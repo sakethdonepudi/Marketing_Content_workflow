@@ -1,0 +1,230 @@
+{
+  "workspace_key": "n-chandrababu-naidu-andhra-pradesh",
+  "sources": [
+    {
+      "id": "ncbn-official-site",
+      "name": "N. Chandrababu Naidu — Official Website",
+      "type": "webpage",
+      "url": "https://ncbn.info/",
+      "official": true,
+      "source_class": "official_primary",
+      "enabled": true,
+      "rate_limit_seconds": 0.5,
+      "poll_interval_seconds": 1800,
+      "identity": {
+        "status": "verified",
+        "verification_method": "cross_source_confirmation",
+        "evidence_url": "https://prakasam.ap.gov.in/chief-minister-profile/",
+        "verification_note": "The configured leader site is cross-checked against the Andhra Pradesh government CM profile."
+      },
+      "workspace_match": {
+        "leader": "N. Chandrababu Naidu",
+        "jurisdiction": "Andhra Pradesh, India",
+        "topics": ["official leader updates", "public leadership"]
+      },
+      "metadata": {
+        "content_role": "homepage",
+        "publisher": "Office of N. Chandrababu Naidu",
+        "language": "English"
+      }
+    },
+    {
+      "id": "ap-government-cm-profile",
+      "name": "Government of Andhra Pradesh — Chief Minister Profile",
+      "type": "webpage",
+      "url": "https://prakasam.ap.gov.in/chief-minister-profile/",
+      "official": true,
+      "source_class": "official_primary",
+      "enabled": true,
+      "rate_limit_seconds": 0.5,
+      "poll_interval_seconds": 86400,
+      "identity": {
+        "status": "verified",
+        "verification_method": "government_domain",
+        "evidence_url": "https://prakasam.ap.gov.in/chief-minister-profile/",
+        "verification_note": "Government of Andhra Pradesh district administration page hosted by NIC."
+      },
+      "workspace_match": {
+        "leader": "N. Chandrababu Naidu",
+        "jurisdiction": "Andhra Pradesh, India",
+        "topics": ["leader identity", "government administration"]
+      },
+      "metadata": {
+        "content_role": "profile",
+        "publisher": "Prakasam District Administration, Government of Andhra Pradesh",
+        "hosted_by": "National Informatics Centre",
+        "language": "English"
+      }
+    },
+    {
+      "id": "nic-andhra-pradesh-news",
+      "name": "NIC Andhra Pradesh — News",
+      "type": "webpage",
+      "url": "https://ap.nic.in/en/news-update/",
+      "official": true,
+      "source_class": "official_primary",
+      "enabled": true,
+      "rate_limit_seconds": 0.5,
+      "poll_interval_seconds": 1800,
+      "identity": {
+        "status": "verified",
+        "verification_method": "government_domain",
+        "evidence_url": "https://ap.nic.in/en/news-update/",
+        "verification_note": "NIC Andhra Pradesh State Centre government-domain news listing."
+      },
+      "workspace_match": {
+        "leader": "N. Chandrababu Naidu",
+        "jurisdiction": "Andhra Pradesh, India",
+        "topics": ["government administration", "public policy"]
+      },
+      "metadata": {
+        "content_role": "listing",
+        "publisher": "National Informatics Centre, Andhra Pradesh State Centre",
+        "language": "English"
+      }
+    },
+    {
+      "id": "tnie-chandrababu-naidu-topic",
+      "name": "The New Indian Express — Andhra CM Chandrababu Naidu",
+      "type": "webpage",
+      "url": "https://www.newindianexpress.com/topic/andhra-chief-minister-n-chandrababu-naidu",
+      "official": false,
+      "source_class": "independent_reporting",
+      "enabled": true,
+      "rate_limit_seconds": 0.2,
+      "poll_interval_seconds": 900,
+      "identity": {
+        "status": "verified",
+        "verification_method": "publisher_masthead_and_registry",
+        "evidence_url": "https://www.newindianexpress.com/about-us",
+        "verification_note": "Publisher page identifies Express Network Private Limited, its editorial leadership, and this domain as its English news website."
+      },
+      "workspace_match": {
+        "leader": "N. Chandrababu Naidu",
+        "jurisdiction": "Andhra Pradesh, India",
+        "topics": ["official leader updates", "government administration", "public policy"]
+      },
+      "metadata": {
+        "content_role": "listing",
+        "publisher": "Express Network Private Limited",
+        "language": "English",
+        "item_type": "news",
+        "link_pattern": "^https://www\\.newindianexpress\\.com/states/andhra-pradesh/\\d{4}/[A-Za-z]{3}/\\d{2}/",
+        "max_items": 5,
+        "max_pages": 1
+      }
+    },
+    {
+      "id": "india-commerce-ministry",
+      "name": "Government of India — Department of Commerce",
+      "type": "webpage",
+      "url": "https://www.commerce.gov.in/",
+      "official": true,
+      "source_class": "official_primary",
+      "enabled": false,
+      "rate_limit_seconds": 1.0,
+      "poll_interval_seconds": 86400,
+      "identity": {
+        "status": "verified",
+        "verification_method": "government_domain",
+        "evidence_url": "https://www.commerce.gov.in/",
+        "verification_note": "Government of India Department of Commerce domain; registered for targeted official corroboration, not general event polling."
+      },
+      "workspace_match": {
+        "leader": "N. Chandrababu Naidu",
+        "jurisdiction": "Andhra Pradesh, India",
+        "topics": ["government administration", "public policy"]
+      },
+      "metadata": {
+        "content_role": "reference",
+        "publisher": "Department of Commerce, Government of India",
+        "language": "English",
+        "verification_search_priority": 1
+      }
+    },
+    {
+      "id": "india-pib",
+      "name": "Government of India — Press Information Bureau",
+      "type": "webpage",
+      "url": "https://www.pib.gov.in/",
+      "official": true,
+      "source_class": "official_primary",
+      "enabled": false,
+      "rate_limit_seconds": 1.0,
+      "poll_interval_seconds": 86400,
+      "identity": {
+        "status": "verified",
+        "verification_method": "government_domain",
+        "evidence_url": "https://www.pib.gov.in/",
+        "verification_note": "Government of India Press Information Bureau domain; registered for targeted official corroboration, not general event polling."
+      },
+      "workspace_match": {
+        "leader": "N. Chandrababu Naidu",
+        "jurisdiction": "Andhra Pradesh, India",
+        "topics": ["government administration", "public policy"]
+      },
+      "metadata": {
+        "content_role": "reference",
+        "publisher": "Press Information Bureau, Government of India",
+        "language": "English",
+        "verification_search_priority": 2
+      }
+    },
+    {
+      "id": "the-hindu",
+      "name": "The Hindu",
+      "type": "webpage",
+      "url": "https://www.thehindu.com/",
+      "official": false,
+      "source_class": "independent_reporting",
+      "enabled": false,
+      "rate_limit_seconds": 1.0,
+      "poll_interval_seconds": 86400,
+      "identity": {
+        "status": "verified",
+        "verification_method": "publisher_masthead_and_registry",
+        "evidence_url": "https://www.thehindu.com/aboutus/",
+        "verification_note": "Publisher identity page for The Hindu; registered only as an independent corroboration domain."
+      },
+      "workspace_match": {
+        "leader": "N. Chandrababu Naidu",
+        "jurisdiction": "Andhra Pradesh, India",
+        "topics": ["government administration", "public policy"]
+      },
+      "metadata": {
+        "content_role": "reference",
+        "publisher": "The Hindu",
+        "language": "English",
+        "verification_search_priority": 3
+      }
+    },
+    {
+      "id": "indian-express",
+      "name": "The Indian Express",
+      "type": "webpage",
+      "url": "https://indianexpress.com/",
+      "official": false,
+      "source_class": "independent_reporting",
+      "enabled": false,
+      "rate_limit_seconds": 1.0,
+      "poll_interval_seconds": 86400,
+      "identity": {
+        "status": "verified",
+        "verification_method": "publisher_masthead_and_registry",
+        "evidence_url": "https://indianexpress.com/about-us/",
+        "verification_note": "Publisher identity page for The Indian Express; registered only as an independent corroboration domain."
+      },
+      "workspace_match": {
+        "leader": "N. Chandrababu Naidu",
+        "jurisdiction": "Andhra Pradesh, India",
+        "topics": ["government administration", "public policy"]
+      },
+      "metadata": {
+        "content_role": "reference",
+        "publisher": "The Indian Express",
+        "language": "English",
+        "verification_search_priority": 4
+      }
+    }
+  ]
+}
