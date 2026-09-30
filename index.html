@@ -60,7 +60,29 @@
           <button data-tab="sources" type="button">Sources</button>
           <button data-tab="claims" type="button">Claims</button>
           <button data-tab="verification" type="button">Verification</button>
+          <button data-tab="content" type="button">Content decision</button>
+          <button data-tab="production" type="button">Production</button>
           <button data-tab="history" type="button">Research history</button>
+        </div>
+        <div class="content-controls">
+          <label>Content CEO
+            <select id="content-provider">
+              <option value="test">Deterministic preview</option>
+              <option value="grok">Grok · live paid call</option>
+            </select>
+          </label>
+          <button id="decide-content" type="button">Decide content</button>
+          <span id="content-progress"></span>
+        </div>
+        <div class="content-controls production-controls">
+          <span><strong>Content package</strong><small> Anthropic · one structured call · no publishing</small></span>
+          <button id="generate-package" type="button">Generate content package</button>
+          <span id="production-progress"></span>
+        </div>
+        <div class="content-controls production-controls render-controls">
+          <span><strong>Media rendering</strong><small id="renderer-config"> Explicit generation · human review required</small></span>
+          <button id="generate-media" type="button">Generate media</button>
+          <span id="render-progress"></span>
         </div>
         <div id="room-content" class="room-content"></div>
       </section>
@@ -68,7 +90,7 @@
         <div class="sectionhead"><h3>Production pipeline</h3><span class="subtle">Event → published</span></div>
         <div class="pipeline"><div>01 <strong>Research</strong><small>Detect and verify</small></div><div>02 <strong>Story</strong><small>Claims to script</small></div><div>03 <strong>Produce</strong><small>Assets and reel</small></div><div>04 <strong>Review</strong><small>QA and approval</small></div><div>05 <strong>Publish</strong><small>Instagram and insights</small></div></div>
       </section>
-      <footer>ReachOut OS · Architecture 04 · Local preview</footer>
+      <footer>ReachOut OS · Architecture 06C · Local preview</footer>
     </main>
   </div>
   <script src="/app.js"></script>
