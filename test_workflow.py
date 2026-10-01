@@ -3947,6 +3947,51 @@ class WorkflowTests(unittest.TestCase):
                        "CHANGES_REQUIRED", "REJECTED", "Lineage & technical details"):
             self.assertIn(phrase, source)
 
+    def test_final_reel_subtitles_render_filled_glyphs_and_audio_mix_is_measured(self):
+        # The composer must draw solid white glyphs with a black halo, never the
+        # hollow outline-only text that made burned-in subtitles invisible.
+        composer = Path(app.__file__).parent.joinpath("tools", "final_reel_composer.swift").read_text(encoding="utf-8")
+        self.assertNotIn(".strokeWidth: -2.0,", composer)
+        self.assertIn(".strokeWidth: 6.0", composer)
+        self.assertIn("Outline pass first", composer)
+        self.assertIn("Fill pass second", composer)
+        self.assertIn(".foregroundColor: NSColor.white", composer)
+        # Audio QA measures real PCM and reports speech loudness, ducking, clipping, silence.
+        samples = [int(32767 * 0.12 * __import__("math").sin(i / 6.0)) for i in range(48000)]
+        import struct as _struct
+        payload = b"".join(_struct.pack("<h", value) for value in samples)
+        header = b"RIFF" + _struct.pack("<I", 36 + len(payload)) + b"WAVE"
+        header += b"fmt " + _struct.pack("<IHHIIHH", 16, 1, 1, 48000, 96000, 2, 16)
+        header += b"data" + _struct.pack("<I", len(payload))
+        decoded, rate, channels = final_reel_composer.parse_pcm_wav(header + payload)
+        self.assertEqual((rate, channels, len(decoded)), (48000, 1, len(samples)))
+        cues = [{"text": "one two", "start": 0.0, "end": 1.0}]
+        with patch.object(final_reel_composer, "_decode_audio", return_value=(tuple(samples), 48000, 1)):
+            qa = final_reel_composer._audio_qa(b"x", cues)
+        self.assertEqual(qa["status"], "PASS", qa["errors"])
+        self.assertTrue(qa["checks"]["narration_track_present"])
+        self.assertLess(qa["checks"]["true_peak"], final_reel_composer.CLIP_CEILING)
+        # A silent render must fail closed.
+        silent = tuple([0] * 48000)
+        with patch.object(final_reel_composer, "_decode_audio", return_value=(silent, 48000, 1)):
+            self.assertEqual(final_reel_composer._audio_qa(b"x", cues)["status"], "FLAG")
+
+    def test_final_reel_subtitle_qa_flags_missing_glyphs(self):
+        cues = [{"text": "the union government permitted sale", "start": 1.0, "end": 2.0}]
+        frames = [{"jpeg": b"frame", "actual_seconds": 1.5}]
+
+        class BlankOCR:
+            name = "blank"
+
+            def detect(self, jpeg):
+                return []
+
+        with patch.object(final_reel_composer, "frame_extractor_for", lambda: type("E", (), {"extract": lambda self, data, times: frames})()), \
+             patch.object(final_reel_composer, "ocr_provider_for", lambda: BlankOCR()):
+            qa = final_reel_composer._subtitle_qa(b"video", cues)
+        self.assertEqual(qa["status"], "FLAG")
+        self.assertTrue(any("no glyphs" in error for error in qa["errors"]))
+
     def test_final_reel_narration_is_package_exact_and_schema_is_immutable(self):
         package = {
             "hook": {"text": "Registered growers can sell through authorised platforms"},

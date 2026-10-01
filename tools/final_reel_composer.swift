@@ -24,6 +24,10 @@ struct ComposerConfig: Codable {
     let gapSeconds: Double
     let tailSeconds: Double
     let musicVolume: Float
+    /// Music level while narration is speaking; kept well below speech so the mix ducks.
+    let duckedMusicVolume: Float?
+    /// Narration gain applied during the mix to reach a phone-audible level.
+    let narrationGain: Float?
 }
 
 struct CueReceipt: Codable {
@@ -61,6 +65,14 @@ func audioDuration(_ path: String) -> Double {
     return value
 }
 
+/// A caption bitmap that renders solid white glyphs with a high-contrast dark halo.
+///
+/// The previous version used `.strokeWidth: -2.0`, which in AppKit means "stroke AND
+/// fill"; because the stroke is centred on the glyph edge it erased the glyph interior
+/// and produced hollow outline-only text. That made burned-in subtitles unreadable and
+/// unreadable by OCR. Here the glyphs are drawn filled in white, then the same text is
+/// stroked underneath in black via a separate pass, giving a solid fill plus a real
+/// outline without erasing it.
 func captionBitmap(text: String, size: CGSize) -> CGImage {
     guard let bitmap = NSBitmapImageRep(
         bitmapDataPlanes: nil, pixelsWide: Int(size.width * 2), pixelsHigh: Int(size.height * 2),
@@ -75,20 +87,32 @@ func captionBitmap(text: String, size: CGSize) -> CGImage {
     let paragraph = NSMutableParagraphStyle()
     paragraph.alignment = .center
     paragraph.lineBreakMode = .byWordWrapping
-    let fontSize = size.width * 0.073
-    let attributes: [NSAttributedString.Key: Any] = [
+    let fontSize = size.width * 0.088
+    let baseAttributes: [NSAttributedString.Key: Any] = [
         .font: NSFont.systemFont(ofSize: fontSize, weight: .bold),
-        .foregroundColor: NSColor.white,
-        .strokeColor: NSColor.black,
-        .strokeWidth: -2.0,
         .paragraphStyle: paragraph,
     ]
     let value = text.uppercased() as NSString
-    let bounds = value.boundingRect(with: NSSize(width: size.width - 28, height: size.height - 12),
-                                    options: [.usesLineFragmentOrigin, .usesFontLeading], attributes: attributes)
-    let rect = NSRect(x: 14, y: max(6, (size.height - bounds.height) / 2),
-                      width: size.width - 28, height: min(size.height - 12, bounds.height + 4))
-    value.draw(with: rect, options: [.usesLineFragmentOrigin, .usesFontLeading], attributes: attributes)
+    let drawBounds = value.boundingRect(with: NSSize(width: size.width - 40, height: size.height - 16),
+                                        options: [.usesLineFragmentOrigin, .usesFontLeading], attributes: baseAttributes)
+    let rect = NSRect(x: 20, y: max(8, (size.height - drawBounds.height) / 2),
+                      width: size.width - 40, height: min(size.height - 16, drawBounds.height + 8))
+    // Outline pass first: stroke-only text in black (positive strokeWidth = stroke only).
+    let outlineAttributes: [NSAttributedString.Key: Any] = [
+        .font: NSFont.systemFont(ofSize: fontSize, weight: .bold),
+        .paragraphStyle: paragraph,
+        .foregroundColor: NSColor.clear,
+        .strokeColor: NSColor.black,
+        .strokeWidth: 6.0,
+    ]
+    value.draw(with: rect, options: [.usesLineFragmentOrigin, .usesFontLeading], attributes: outlineAttributes)
+    // Fill pass second: opaque white glyph interiors on top of the outline.
+    let fillAttributes: [NSAttributedString.Key: Any] = [
+        .font: NSFont.systemFont(ofSize: fontSize, weight: .bold),
+        .paragraphStyle: paragraph,
+        .foregroundColor: NSColor.white,
+    ]
+    value.draw(with: rect, options: [.usesLineFragmentOrigin, .usesFontLeading], attributes: fillAttributes)
     NSGraphicsContext.restoreGraphicsState()
     guard let image = bitmap.cgImage else { fail("caption bitmap encode failed") }
     return image
@@ -96,17 +120,31 @@ func captionBitmap(text: String, size: CGSize) -> CGImage {
 
 func captionLayer(text: String, start: Double, end: Double, total: Double, size: CGSize) -> CALayer {
     let layer = CALayer()
-    let side = size.width * 0.11
-    let bottom = size.height * 0.19
-    layer.frame = CGRect(x: side, y: bottom, width: size.width - side * 2, height: size.height * 0.13)
-    layer.backgroundColor = NSColor.black.withAlphaComponent(0.58).cgColor
-    layer.cornerRadius = 18
+    let side = size.width * 0.08
+    let censureWidth = size.width - side * 2
+    // Size the strip to the actual wrapped text height (1-2 lines) so there is never a
+    // tall empty subtitle box. The bottom edge clears the Reels bottom safe zone.
+    let paragraph = NSMutableParagraphStyle()
+    paragraph.alignment = .center
+    paragraph.lineBreakMode = .byWordWrapping
+    let measureAttributes: [NSAttributedString.Key: Any] = [
+        .font: NSFont.systemFont(ofSize: censureWidth * 0.088, weight: .bold), .paragraphStyle: paragraph,
+    ]
+    let measured = (text.uppercased() as NSString).boundingRect(
+        with: NSSize(width: censureWidth - 40, height: censureWidth), options: [.usesLineFragmentOrigin, .usesFontLeading],
+        attributes: measureAttributes)
+    let stripHeight = min(size.height * 0.22, max(measured.height + 44, size.height * 0.11))
+    let bottom = size.height * 0.20
+    layer.frame = CGRect(x: side, y: bottom, width: censureWidth, height: stripHeight)
+    layer.backgroundColor = NSColor.black.withAlphaComponent(0.62).cgColor
+    layer.cornerRadius = 20
     layer.masksToBounds = true
     layer.opacity = 0
     let textLayer = CALayer()
     textLayer.frame = layer.bounds
     textLayer.contents = captionBitmap(text: text, size: layer.bounds.size)
-    textLayer.contentsGravity = .resizeAspect
+    // Render the bitmap 1:1 (never resizeAspect downscale) so glyphs stay crisp and large.
+    textLayer.contentsGravity = .resize
     textLayer.contentsScale = 2
     layer.addSublayer(textLayer)
     let visible = max(0.05, end - start)
@@ -176,16 +214,35 @@ func compose(_ config: ComposerConfig) throws -> ComposerReceipt {
         musicCursor = CMTimeAdd(musicCursor, take)
     }
 
+    let duckedMusicVolume = config.duckedMusicVolume ?? (config.musicVolume * 0.25)
+    let narrationGain = config.narrationGain ?? 4.0
     let audioMix = AVMutableAudioMix()
     let voiceMix = AVMutableAudioMixInputParameters(track: narrationTrack)
-    voiceMix.setVolume(1.0, at: .zero)
+    // NARRATION_GAIN is kept modest on purpose. Apple Speech already renders close to
+    // full scale; a large gain clips at the encoder. Phone-audible loudness is reached
+    // with a moderate gain plus the measured post-mix limiter applied in Python.
+    voiceMix.setVolume(narrationGain, at: .zero)
     let bedMix = AVMutableAudioMixInputParameters(track: musicTrack)
+    // Music bed automation. AVFoundation requires each scheduled ramp to be strictly
+    // ordered and non-overlapping, so we use one continuous ramp that snaps down to a
+    // ducked level across the whole spoken span and back up afterwards, plus a short
+    // lead-in and tail. Voices play through at a fixed gain so narration dominates.
+    func at(_ seconds: Double) -> CMTime { CMTime(seconds: min(max(0, seconds), targetDuration), preferredTimescale: 600) }
+    let duckStart = max(0.05, narrationStart - 0.15)
+    let duckEnd = min(targetDuration - 0.05, narrationEnd + 0.2)
+    let fadeOutStart = max(duckEnd, targetDuration - 0.9)
+    // 0 -> bed, smoothly duck across the spoken span, restore, then fade to silence.
     bedMix.setVolumeRamp(fromStartVolume: 0, toEndVolume: config.musicVolume,
-                         timeRange: CMTimeRange(start: .zero, duration: CMTime(seconds: 0.8, preferredTimescale: 600)))
-    bedMix.setVolume(config.musicVolume, at: CMTime(seconds: 0.8, preferredTimescale: 600))
+                         timeRange: CMTimeRange(start: at(0), duration: at(duckStart)))
+    bedMix.setVolume(config.musicVolume, at: at(duckStart))
+    bedMix.setVolumeRamp(fromStartVolume: config.musicVolume, toEndVolume: duckedMusicVolume,
+                         timeRange: CMTimeRange(start: at(duckStart), duration: at(0.25)))
+    bedMix.setVolume(duckedMusicVolume, at: at(min(duckStart + 0.25, duckEnd)))
+    bedMix.setVolumeRamp(fromStartVolume: duckedMusicVolume, toEndVolume: config.musicVolume,
+                         timeRange: CMTimeRange(start: at(duckEnd), duration: at(min(0.3, max(0.05, fadeOutStart - duckEnd)))))
+    bedMix.setVolume(config.musicVolume, at: at(fadeOutStart))
     bedMix.setVolumeRamp(fromStartVolume: config.musicVolume, toEndVolume: 0,
-                         timeRange: CMTimeRange(start: CMTime(seconds: max(0, targetDuration - 1), preferredTimescale: 600),
-                                                duration: CMTime(seconds: 1, preferredTimescale: 600)))
+                         timeRange: CMTimeRange(start: at(fadeOutStart), duration: at(targetDuration - fadeOutStart)))
     audioMix.inputParameters = [voiceMix, bedMix]
 
     let renderSize = CGSize(width: config.width, height: config.height)

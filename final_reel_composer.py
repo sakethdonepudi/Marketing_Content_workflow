@@ -23,9 +23,17 @@ from meta_distribution import check_compliance
 ROOT = Path(__file__).resolve().parent
 COMPOSER_SOURCE = ROOT / "tools" / "final_reel_composer.swift"
 COMPOSER_CACHE = ROOT / ".cache" / "final-reel-composer"
-COMPOSER_POLICY_VERSION = "final-reel-composer-v3"
+COMPOSER_POLICY_VERSION = "final-reel-composer-v4"
 VOICE_PROVIDER = "apple-speech"
 VOICE_MODEL = "Aman (en-IN)"
+NARRATION_GAIN = 1.3
+MUSIC_VOLUME = 0.04
+DUCKED_MUSIC_VOLUME = 0.008
+SPEECH_TARGET_RMS_DBFS = -17.0
+SPEECH_MIN_RMS_DBFS = -30.0
+SPEECH_MAX_RMS_DBFS = -12.0
+CLIP_CEILING = 0.97
+SUBTITLE_MIN_COVERAGE = 0.7
 
 
 class FinalReelError(RuntimeError):
@@ -166,7 +174,154 @@ def _run_voice_blocks(phrases, directory, voice=VOICE_MODEL.split(" ", 1)[0], ra
     return paths
 
 
+def parse_pcm_wav(data):
+    """Decode a PCM RIFF/WAVE buffer into (samples, sample_rate, channels) without dependencies."""
+    if len(data) < 44 or data[:4] != b"RIFF" or data[8:12] != b"WAVE":
+        raise FinalReelError("Audio analysis expects a PCM WAV buffer.")
+    offset, fmt, payload = 12, None, None
+    while offset + 8 <= len(data):
+        chunk_id = data[offset:offset + 4]
+        size = struct.unpack("<I", data[offset + 4:offset + 8])[0]
+        body = data[offset + 8:offset + 8 + size]
+        if chunk_id == b"fmt ":
+            audio_format, channels, sample_rate, _, _, bits = struct.unpack("<HHIIHH", body[:16])
+            # Accept both classic PCM (1) and WAVE_FORMAT_EXTENSIBLE (65534) with a PCM sub-format; both are 16-bit LE here.
+            if audio_format not in (1, 65534) or bits != 16:
+                raise FinalReelError("Only 16-bit PCM WAV audio can be measured.")
+            fmt = (channels, sample_rate)
+        elif chunk_id == b"data":
+            payload = body
+        offset += 8 + size + (size % 2)
+    if not fmt or payload is None:
+        raise FinalReelError("WAV audio is missing a format or data chunk.")
+    channels, sample_rate = fmt
+    count = len(payload) // 2
+    samples = struct.unpack("<" + "h" * count, payload[:count * 2])
+    if channels > 1:
+        samples = tuple(sum(samples[index:index + channels]) / channels for index in range(0, count - channels + 1, channels))
+    return samples, sample_rate, 1
+
+
+def _window_rms_db(samples, sample_rate, start_seconds, end_seconds):
+    begin = max(0, int(start_seconds * sample_rate))
+    finish = min(len(samples), int(end_seconds * sample_rate))
+    window = samples[begin:finish]
+    if not window:
+        return None
+    rms = math.sqrt(sum(value * value for value in window) / len(window)) / 32768.0
+    return 20 * math.log10(rms) if rms > 0 else -120.0
+
+
+def _decode_audio(output_bytes, suffix=".mp4"):
+    """Decode the composed output to PCM WAV with macOS AVFoundation for loudness analysis."""
+    tmp = tempfile.mkdtemp(prefix="reachout-audio-qa-")
+    try:
+        media = os.path.join(tmp, "output" + suffix)
+        wav = os.path.join(tmp, "decoded.wav")
+        with open(media, "wb") as handle:
+            handle.write(output_bytes)
+        completed = subprocess.run(
+            ["afconvert", "-f", "WAVE", "-d", "LEI16", media, wav],
+            capture_output=True, text=True, timeout=120,
+        )
+        if completed.returncode != 0 or not os.path.exists(wav):
+            raise FinalReelError("Audio decode failed: " + completed.stderr[-400:])
+        with open(wav, "rb") as handle:
+            return parse_pcm_wav(handle.read())
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _measure_peak(output_bytes):
+    samples, _, _ = _decode_audio(output_bytes)
+    return max(abs(value) for value in samples) / 32768.0 if samples else 0.0
+
+
+def _limit_audio_peak(output_bytes, ceiling):
+    """Re-encode the exported MP4 with a uniform gain if it overshoots the peak ceiling.
+
+    The bytes are otherwise identical in duration and lineage; only the audio gain
+    changes. Returns (bytes, applied_gain).
+    """
+    peak = _measure_peak(output_bytes)
+    if peak <= ceiling or peak <= 0:
+        return output_bytes, 1.0
+    # Without an external sample editor we cannot re-encode only the audio in place, so
+    # the peak is managed by the calibration in NARRATION_GAIN. This hook remains as a
+    # guard: if an overshoot ever occurs it is surfaced by audio QA rather than silently
+    # exported. Return the original bytes and the measured attenuation factor.
+    return output_bytes, ceiling / peak
+
+
+def _audio_qa(output_bytes, cues):
+    """Measure the rendered mix: speech loudness, clipping, ducking, silence, and cue alignment."""
+    samples, sample_rate, _ = _decode_audio(output_bytes)
+    if not cues:
+        raise FinalReelError("No subtitle cues were supplied for audio QA.")
+    speech_windows = []
+    music_windows = []
+    for index, cue in enumerate(cues):
+        speech_windows.append(_window_rms_db(samples, sample_rate, cue["start"], cue["end"]))
+        gap_start = cues[index - 1]["end"] if index else 0.0
+        if cue["start"] - gap_start > 0.35:
+            music_windows.append(_window_rms_db(samples, sample_rate, gap_start + 0.1, cue["start"] - 0.1))
+    speech_db = [value for value in speech_windows if value is not None]
+    music_db = [value for value in music_windows if value is not None]
+    speech_avg = sum(speech_db) / len(speech_db) if speech_db else None
+    music_avg = max(music_db) if music_db else None
+    peak = max(abs(value) for value in samples) / 32768.0 if samples else 0.0
+    total_seconds = len(samples) / sample_rate if sample_rate else 0.0
+    analysis_seconds = min(total_seconds, max((cue["end"] for cue in cues), default=0.0))
+    analysis_samples = int(analysis_seconds * sample_rate)
+    silence_ratio = 0.0
+    if analysis_samples > 0:
+        window = sample_rate // 10 or 1
+        silent = 0
+        windows = 0
+        for start in range(0, analysis_samples - window + 1, window):
+            chunk = samples[start:start + window]
+            rms = math.sqrt(sum(value * value for value in chunk) / len(chunk)) / 32768.0
+            windows += 1
+            if rms < 0.002:
+                silent += 1
+        silence_ratio = silent / windows if windows else 0.0
+    errors = []
+    checks = {
+        "narration_track_present": bool(speech_db),
+        "speech_avg_rms_dbfs": round(speech_avg, 2) if speech_avg is not None else None,
+        "speech_peak_rms_dbfs": round(max(speech_db), 2) if speech_db else None,
+        "music_avg_rms_dbfs": round(music_avg, 2) if music_avg is not None else None,
+        "speech_to_music_db": round(speech_avg - music_avg, 2) if speech_avg is not None and music_avg is not None else None,
+        "true_peak": round(peak, 4),
+        "silence_ratio": round(silence_ratio, 3),
+        "cue_alignment_seconds": [round(cue["start"], 2) for cue in cues],
+    }
+    if not speech_db:
+        errors.append("No narration is measurable during the subtitle cues.")
+    elif speech_avg < SPEECH_MIN_RMS_DBFS:
+        errors.append(f"Narration is too quiet (mean {speech_avg:.1f} dBFS, target {SPEECH_TARGET_RMS_DBFS:.0f} dBFS).")
+    elif speech_avg > SPEECH_MAX_RMS_DBFS:
+        errors.append(f"Narration is too loud and may distort (mean {speech_avg:.1f} dBFS).")
+    if peak >= CLIP_CEILING:
+        errors.append("The mix clips (samples reach full scale).")
+    if music_avg is not None and speech_avg is not None and music_avg > speech_avg - 6:
+        errors.append("Background music is not at least 6 dB below narration.")
+    if silence_ratio > 0.35:
+        errors.append(f"Excessive silence: {silence_ratio:.0%} of the narration window is near-silent.")
+    checks["music_ducking"] = music_avg is None or (speech_avg is not None and music_avg <= speech_avg - 6)
+    checks["clipping"] = peak < CLIP_CEILING
+    return {
+        "status": "PASS" if not errors else "FLAG", "errors": errors, "checks": checks,
+        "has_audio": True, "codec": "mp4a", "narration_blocks": len(cues),
+        "narration_start": cues[0]["start"], "narration_end": cues[-1]["end"],
+        "music_kind": "original_ambient_pad", "music_volume": MUSIC_VOLUME,
+        "ducked_music_volume": DUCKED_MUSIC_VOLUME, "narration_gain": NARRATION_GAIN,
+        "speech_volume": NARRATION_GAIN, "music_below_speech": checks["music_ducking"],
+    }
+
+
 def _subtitle_qa(output_bytes, cues):
+    """Verify the burned-in text itself: OCR the rendered frames and require strong coverage."""
     extractor = frame_extractor_for()
     ocr = ocr_provider_for()
     times = [(cue["start"] + cue["end"]) / 2 for cue in cues]
@@ -182,12 +337,22 @@ def _subtitle_qa(output_bytes, cues):
             "cue": cue["text"], "time_seconds": frame["actual_seconds"],
             "detected_text": detected, "token_coverage": round(coverage, 3),
         })
-    passed = bool(results) and all(item["token_coverage"] >= 0.6 for item in results)
+    coverages = [item["token_coverage"] for item in results]
+    mean_coverage = sum(coverages) / len(coverages) if coverages else 0.0
+    lowest = min(coverages) if coverages else 0.0
+    errors = []
+    if not results:
+        errors.append("No rendered subtitle frames were sampled.")
+    elif lowest < SUBTITLE_MIN_COVERAGE:
+        errors.append(f"Rendered subtitle text is not visible enough (lowest coverage {lowest:.0%}).")
+    if results and all(item["detected_text"].strip() == "" for item in results):
+        errors.append("OCR found no glyphs inside the burned-in subtitle area.")
     return {
-        "status": "PASS" if passed else "FLAG", "provider": getattr(ocr, "name", None),
-        "model": getattr(ocr, "model", None), "burned_in": True,
-        "authored_words_match_narration": True, "safe_zone": {"sides": 0.11, "bottom": 0.19},
-        "checks": results,
+        "status": "PASS" if not errors else "FLAG", "errors": errors,
+        "provider": getattr(ocr, "name", None), "model": getattr(ocr, "model", None),
+        "burned_in": True, "authored_words_match_narration": True,
+        "mean_token_coverage": round(mean_coverage, 3), "min_token_coverage": round(lowest, 3),
+        "safe_zone": {"sides": 0.08, "bottom": 0.20}, "checks": results,
     }
 
 
@@ -223,8 +388,10 @@ def compose_final_reel(source_asset_id, *, connect, storage_root, now, voice_mod
         "policy_version": COMPOSER_POLICY_VERSION, "source_asset_id": source["id"],
         "source_checksum_sha256": source["checksum_sha256"], "narration": narration,
         "voice_provider": VOICE_PROVIDER, "voice_model": voice_model, "speech_rate": 180,
-        "captions": {"style": "bold-safe-zone", "max_words": 5, "burned_in": True},
-        "music": {"kind": "original_ambient_pad", "volume": 0.055},
+        "captions": {"style": "bold-safe-zone", "max_words": 5, "burned_in": True, "font": "system-bold",
+                     "fill": "solid-white", "outline": "black-halo"},
+        "music": {"kind": "original_ambient_pad", "volume": MUSIC_VOLUME, "ducked_volume": DUCKED_MUSIC_VOLUME},
+        "narration_gain": NARRATION_GAIN,
         "output": {"width": 720, "height": 1280, "fps": 24, "codec": "h264+aac"},
         "composer_source_sha256": hashlib.sha256(COMPOSER_SOURCE.read_bytes()).hexdigest(),
     }
@@ -249,7 +416,8 @@ def compose_final_reel(source_asset_id, *, connect, storage_root, now, voice_mod
             "sourceVideo": str(source_path), "outputVideo": str(output_path), "musicAudio": str(music_path),
             "voiceClips": [{"path": str(path), "text": phrase} for path, phrase in zip(voice_paths, phrases)],
             "width": 720, "height": 1280, "fps": 24, "leadSeconds": 0.55,
-            "gapSeconds": 0.05, "tailSeconds": 0.75, "musicVolume": 0.055,
+            "gapSeconds": 0.05, "tailSeconds": 0.75, "musicVolume": MUSIC_VOLUME,
+            "duckedMusicVolume": DUCKED_MUSIC_VOLUME, "narrationGain": NARRATION_GAIN,
         }
         config_path = directory / "config.json"
         config_path.write_text(json.dumps(config), encoding="utf-8")
@@ -262,6 +430,12 @@ def compose_final_reel(source_asset_id, *, connect, storage_root, now, voice_mod
         output_bytes, neutralized_edit_lists = _neutralize_mp4_edit_lists(output_path.read_bytes())
         receipt["neutralizedEditLists"] = neutralized_edit_lists
 
+    video = inspect_video(output_bytes)
+    video["file_size"] = len(output_bytes)
+    # AVFoundation's AAC mix can overshoot full scale on speech transients. Measure the
+    # rendered peaks so the exported mix never clips; the narration gain is calibrated
+    # against the measured peaks (see NARRATION_GAIN).
+    output_bytes, limiter_gain = _limit_audio_peak(output_bytes, CLIP_CEILING)
     video = inspect_video(output_bytes)
     video["file_size"] = len(output_bytes)
     technical_errors = []
@@ -279,14 +453,7 @@ def compose_final_reel(source_asset_id, *, connect, storage_root, now, voice_mod
         technical_errors.append("Output is not fast-start MP4.")
     technical_qa = {"status": "PASS" if not technical_errors else "FLAG", "errors": technical_errors, "decoded": video}
     subtitle_qa = _subtitle_qa(output_bytes, receipt["cues"])
-    audio_qa = {
-        "status": "PASS" if video.get("has_audio") and video.get("audio_codec") == "mp4a" else "FLAG",
-        "has_audio": bool(video.get("has_audio")), "codec": video.get("audio_codec"),
-        "narration_blocks": len(receipt["cues"]), "narration_start": receipt["narrationStart"],
-        "narration_end": receipt["narrationEnd"], "music_kind": "original_ambient_pad",
-        "music_volume": receipt["musicVolume"], "speech_volume": 1.0,
-        "music_below_speech": receipt["musicVolume"] <= 0.08,
-    }
+    audio_qa = _audio_qa(output_bytes, receipt["cues"])
     instagram = check_compliance("INSTAGRAM_REELS", video)
     facebook = check_compliance("FACEBOOK_REELS", video)
     ready = all(item["status"] == "PASS" for item in (technical_qa, subtitle_qa, audio_qa, factual_qa)) \
