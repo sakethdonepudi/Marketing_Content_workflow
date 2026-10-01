@@ -31,7 +31,10 @@ DECISION_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
     "properties": {
-        "decision": {"type": "string", "enum": ["CREATE", "HOLD", "MONITOR", "SKIP", "HUMAN_REVIEW"]},
+        "decision": {"type": "string", "enum": ["CREATE", "HOLD", "SKIP"]},
+        "media_source_strategy": {"type": "string", "enum": [
+            "GENERATE_ORIGINAL", "USE_APPROVED_OWNED_MEDIA", "USE_APPROVED_LICENSED_MEDIA", "NONE",
+        ]},
         "recommended_format": {"type": "string", "enum": ["REEL", "STORY", "CAROUSEL", "IMAGE"]},
         "language": {"type": "string"},
         "proposed_duration_seconds": {"type": "integer", "minimum": 1, "maximum": 300},
@@ -40,7 +43,7 @@ DECISION_SCHEMA = {
         "missing_evidence_or_media": {"type": "array", "items": {"type": "string"}},
     },
     "required": [
-        "decision", "recommended_format", "language", "proposed_duration_seconds",
+        "decision", "media_source_strategy", "recommended_format", "language", "proposed_duration_seconds",
         "priority", "factual_rationale", "missing_evidence_or_media",
     ],
 }
@@ -85,6 +88,17 @@ def _media_format(media):
     return "IMAGE", 15
 
 
+def _approved_media_strategy(media):
+    available = [
+        item for item in media
+        if item["availability_status"] == "available" and item["rights_status"] == "verified"
+    ]
+    if not available:
+        return "GENERATE_ORIGINAL"
+    owned = any((item.get("metadata") or {}).get("rights_basis") == "owned" for item in available)
+    return "USE_APPROVED_OWNED_MEDIA" if owned else "USE_APPROVED_LICENSED_MEDIA"
+
+
 class DeterministicContentAdapter(ContentDecisionProvider):
     name = "deterministic-content-ceo"
     mode = "test"
@@ -97,34 +111,38 @@ class DeterministicContentAdapter(ContentDecisionProvider):
         del kwargs
         recommended_format, duration = _media_format(decision_bundle["media"])
         recent_duplicate = decision_bundle.get("recent_duplicate")
-        usable_media = any(
-            item["availability_status"] == "available" and item["rights_status"] == "verified"
-            and item["media_type"] in ("image", "video")
-            for item in decision_bundle["media"]
-        )
         age_days = decision_bundle.get("event_age_days")
         if recent_duplicate:
             decision = "SKIP"
+            media_strategy = "NONE"
             rationale = "Recent publishing history already covers this event and approved claim-set version."
             missing = []
         elif age_days is not None and age_days > decision_bundle["freshness_days"]:
-            decision = "MONITOR"
-            rationale = "The event is older than the configured freshness window; monitor for a material update."
-            missing = ["A fresh, verified development is required before creating content."]
-        elif not usable_media:
             decision = "HOLD"
-            rationale = "The approved claims are eligible, but no rights-verified image or video supports an executable format."
-            missing = ["Add rights-verified event media before production."]
+            media_strategy = "NONE"
+            rationale = "The event is older than the configured freshness window; wait for a material update."
+            missing = ["A fresh, verified development is required before creating content."]
+        elif not decision_bundle.get("original_generation_allowed", False) and not any(
+            item["availability_status"] == "available" and item["rights_status"] == "verified"
+            for item in decision_bundle["media"]
+        ):
+            decision = "HOLD"
+            media_strategy = "NONE"
+            rationale = "The story requires media that is not approved, and original generation is not safe for this story."
+            missing = ["Required approved media or human input is missing."]
         else:
             decision = "CREATE"
+            media_strategy = _approved_media_strategy(decision_bundle["media"])
             rationale = (
-                "The event is fresh, not recently duplicated, and the available rights-verified media supports "
-                f"the proposed {recommended_format.lower()} format."
+                "The event is fresh, not recently duplicated, and can be represented using "
+                + ("original non-documentary generated visuals." if media_strategy == "GENERATE_ORIGINAL"
+                   else "explicitly approved media.")
             )
             missing = []
         return ContentProviderResult(
             decision={
                 "decision": decision,
+                "media_source_strategy": media_strategy,
                 "recommended_format": recommended_format,
                 "language": decision_bundle.get("default_language", "English"),
                 "proposed_duration_seconds": duration,
@@ -154,7 +172,12 @@ class GrokContentAdapter(ContentDecisionProvider):
             raise MissingAPIKeyError("XAI_API_KEY is not configured; live Content CEO was not started.")
         system = (
             "You are a Content CEO selecting whether verified public-information evidence deserves content and which "
-            "format its available media supports. Use only the supplied approved claims. Do not add facts, write a "
+            "safe media-source strategy supports it. Missing source media is not by itself a reason to HOLD: choose "
+            "GENERATE_ORIGINAL when neutral, non-deceptive visuals can be generated safely. Evidence-source media is "
+            "evidence only and must never be selected for reuse. For public-affairs stories, prefer maps, diagrams, "
+            "objects, processes, environments, and neutral contextual illustrations; do not depict identifiable people "
+            "unless explicitly justified by approved inputs and human review. Generated visuals are not documentary "
+            "evidence. Use only the supplied approved claims. Do not add facts, write a "
             "script, propose persuasion, or target political or demographic groups. Assess public-information relevance, "
             "freshness, duplication, and media fit. Return only the required structured decision."
         )

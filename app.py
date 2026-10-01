@@ -125,7 +125,7 @@ VERIFICATION_RETRY_MAX_BACKOFF_SECONDS = max(
 )
 VERIFICATION_MAX_LEADS = max(1, min(10, int(os.environ.get("VERIFICATION_MAX_LEADS", "5"))))
 VERIFICATION_EXECUTOR = ThreadPoolExecutor(max_workers=1)
-CONTENT_POLICY_VERSION = os.environ.get("CONTENT_POLICY_VERSION", "content-ceo-v1.1")
+CONTENT_POLICY_VERSION = os.environ.get("CONTENT_POLICY_VERSION", "content-ceo-v1.2")
 CONTENT_FRESHNESS_DAYS = max(1, int(os.environ.get("CONTENT_FRESHNESS_DAYS", "7")))
 CONTENT_HISTORY_DAYS = max(1, int(os.environ.get("CONTENT_HISTORY_DAYS", "30")))
 CONTENT_TOKEN_LIMIT = max(256, int(os.environ.get("CONTENT_TOKEN_LIMIT", "900")))
@@ -3821,6 +3821,24 @@ def _content_input_bundle(event_id, provider_mode):
         media = [dict(row) for row in connection.execute(
             "SELECT * FROM media_assets WHERE event_id=? AND mode=? ORDER BY created_at,id", (event_id, asset_mode)
         )]
+        for item in media:
+            item["metadata"] = json.loads(item.get("metadata_json") or "{}")
+        required_unapproved_media = [
+            item for item in media
+            if item["metadata"].get("required_for_story")
+            and not (item["availability_status"] == "available" and item["rights_status"] == "verified")
+        ]
+        generation_prohibited = any(item["metadata"].get("original_generation_prohibited") for item in media)
+        original_generation_allowed = not generation_prohibited and not required_unapproved_media
+        if required_unapproved_media:
+            blockers.append("Media explicitly required for this story is unavailable or lacks verified rights.")
+            eligibility = "BLOCKED"
+        elif generation_prohibited and not any(
+            item["availability_status"] == "available" and item["rights_status"] == "verified"
+            for item in media
+        ):
+            blockers.append("Original generation is prohibited for this story and no approved media is available.")
+            eligibility = "BLOCKED"
         cutoff = (datetime.now(timezone.utc) - timedelta(days=CONTENT_HISTORY_DAYS)).isoformat()
         publishing = [dict(row) for row in connection.execute(
             "SELECT * FROM publishing_history WHERE mode=? AND recorded_at>=? ORDER BY recorded_at DESC,id DESC",
@@ -3865,6 +3883,16 @@ def _content_input_bundle(event_id, provider_mode):
         "approved_claims": approved_claims,
         "verification_decisions": verification_decisions,
         "media": media,
+        "original_generation_allowed": original_generation_allowed,
+        "generated_media_safety": {
+            "treatment": "neutral_non_documentary_public_affairs_visual",
+            "preferred": ["location/environment illustration", "map", "diagram", "object/process visual", "neutral contextual imagery"],
+            "prohibited": [
+                "reuse of evidence-source images", "unlicensed third-party media",
+                "synthetic identifiable people without explicit package justification and human review",
+                "presentation of generated visuals as documentary evidence",
+            ],
+        },
         "recent_content": recent_content,
         "recent_publishing_history": publishing,
         "recent_duplicate": dict(recent_duplicate) if recent_duplicate else None,
@@ -3903,6 +3931,7 @@ def _content_input_bundle(event_id, provider_mode):
             for item in recent_content
         ],
         "blockers": bundle["blockers"],
+        "original_generation_allowed": bundle["original_generation_allowed"],
     }
     return bundle, hashlib.sha256(json.dumps(material, sort_keys=True).encode()).hexdigest()
 
@@ -3925,14 +3954,9 @@ def _format_supported(content_format, media):
 def _gate_content_proposal(bundle):
     claim_set = bundle["approved_claim_set"]
     missing = list(bundle["blockers"])
-    if not any(
-        item["availability_status"] == "available" and item["rights_status"] == "verified"
-        and item["media_type"] in ("image", "video")
-        for item in bundle["media"]
-    ):
-        missing.append("No rights-verified image or video is currently available for content production.")
     return {
         "decision": "HOLD",
+        "media_source_strategy": "NONE",
         "recommended_format": "IMAGE",
         "language": "English",
         "proposed_duration_seconds": 15,
@@ -3949,22 +3973,46 @@ def _gate_content_proposal(bundle):
 
 
 def _normalize_content_proposal(bundle, proposal, provider_mode):
-    allowed_decisions = {"CREATE", "HOLD", "MONITOR", "SKIP", "HUMAN_REVIEW"}
+    allowed_decisions = {"CREATE", "HOLD", "SKIP"}
     allowed_formats = {"REEL", "STORY", "CAROUSEL", "IMAGE"}
-    decision = proposal.get("decision") if proposal.get("decision") in allowed_decisions else "HUMAN_REVIEW"
+    strategies = {"GENERATE_ORIGINAL", "USE_APPROVED_OWNED_MEDIA", "USE_APPROVED_LICENSED_MEDIA", "NONE"}
+    decision = proposal.get("decision") if proposal.get("decision") in allowed_decisions else "HOLD"
     content_format = proposal.get("recommended_format") if proposal.get("recommended_format") in allowed_formats else "IMAGE"
+    approved_media = [
+        item for item in bundle["media"]
+        if item["availability_status"] == "available" and item["rights_status"] == "verified"
+    ]
+    strategy = proposal.get("media_source_strategy")
+    if strategy not in strategies:
+        if decision == "CREATE" and not approved_media and bundle.get("original_generation_allowed"):
+            strategy = "GENERATE_ORIGINAL"
+        elif decision == "CREATE" and approved_media:
+            owned = any(item.get("metadata", {}).get("rights_basis") == "owned" for item in approved_media)
+            strategy = "USE_APPROVED_OWNED_MEDIA" if owned else "USE_APPROVED_LICENSED_MEDIA"
+        else:
+            strategy = "NONE"
     missing = [str(item) for item in proposal.get("missing_evidence_or_media", [])]
     rationale = str(proposal.get("factual_rationale") or "Provider returned no factual decision rationale.")
     if bundle["recent_duplicate"] and decision == "CREATE":
         decision = "SKIP"
+        strategy = "NONE"
         rationale = "Recent publishing history already covers this event and approved claim-set version."
-    if decision == "CREATE" and not _format_supported(content_format, bundle["media"]):
+    if decision == "CREATE" and not approved_media and bundle.get("original_generation_allowed"):
+        strategy = "GENERATE_ORIGINAL"
+    if decision == "CREATE" and strategy == "GENERATE_ORIGINAL" and not bundle.get("original_generation_allowed"):
         decision = "HOLD"
+        strategy = "NONE"
+        missing.append("Original media generation is not safe or permitted for this story.")
+        rationale += " The proposed original-generation path failed the deterministic safety gate."
+    if decision == "CREATE" and strategy in {"USE_APPROVED_OWNED_MEDIA", "USE_APPROVED_LICENSED_MEDIA"} and not _format_supported(content_format, bundle["media"]):
+        decision = "HOLD"
+        strategy = "NONE"
         missing.append(f"Available rights-verified media does not support {content_format}.")
         rationale += " The proposed format failed the deterministic media-eligibility check."
     claim_set = bundle["approved_claim_set"]
     return {
         "decision": decision,
+        "media_source_strategy": strategy if decision == "CREATE" else "NONE",
         "recommended_format": content_format,
         "language": str(proposal.get("language") or "English")[:80],
         "proposed_duration_seconds": max(1, min(300, int(proposal.get("proposed_duration_seconds") or 15))),
@@ -3983,17 +4031,22 @@ def _normalize_content_proposal(bundle, proposal, provider_mode):
 
 def _insert_content_decision(connection, run, input_version, proposal):
     decision_id = "CD-" + uuid.uuid4().hex[:12].upper()
+    previous = connection.execute(
+        "SELECT id FROM content_decisions WHERE event_id=? ORDER BY decided_at DESC,id DESC LIMIT 1",
+        (run["event_id"],),
+    ).fetchone()
     connection.execute(
         "INSERT INTO content_decisions(id,run_id,event_id,decision,recommended_format,language,"
         "proposed_duration_seconds,priority,factual_rationale,approved_claim_set_id,approved_claim_set_version,"
-        "evidence_version,missing_evidence_or_media_json,executable,test_only,decided_at,policy_version,input_version) "
-        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "evidence_version,missing_evidence_or_media_json,media_source_strategy,previous_decision_id,"
+        "executable,test_only,decided_at,policy_version,input_version) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (
             decision_id, run["id"], run["event_id"], proposal["decision"], proposal["recommended_format"],
             proposal["language"], proposal["proposed_duration_seconds"], proposal["priority"],
             proposal["factual_rationale"], proposal.get("approved_claim_set_id"),
             proposal.get("approved_claim_set_version"), proposal.get("evidence_version"),
             json.dumps(proposal.get("missing_evidence_or_media") or [], ensure_ascii=False),
+            proposal.get("media_source_strategy", "NONE"), previous["id"] if previous else None,
             int(proposal.get("executable", 0)), int(proposal.get("test_only", 0)), now(),
             CONTENT_POLICY_VERSION, input_version,
         ),
@@ -4124,7 +4177,8 @@ def run_content_decision_job(run_id, provider=None):
     if provider_error:
         safe_message = str(provider_error)[:500]
         proposal = {
-            "decision": "HUMAN_REVIEW", "recommended_format": "IMAGE", "language": "English",
+            "decision": "HOLD", "media_source_strategy": "NONE",
+            "recommended_format": "IMAGE", "language": "English",
             "proposed_duration_seconds": 15, "priority": bundle["event"]["priority"],
             "factual_rationale": "Content CEO provider failed; no executable content decision was made.",
             "missing_evidence_or_media": [safe_message],
@@ -4272,8 +4326,13 @@ def _production_eligibility(content_decision_id):
         blockers.append("The Content CEO decision is stale because evidence, media, or publishing inputs changed.")
     if bundle and bundle["eligibility_status"] != "PRODUCTION_APPROVED":
         blockers.extend(bundle["blockers"])
-    if not _format_supported(decision["recommended_format"], media):
+    if decision["media_source_strategy"] == "GENERATE_ORIGINAL":
+        if bundle and not bundle.get("original_generation_allowed"):
+            blockers.append("Original media generation is no longer safe or permitted for this story.")
+    elif decision["media_source_strategy"] in {"USE_APPROVED_OWNED_MEDIA", "USE_APPROVED_LICENSED_MEDIA"} and not _format_supported(decision["recommended_format"], media):
         blockers.append(f"Current rights-cleared media does not support {decision['recommended_format']}.")
+    elif decision["media_source_strategy"] == "NONE" and decision["decision"] == "CREATE":
+        blockers.append("CREATE requires an explicit media-source strategy.")
     evidence_version = _version_hash([(item["snapshot_id"], item["content_hash"], item["invalidated_at"]) for item in evidence])
     media_version = _version_hash([
         (item["id"], item["content_hash"], item["rights_status"], item["availability_status"], item["updated_at"])
@@ -4294,6 +4353,7 @@ def _production_eligibility(content_decision_id):
         },
         "content_decision": {
             "decision_id": decision["id"], "recommended_format": decision["recommended_format"],
+            "media_source_strategy": decision["media_source_strategy"],
             "language": decision["language"], "proposed_duration_seconds": decision["proposed_duration_seconds"],
             "priority": decision["priority"], "factual_rationale": decision["factual_rationale"],
         },
@@ -4314,6 +4374,9 @@ def _production_eligibility(content_decision_id):
         "constraints": [
             "Use only approved_claims for factual content.", "Do not browse or research.",
             "Preserve attribution and certainty.", "No publishing or rendering is authorized.",
+            "Evidence-source media is evidence only and must not become a production asset automatically.",
+            "For GENERATE_ORIGINAL, create neutral non-documentary public-affairs visuals and avoid identifiable people.",
+            "Generated visuals must never be presented as documentary evidence.",
         ],
     }
     input_version = _version_hash({

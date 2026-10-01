@@ -1543,7 +1543,85 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(decision["decision"], "HOLD")
         self.assertEqual(decision["executable"], 0)
         self.assertEqual(run["provider_called"], 0)
+        self.assertEqual(decision["media_source_strategy"], "NONE")
         self.assertIn("No claim-set", decision["missing_evidence_or_media"][0])
+
+    def test_verified_story_without_source_media_can_generate_original(self):
+        event, _, _ = self.production_approved_event(with_media=False)
+        with patch.object(app, "CONTENT_EXECUTOR", DeferredExecutor()):
+            queued = app.enqueue_content_decision(event["event_id"], "grok")
+        app.run_content_decision_job(queued["run"]["id"], FixtureContentProvider())
+        decision = app.event_room(event["event_id"])["content_decision_runs"][0]["decision_record"]
+        self.assertEqual((decision["decision"], decision["executable"]), ("CREATE", 1))
+        self.assertEqual(decision["media_source_strategy"], "GENERATE_ORIGINAL")
+
+    def test_verified_story_with_licensed_media_uses_approved_media(self):
+        event, _, _ = self.production_approved_event(with_media=True)
+        with patch.object(app, "CONTENT_EXECUTOR", DeferredExecutor()):
+            queued = app.enqueue_content_decision(event["event_id"], "grok")
+        app.run_content_decision_job(queued["run"]["id"], FixtureContentProvider())
+        decision = app.event_room(event["event_id"])["content_decision_runs"][0]["decision_record"]
+        self.assertEqual(decision["decision"], "CREATE")
+        self.assertEqual(decision["media_source_strategy"], "USE_APPROVED_LICENSED_MEDIA")
+
+    def test_rights_restricted_required_media_holds_without_provider_call(self):
+        event, _, _ = self.production_approved_event(with_media=False)
+        app.register_media_asset(
+            event["event_id"], "https://media.example/required.jpg", "image", "Restricted fixture",
+            rights_status="restricted", availability_status="available",
+            metadata={"required_for_story": True, "original_generation_prohibited": True},
+        )
+        result = app.enqueue_content_decision(event["event_id"], "grok", background=False)
+        run = app.event_room(event["event_id"])["content_decision_runs"][0]
+        self.assertEqual((result["run"]["status"], run["provider_called"]), ("COMPLETED", 0))
+        self.assertEqual(run["decision_record"]["decision"], "HOLD")
+        self.assertIn("required", run["decision_record"]["factual_rationale"].lower())
+
+    def test_non_executable_story_without_safe_generation_path_holds(self):
+        event, _, _ = self.production_approved_event(with_media=False)
+        app.register_media_asset(
+            event["event_id"], "https://media.example/prohibited.jpg", "image", "Restricted fixture",
+            rights_status="restricted", availability_status="available",
+            metadata={"original_generation_prohibited": True},
+        )
+        app.enqueue_content_decision(event["event_id"], "grok", background=False)
+        decision = app.event_room(event["event_id"])["content_decision_runs"][0]["decision_record"]
+        self.assertEqual((decision["decision"], decision["media_source_strategy"]), ("HOLD", "NONE"))
+
+    def test_evidence_sources_never_become_production_media_automatically(self):
+        event, _, _ = self.production_approved_event(with_media=False)
+        bundle, _ = app._content_input_bundle(event["event_id"], "live")
+        self.assertEqual(bundle["media"], [])
+        self.assertTrue(bundle["approved_claims"])
+
+    def test_new_decision_preserves_prior_hold_and_lineage(self):
+        event, _, _ = self.production_approved_event(with_media=False)
+        asset_url = "https://media.example/required-lineage.jpg"
+        app.register_media_asset(
+            event["event_id"], asset_url, "image", "Restricted fixture",
+            rights_status="restricted", availability_status="available",
+            metadata={"required_for_story": True},
+        )
+        app.enqueue_content_decision(event["event_id"], "grok", background=False)
+        first = app.event_room(event["event_id"])["content_decision_runs"][0]["decision_record"]
+        self.assertEqual(first["decision"], "HOLD")
+        app.register_media_asset(
+            event["event_id"], asset_url, "image", "Owned fixture",
+            rights_status="verified", availability_status="available",
+            metadata={"required_for_story": True, "rights_basis": "owned"},
+        )
+        with patch.object(app, "CONTENT_EXECUTOR", DeferredExecutor()):
+            queued = app.enqueue_content_decision(event["event_id"], "grok")
+        app.run_content_decision_job(queued["run"]["id"], FixtureContentProvider())
+        with app.connect() as connection:
+            preserved = connection.execute("SELECT decision FROM content_decisions WHERE id=?", (first["id"],)).fetchone()
+            latest = connection.execute(
+                "SELECT * FROM content_decisions WHERE event_id=? ORDER BY decided_at DESC,id DESC LIMIT 1",
+                (event["event_id"],),
+            ).fetchone()
+        self.assertEqual(preserved["decision"], "HOLD")
+        self.assertEqual(latest["previous_decision_id"], first["id"])
+        self.assertEqual((latest["decision"], latest["media_source_strategy"]), ("CREATE", "USE_APPROVED_OWNED_MEDIA"))
 
     def test_content_ceo_blocks_stale_approved_claim_set(self):
         event, _, _ = self.production_approved_event(with_media=True)
@@ -1624,7 +1702,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertFalse(changed_evidence["cached"])
         self.assertNotEqual(changed_history["run"]["input_version"], changed_evidence["run"]["input_version"])
 
-    def test_content_provider_failure_persists_human_review(self):
+    def test_content_provider_failure_persists_hold(self):
         event, _, _ = self.production_approved_event(with_media=True)
         with patch.object(app, "CONTENT_EXECUTOR", DeferredExecutor()):
             queued = app.enqueue_content_decision(event["event_id"], "grok")
@@ -1634,7 +1712,8 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(run["status"], "FAILED")
         self.assertEqual(run["cost_status"], "unknown")
         self.assertIsNone(run["total_tokens"])
-        self.assertEqual(run["decision_record"]["decision"], "HUMAN_REVIEW")
+        self.assertEqual(run["decision_record"]["decision"], "HOLD")
+        self.assertEqual(run["decision_record"]["media_source_strategy"], "NONE")
         self.assertEqual(run["decision_record"]["executable"], 0)
 
     def test_production_positive_fixture_creates_one_validated_immutable_package(self):
@@ -1661,7 +1740,16 @@ class WorkflowTests(unittest.TestCase):
         event, _, _ = self.production_approved_event(with_media=False)
         with patch.object(app, "CONTENT_EXECUTOR", DeferredExecutor()):
             queued = app.enqueue_content_decision(event["event_id"], "grok")
-        app.run_content_decision_job(queued["run"]["id"], FixtureContentProvider())
+        app.run_content_decision_job(queued["run"]["id"], FixtureContentProvider({
+            "decision": "HOLD",
+            "recommended_format": "NONE",
+            "language": "English",
+            "proposed_duration_seconds": None,
+            "priority": "NORMAL",
+            "factual_rationale": "Controlled editorial hold unrelated to source-media availability.",
+            "missing_evidence_or_media": ["Editorial execution is intentionally paused."],
+            "media_source_strategy": "NONE",
+        }))
         hold = app.event_room(event["event_id"])["content_decision_runs"][0]["decision_record"]
         self.assertEqual(hold["decision"], "HOLD")
         with self.assertRaisesRegex(ValueError, "HOLD"):
