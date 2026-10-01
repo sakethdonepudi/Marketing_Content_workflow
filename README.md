@@ -209,6 +209,12 @@ Verified against Meta's official docs (Graph API v25.0, configurable via `META_G
 - **Duplicate protection:** client request keys; one in-flight job and one successful post per platform and video, enforced by unique indexes.
 - **Retries:** transient failures retry within `PUBLISH_MAX_ATTEMPTS`. An ambiguous publish moves to `NEEDS_INTERVENTION` and is never re-sent; "Check status" is free and never reposts. On restart, in-flight jobs are never re-run automatically.
 
+### Final Reel Composer (migration `020`, `021`)
+
+`final_reel_composer.py` composes a 9:16 Reel from one approved generated video: approved-package narration, Apple Speech voice-over, burned-in synchronized subtitles, and a quiet original ambient music bed. Composition runs from the Media tab only for a live, validated, QA-passed source video, and every composition is a new immutable `final_reel_assets` version (never overwrites a prior run). The composer validates that narration is verbatim approved package/claim text, checks the output for 720×1280 H.264/AAC, 12–25 s, fast-start with no edit lists, and records technical, subtitle-OCR, audio, and factual QA plus Instagram/Facebook Reels compliance.
+
+Human approval is per exact Final Reel version in `final_reel_reviews` and never inherited. When an approved Final Reel exists, Meta distribution binds to that reel's bytes and checksum (`distribution_packages.media_source = FINAL_REEL`, `final_reel_asset_id`, `final_reel_review_id`); the raw xAI video is refused for the same source. Migration `021` is additive and forward-only. Publishing switches remain off and nothing publishes or schedules automatically.
+
 ## Structured errors
 
 Application and ingestion errors are emitted to stderr as one JSON object per line. Records include UTC time, level, event name, message, request/source context, and never include fetched page bodies. Configure verbosity with `LOG_LEVEL`.

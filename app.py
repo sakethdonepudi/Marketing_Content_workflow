@@ -69,6 +69,7 @@ from media_tools import (
     prepare_video_source, sample_times, warm_media_probe,
 )
 from visual_qa import visual_qa_provider_for
+import final_reel_composer
 from meta_distribution import (
     COPY_POLICY_VERSION as DISTRIBUTION_COPY_POLICY_VERSION,
     PLATFORMS as META_PLATFORMS,
@@ -6445,7 +6446,7 @@ def _latest_distribution_review(connection, package_id):
     return dict(row) if row else None
 
 
-def _distribution_media_blockers(connection, asset_id):
+def _distribution_media_blockers(connection, asset_id, *, allow_superseded=False):
     """Media must be a live, validated, current video whose latest human review is APPROVED."""
     asset = connection.execute("SELECT * FROM generated_assets WHERE id=?", (asset_id,)).fetchone()
     if asset is None:
@@ -6464,7 +6465,166 @@ def _distribution_media_blockers(connection, asset_id):
         blockers.append("The media asset's latest human review is not APPROVED.")
     elif review["asset_version"] != asset["version_number"]:
         blockers.append("The media approval belongs to a different asset version.")
+    if not allow_superseded:
+        approved_reel = connection.execute(
+            "SELECT f.id FROM final_reel_assets f WHERE f.source_asset_id=? AND f.status='READY_FOR_REVIEW' "
+            "AND EXISTS(SELECT 1 FROM final_reel_reviews r WHERE r.final_reel_asset_id=f.id AND r.action='APPROVED') "
+            "ORDER BY f.created_at DESC, f.id DESC LIMIT 1", (asset_id,),
+        ).fetchone()
+        if approved_reel:
+            blockers.append(
+                f"An approved Final Reel ({approved_reel['id']}) exists; distribute that instead of the raw video."
+            )
     return asset, job, review, blockers
+
+
+def _latest_final_reel_review(connection, final_reel_id):
+    row = connection.execute(
+        "SELECT * FROM final_reel_reviews WHERE final_reel_asset_id=? ORDER BY created_at DESC,id DESC LIMIT 1",
+        (final_reel_id,),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def _latest_media_qa_statuses(connection, asset_id):
+    rows = connection.execute(
+        "SELECT qa_kind,status FROM media_qa_runs m WHERE generated_asset_id=? AND run_number=("
+        "SELECT MAX(run_number) FROM media_qa_runs WHERE generated_asset_id=m.generated_asset_id AND qa_kind=m.qa_kind)",
+        (asset_id,),
+    ).fetchall()
+    return {row["qa_kind"]: row["status"] for row in rows}
+
+
+def _final_reel_source_blockers(connection, source_asset_id):
+    """A Final Reel may only be composed from a live, QA-passed, lineage-current generated video."""
+    row = connection.execute(
+        "SELECT ga.*,rj.status AS job_status FROM generated_assets ga JOIN render_jobs rj ON rj.id=ga.render_job_id "
+        "WHERE ga.id=?", (source_asset_id,),
+    ).fetchone()
+    if row is None:
+        return None, None, [f"Source asset {source_asset_id} does not exist."]
+    asset = dict(row)
+    job = dict(connection.execute("SELECT * FROM render_jobs WHERE id=?", (asset["render_job_id"],)).fetchone())
+    blockers = []
+    if asset["media_type"] not in ("VIDEO", "SHORT_FORM_VIDEO", "LONG_FORM_VIDEO"):
+        blockers.append("Only a generated video can become a Final Reel source.")
+    if asset["fixture_only"]:
+        blockers.append("Fixture placeholder media can never become a Final Reel source.")
+    if not asset["executable"]:
+        blockers.append("Non-executable media can never become a Final Reel source.")
+    if asset["status"] != "VALIDATED" or asset["stale"] or not asset["usable_for_review"]:
+        blockers.append("The source video is not a validated, current, usable asset.")
+    if job["status"] != "READY_FOR_REVIEW":
+        blockers.append("The source render job did not finish at READY_FOR_REVIEW.")
+    qa = _latest_media_qa_statuses(connection, source_asset_id)
+    if qa.get("TECHNICAL") != "PASS":
+        blockers.append("The source video's latest technical QA is not PASS.")
+    if qa.get("OCR") == "FLAG":
+        blockers.append("The source video's latest OCR QA flagged unexpected text.")
+    if qa.get("VISUAL") == "FLAG":
+        blockers.append("The source video's latest visual QA is flagged.")
+    _, lineage_blockers = _distribution_lineage_blockers(job)
+    blockers.extend(lineage_blockers)
+    return asset, job, list(dict.fromkeys(blockers))
+
+
+def final_reel_asset(final_reel_id):
+    with connect() as connection:
+        row = connection.execute("SELECT * FROM final_reel_assets WHERE id=?", (final_reel_id,)).fetchone()
+        if row is None:
+            raise KeyError(final_reel_id)
+        result = dict(row)
+        result["reviews"] = [dict(item) for item in connection.execute(
+            "SELECT * FROM final_reel_reviews WHERE final_reel_asset_id=? ORDER BY created_at DESC,id DESC",
+            (final_reel_id,),
+        )]
+    decoded = final_reel_composer.decoded_final_reel(result)
+    decoded["latest_review"] = decoded["reviews"][0] if decoded["reviews"] else None
+    return decoded
+
+
+def create_final_reel(source_asset_id, *, composer=None):
+    """Compose exactly one immutable Final Reel derivative from an eligible source video."""
+    with connect() as connection:
+        asset, job, blockers = _final_reel_source_blockers(connection, source_asset_id)
+    if blockers:
+        raise ValueError("Final Reel composition blocked: " + " ".join(blockers))
+    composer = composer or final_reel_composer.compose_final_reel
+    try:
+        result = composer(source_asset_id, connect=connect, storage_root=RENDER_STORAGE_ROOT, now=now)
+    except final_reel_composer.FinalReelError as error:
+        raise ValueError(f"Final Reel composition failed: {error}") from error
+    if isinstance(result, dict) and result.get("id"):
+        return final_reel_asset(result["id"])
+    return result
+
+
+def review_final_reel(final_reel_id, action, reviewer, comment=None):
+    """Human approval is bound to one exact immutable Final Reel version and never inherited."""
+    if action not in ("APPROVED", "CHANGES_REQUIRED", "REJECTED"):
+        raise ValueError("Review action must be APPROVED, CHANGES_REQUIRED, or REJECTED.")
+    reviewer = str(reviewer or "").strip()
+    if not reviewer:
+        raise ValueError("Reviewer name is required.")
+    comment = str(comment or "").strip()[:2000] or None
+    with connect() as connection:
+        reel = connection.execute("SELECT * FROM final_reel_assets WHERE id=?", (final_reel_id,)).fetchone()
+        if reel is None:
+            raise KeyError(final_reel_id)
+        if action == "APPROVED" and reel["status"] != "READY_FOR_REVIEW":
+            raise ValueError("A blocked Final Reel cannot be approved.")
+        review_id = "FRR-" + uuid.uuid4().hex[:12].upper()
+        connection.execute(
+            "INSERT INTO final_reel_reviews(id,final_reel_asset_id,action,reviewer,comment,created_at) VALUES(?,?,?,?,?,?)",
+            (review_id, final_reel_id, action, reviewer, comment, now()),
+        )
+    return final_reel_asset(final_reel_id)
+
+
+def _final_reel_distribution_blockers(connection, final_reel_id):
+    """A Final Reel can be distributed only when both the source lineage and the exact reel are approved."""
+    reel = connection.execute("SELECT * FROM final_reel_assets WHERE id=?", (final_reel_id,)).fetchone()
+    if reel is None:
+        raise KeyError(final_reel_id)
+    reel = dict(reel)
+    asset, job, source_review, source_blockers = _distribution_media_blockers(
+        connection, reel["source_asset_id"], allow_superseded=True
+    )
+    blockers = list(source_blockers)
+    if reel["status"] != "READY_FOR_REVIEW":
+        blockers.append("Only a READY_FOR_REVIEW Final Reel can be distributed.")
+    review = _latest_final_reel_review(connection, final_reel_id)
+    if not review or review["action"] != "APPROVED":
+        blockers.append("The Final Reel's latest human review is not APPROVED.")
+    return reel, asset, job, source_review, review, list(dict.fromkeys(blockers))
+
+
+def _distribution_media(connection, media_source, media_id):
+    """Resolve either a raw generated video or an approved Final Reel into one media binding."""
+    if media_source == "FINAL_REEL":
+        reel, asset, job, source_review, reel_review, blockers = _final_reel_distribution_blockers(connection, media_id)
+        return {
+            "media_source": "FINAL_REEL", "generated_asset_id": asset["id"], "asset_version": asset["version_number"],
+            "checksum": reel["checksum_sha256"], "storage_uri": reel["storage_uri"], "mime_type": reel["mime_type"],
+            "media_review_id": source_review["id"] if source_review else None,
+            "final_reel_asset_id": reel["id"], "final_reel_review_id": reel_review["id"] if reel_review else None,
+            "event_id": reel["event_id"], "content_package_id": reel["content_package_id"],
+            "content_package_version": reel["content_package_version"], "job": job, "asset": asset,
+            "review": reel_review, "source_review": source_review, "blockers": blockers,
+        }
+    asset, job, review, blockers = _distribution_media_blockers(connection, media_id)
+    return {
+        "media_source": "GENERATED_ASSET", "generated_asset_id": asset["id"], "asset_version": asset["version_number"],
+        "checksum": asset["checksum_sha256"], "storage_uri": asset["storage_uri"], "mime_type": asset["mime_type"],
+        "media_review_id": review["id"] if review else None, "final_reel_asset_id": None, "final_reel_review_id": None,
+        "event_id": asset["event_id"], "content_package_id": asset["content_package_id"],
+        "content_package_version": asset["content_package_version"], "job": job, "asset": asset,
+        "review": review, "source_review": review, "blockers": blockers,
+    }
+
+
+def _package_media_id(package):
+    return package.get("final_reel_asset_id") if package.get("media_source") == "FINAL_REEL" else package.get("generated_asset_id")
 
 
 def _distribution_lineage_blockers(job):
@@ -6476,20 +6636,13 @@ def _distribution_lineage_blockers(job):
     return gate, blockers
 
 
-def create_distribution_package(asset_id, platform, cover_time_ms=None, *, storage=None):
-    """Build an immutable platform package from approved content only. Requires APPROVED media."""
-    if platform not in META_PLATFORMS:
-        raise ValueError("Platform must be INSTAGRAM_REELS or FACEBOOK_REELS.")
-    storage = storage or LocalMediaStorage(RENDER_STORAGE_ROOT)
-    with connect() as connection:
-        asset, job, review, blockers = _distribution_media_blockers(connection, asset_id)
-    if blockers:
-        raise ValueError("Distribution blocked: " + " ".join(blockers))
+def _create_distribution_package(media, platform, cover_time_ms, storage):
+    job = media["job"]
     gate, lineage_blockers = _distribution_lineage_blockers(job)
     if lineage_blockers:
         raise ValueError("Distribution blocked: " + " ".join(lineage_blockers))
-    data = storage.get(asset["storage_uri"])
-    if hashlib.sha256(data).hexdigest() != asset["checksum_sha256"]:
+    data = storage.get(media["storage_uri"])
+    if hashlib.sha256(data).hexdigest() != media["checksum"]:
         raise ValueError("Distribution blocked: stored media bytes do not match the approved checksum.")
     video = {**inspect_video(data), "file_size": len(data)}
     compliance = check_platform_compliance(platform, video)
@@ -6508,8 +6661,10 @@ def create_distribution_package(asset_id, platform, cover_time_ms=None, *, stora
     copy = build_platform_copy(platform, package, claims, cover_time_ms=cover_time_ms)
     validation = validate_platform_copy(copy, package, claims, platform)
     record = {
-        "platform": platform, "asset": [asset["id"], asset["version_number"], asset["checksum_sha256"]],
-        "review": review["id"], "package": [gate["package"]["id"], gate["package"]["version_number"], gate["package"]["content_hash"]],
+        "platform": platform, "media_source": media["media_source"],
+        "asset": [media["generated_asset_id"], media["asset_version"], media["checksum"]],
+        "final_reel": media["final_reel_asset_id"], "review": media["media_review_id"],
+        "package": [gate["package"]["id"], gate["package"]["version_number"], gate["package"]["content_hash"]],
         "copy": {key: copy[key] for key in ("caption", "title", "hashtags", "accessibility_text", "cover", "platform_metadata")},
     }
     timestamp = now()
@@ -6517,7 +6672,7 @@ def create_distribution_package(asset_id, platform, cover_time_ms=None, *, stora
         connection.execute("BEGIN IMMEDIATE")
         version = connection.execute(
             "SELECT COALESCE(MAX(version_number),0)+1 FROM distribution_packages WHERE platform=? AND generated_asset_id=?",
-            (platform, asset_id),
+            (platform, media["generated_asset_id"]),
         ).fetchone()[0]
         package_id = "DP-" + uuid.uuid4().hex[:12].upper()
         connection.execute(
@@ -6525,20 +6680,50 @@ def create_distribution_package(asset_id, platform, cover_time_ms=None, *, stora
             "asset_checksum_sha256,media_review_id,content_package_id,content_package_version,content_package_hash,"
             "approved_claim_set_id,approved_claim_set_version,caption,title,hashtags_json,accessibility_text,cover_json,"
             "platform_metadata_json,copy_provenance_json,copy_validation_json,compliance_json,compliant,copy_policy_version,"
-            "content_hash,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "content_hash,created_at,media_source,final_reel_asset_id,final_reel_review_id) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
-                package_id, asset["event_id"], platform, version, asset_id, asset["version_number"], asset["checksum_sha256"],
-                review["id"], gate["package"]["id"], gate["package"]["version_number"], gate["package"]["content_hash"],
-                gate["package"]["approved_claim_set_id"], gate["package"]["approved_claim_set_version"],
-                copy["caption"], copy["title"], json.dumps(copy["hashtags"]), copy["accessibility_text"],
-                json.dumps(copy["cover"]), json.dumps(copy["platform_metadata"]), json.dumps(copy["provenance"]),
-                json.dumps(validation), json.dumps({**compliance, "decoded": {k: v for k, v in video.items() if k != "decoder"}}),
+                package_id, media["event_id"], platform, version, media["generated_asset_id"], media["asset_version"],
+                media["checksum"], media["media_review_id"], gate["package"]["id"], gate["package"]["version_number"],
+                gate["package"]["content_hash"], gate["package"]["approved_claim_set_id"],
+                gate["package"]["approved_claim_set_version"], copy["caption"], copy["title"], json.dumps(copy["hashtags"]),
+                copy["accessibility_text"], json.dumps(copy["cover"]), json.dumps(copy["platform_metadata"]),
+                json.dumps(copy["provenance"]), json.dumps(validation),
+                json.dumps({**compliance, "decoded": {k: v for k, v in video.items() if k != "decoder"}}),
                 int(compliance["compliant"] and validation["valid"]), DISTRIBUTION_COPY_POLICY_VERSION,
-                meta_content_hash(record), timestamp,
+                meta_content_hash(record), timestamp, media["media_source"], media["final_reel_asset_id"],
+                media["final_reel_review_id"],
             ),
         )
         connection.commit()
     return distribution_package(package_id)
+
+
+def create_distribution_package(asset_id, platform, cover_time_ms=None, *, storage=None):
+    """Build an immutable platform package from an approved raw generated video.
+
+    Blocked when an approved Final Reel exists for the same source so the composed reel is used instead.
+    """
+    if platform not in META_PLATFORMS:
+        raise ValueError("Platform must be INSTAGRAM_REELS or FACEBOOK_REELS.")
+    storage = storage or LocalMediaStorage(RENDER_STORAGE_ROOT)
+    with connect() as connection:
+        media = _distribution_media(connection, "GENERATED_ASSET", asset_id)
+    if media["blockers"]:
+        raise ValueError("Distribution blocked: " + " ".join(media["blockers"]))
+    return _create_distribution_package(media, platform, cover_time_ms, storage)
+
+
+def create_final_reel_distribution_package(final_reel_id, platform, cover_time_ms=None, *, storage=None):
+    """Build an immutable platform package bound to one approved immutable Final Reel."""
+    if platform not in META_PLATFORMS:
+        raise ValueError("Platform must be INSTAGRAM_REELS or FACEBOOK_REELS.")
+    storage = storage or LocalMediaStorage(RENDER_STORAGE_ROOT)
+    with connect() as connection:
+        media = _distribution_media(connection, "FINAL_REEL", final_reel_id)
+    if media["blockers"]:
+        raise ValueError("Distribution blocked: " + " ".join(media["blockers"]))
+    return _create_distribution_package(media, platform, cover_time_ms, storage)
 
 
 def distribution_package(package_id):
@@ -6570,10 +6755,11 @@ def review_distribution_package(package_id, action, reviewer, comment=None):
             problems.extend(package["compliance"].get("errors") or [])
             problems.extend(package["copy_validation"].get("errors") or [])
         with connect() as connection:
-            _, _, _, media_blockers = _distribution_media_blockers(connection, package["generated_asset_id"])
-            media_review = _latest_media_review(connection, package["generated_asset_id"])
-        problems.extend(media_blockers)
-        if media_review and media_review["id"] != package["media_review_id"] and media_review["action"] != "APPROVED":
+            media = _distribution_media(connection, package.get("media_source") or "GENERATED_ASSET", _package_media_id(package))
+            media_review = media["review"]
+        problems.extend(media["blockers"])
+        expected_review_id = package.get("final_reel_review_id") or package["media_review_id"]
+        if media_review and media_review["id"] != expected_review_id and media_review["action"] != "APPROVED":
             problems.append("The media review this package was built on is no longer the current approval.")
         if problems:
             raise ValueError("Platform package cannot be approved: " + " ".join(dict.fromkeys(problems)))
@@ -6590,13 +6776,12 @@ def _publish_gate(package, *, require_live=True):
     """Every condition required to post. Re-evaluated at execution time, never cached."""
     blockers = []
     with connect() as connection:
-        _, job, media_review, media_blockers = _distribution_media_blockers(connection, package["generated_asset_id"])
+        media = _distribution_media(connection, package.get("media_source") or "GENERATED_ASSET", _package_media_id(package))
         distribution_review = _latest_distribution_review(connection, package["id"])
-        asset = connection.execute("SELECT checksum_sha256 FROM generated_assets WHERE id=?", (package["generated_asset_id"],)).fetchone()
-    blockers.extend(media_blockers)
-    if asset["checksum_sha256"] != package["asset_checksum_sha256"]:
+    blockers.extend(media["blockers"])
+    if media["checksum"] != package["asset_checksum_sha256"]:
         blockers.append("The media checksum no longer matches the platform package.")
-    _, lineage_blockers = _distribution_lineage_blockers(job)
+    _, lineage_blockers = _distribution_lineage_blockers(media["job"])
     blockers.extend(lineage_blockers)
     if not package["compliant"]:
         blockers.append("The platform package failed platform compliance or copy validation.")
@@ -6613,7 +6798,9 @@ def _publish_gate(package, *, require_live=True):
             blockers.append("Missing platform configuration: " + ", ".join(configuration["missing"]))
     return {
         "allowed": not blockers, "blockers": list(dict.fromkeys(blockers)),
-        "media_review_id": media_review["id"] if media_review else None,
+        "media_source": media["media_source"],
+        "media_review_id": media["media_review_id"],
+        "final_reel_asset_id": media["final_reel_asset_id"],
         "distribution_review_id": distribution_review["id"] if distribution_review else None,
         "switches": meta_publishing_switches(), "checked_at": now(),
     }
@@ -6707,12 +6894,13 @@ def request_publish(package_id, *, mode="NOW", scheduled_for=None, client_reques
         connection.execute(
             "INSERT INTO publish_jobs(id,distribution_package_id,event_id,platform,generated_asset_id,asset_checksum_sha256,mode,"
             "status,scheduled_for,idempotency_key,client_request_id,requested_by,api_version,max_attempts,gate_snapshot_json,"
-            "created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "created_at,updated_at,media_source,final_reel_asset_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 job_id, package["id"], package["event_id"], package["platform"], package["generated_asset_id"],
                 package["asset_checksum_sha256"], mode, "QUEUED" if mode == "NOW" else "SCHEDULED", scheduled_for,
                 idempotency_key, client_request_id, str(requested_by or "")[:120] or None, meta_api_version(),
                 PUBLISH_MAX_ATTEMPTS, json.dumps(gate), timestamp, timestamp,
+                package.get("media_source") or "GENERATED_ASSET", package.get("final_reel_asset_id"),
             ),
         )
         if client_request_id:
@@ -6803,8 +6991,8 @@ def execute_publish_job(job_id, publisher=None, video_loader=None):
     stage = "container"
     try:
         with connect() as connection:
-            asset = dict(connection.execute("SELECT * FROM generated_assets WHERE id=?", (package["generated_asset_id"],)).fetchone())
-        data = (video_loader or LocalMediaStorage(RENDER_STORAGE_ROOT).get)(asset["storage_uri"])
+            media = _distribution_media(connection, package.get("media_source") or "GENERATED_ASSET", _package_media_id(package))
+        data = (video_loader or LocalMediaStorage(RENDER_STORAGE_ROOT).get)(media["storage_uri"])
         if hashlib.sha256(data).hexdigest() != package["asset_checksum_sha256"]:
             raise MetaRejectedError("Video bytes do not match the approved checksum.")
         container = job.get("provider_container_id") or _with_retries(job, "container", lambda: publisher.create_container(copy))
@@ -7213,6 +7401,17 @@ def event_room(event_id):
             "SELECT * FROM cost_ledger WHERE event_id=? ORDER BY recorded_at,id", (event_id,)
         )]
         cost_summary = production_cost_summary(connection, event_id)
+        final_reels = []
+        for row in connection.execute(
+            "SELECT * FROM final_reel_assets WHERE event_id=? ORDER BY created_at DESC,id DESC", (event_id,)
+        ):
+            reel = final_reel_composer.decoded_final_reel(dict(row))
+            reel["reviews"] = [dict(item) for item in connection.execute(
+                "SELECT * FROM final_reel_reviews WHERE final_reel_asset_id=? ORDER BY created_at DESC,id DESC",
+                (reel["id"],),
+            )]
+            reel["latest_review"] = reel["reviews"][0] if reel["reviews"] else None
+            final_reels.append(reel)
     for run in runs:
         run["summary"] = json.loads(run.pop("summary_json")) if run.get("summary_json") else None
     for verification in verification_runs:
@@ -7295,8 +7494,23 @@ def event_room(event_id):
             source_gate = _render_eligibility(latest_package["id"], "VIDEO", asset["id"])
             source_blockers = list(source_gate["blockers"]) + ([] if asset["current_for_review"] else ["This image is not current for review."])
             asset["video_source"] = {"eligible": not source_blockers, "blockers": list(dict.fromkeys(source_blockers))}
+    final_reel_eligible = None
+    with connect() as connection:
+        for render in render_jobs:
+            for asset in render["assets"]:
+                if asset["media_type"] not in ("VIDEO", "SHORT_FORM_VIDEO", "LONG_FORM_VIDEO"):
+                    asset["final_reel"] = {
+                        "eligible": False,
+                        "blockers": ["Only a generated video can become a Final Reel source."],
+                    }
+                    continue
+                _, _, blockers = _final_reel_source_blockers(connection, asset["id"])
+                if not blockers and final_reel_eligible is None:
+                    final_reel_eligible = asset["id"]
+                asset["final_reel"] = {"eligible": not blockers, "blockers": blockers}
     return {
         "event": dict(event), "signals": signals, "claims": claims, "runs": runs,
+        "final_reels": final_reels, "final_reel_source_asset_id": final_reel_eligible,
         "verification_runs": verification_runs, "approved_claim_sets": approved_sets,
         "source_acquisition_runs": acquisition_runs, "official_source_registry": official_source_registry,
         "content_decision_runs": content_runs, "media_assets": media_assets,
@@ -7471,6 +7685,25 @@ class Handler(SimpleHTTPRequestHandler):
                 return
             self.send_binary(storage.get(asset["storage_uri"]), asset["mime_type"])
             return
+        match = re.fullmatch(r"/api/final-reels/([^/]+)", path)
+        if match:
+            self.send_json({"asset": final_reel_asset(match.group(1))})
+            return
+        match = re.fullmatch(r"/api/final-reels/([^/]+)/content", path)
+        if match:
+            with connect() as connection:
+                row = connection.execute(
+                    "SELECT storage_uri,mime_type FROM final_reel_assets WHERE id=?", (match.group(1),)
+                ).fetchone()
+            if row is None:
+                self.send_json({"error": "final reel not found"}, 404)
+                return
+            storage = LocalMediaStorage(RENDER_STORAGE_ROOT)
+            if not storage.exists(row["storage_uri"]):
+                self.send_json({"error": "stored final reel is unavailable"}, 404)
+                return
+            self.send_binary(storage.get(row["storage_uri"]), row["mime_type"])
+            return
         match = re.fullmatch(r"/api/derived-assets/([^/]+)/content", path)
         if match:
             with connect() as connection:
@@ -7579,6 +7812,24 @@ class Handler(SimpleHTTPRequestHandler):
                     match.group(1), body.get("action"), body.get("reviewer"), body.get("comment"),
                 )
                 self.send_json({"review": review}, 201)
+                return
+            match = re.fullmatch(r"/api/generated-assets/([^/]+)/final-reels", path)
+            if match:
+                self.send_json({"asset": create_final_reel(match.group(1))}, 201)
+                return
+            match = re.fullmatch(r"/api/final-reels/([^/]+)/review", path)
+            if match:
+                asset = review_final_reel(
+                    match.group(1), body.get("action"), body.get("reviewer"), body.get("comment"),
+                )
+                self.send_json({"asset": asset}, 201)
+                return
+            match = re.fullmatch(r"/api/final-reels/([^/]+)/distribution-packages", path)
+            if match:
+                package = create_final_reel_distribution_package(
+                    match.group(1), body.get("platform"), body.get("cover_time_ms")
+                )
+                self.send_json({"distribution_package": package}, 201)
                 return
             match = re.fullmatch(r"/api/generated-assets/([^/]+)/distribution-packages", path)
             if match:

@@ -13,6 +13,7 @@ from content_ceo import ContentProviderResult
 from content_production import DeterministicProductionFixtureAdapter, ProductionProviderResult
 import content_production
 import meta_distribution
+import final_reel_composer
 import media_rendering
 import media_qa
 import visual_qa
@@ -3825,6 +3826,162 @@ class WorkflowTests(unittest.TestCase):
         for phrase in ("Publish now", "Cancel schedule", "Schedule", "Publishing is OFF", "Check status",
                        "Instagram Reels", "Facebook Reels", "client_request_id"):
             self.assertIn(phrase, source)
+
+    # ---------- Final Reel Composer integration ----------
+
+    def _final_reel_fixture(self, source_asset_id, *, duration=14.0, qa_pass=True):
+        with app.connect() as connection:
+            source = dict(connection.execute("SELECT * FROM generated_assets WHERE id=?", (source_asset_id,)).fetchone())
+            package_row = connection.execute(
+                "SELECT package_json FROM content_packages WHERE id=? AND version_number=?",
+                (source["content_package_id"], source["content_package_version"]),
+            ).fetchone()
+        narration = final_reel_composer.approved_narration(json.loads(package_row["package_json"]))
+        stored = LocalMediaStorage(app.RENDER_STORAGE_ROOT).save(
+            mp4_bytes(720, 1280, duration, fps=24, audio=True), extension="mp4"
+        )
+        status = "PASS" if qa_pass else "FLAG"
+        qa = {"status": status, "errors": []}
+        row = {
+            "id": "FR-" + app.uuid.uuid4().hex[:12].upper(), "event_id": source["event_id"],
+            "content_package_id": source["content_package_id"], "content_package_version": source["content_package_version"],
+            "source_asset_id": source["id"], "source_asset_version": source["version_number"],
+            "source_asset_checksum_sha256": source["checksum_sha256"], "source_render_job_id": source["render_job_id"],
+            "storage_uri": stored.storage_uri, "mime_type": "video/mp4", "width": 720, "height": 1280,
+            "duration_seconds": duration, "frame_rate": 24.0, "codec": "avc1", "has_audio": 1, "audio_codec": "mp4a",
+            "file_size": stored.file_size, "checksum_sha256": stored.checksum_sha256, "narration_text": narration,
+            "voice_provider": "apple-speech", "voice_model": "Aman (en-IN)",
+            "subtitle_manifest_json": json.dumps({"burned_in": True, "cues": []}),
+            "audio_manifest_json": json.dumps({"status": status, "music_below_speech": True}),
+            "transform_manifest_json": json.dumps({"policy_version": final_reel_composer.COMPOSER_POLICY_VERSION}),
+            "transform_hash": app.hashlib.sha256(app.uuid.uuid4().bytes).hexdigest(),
+            "technical_qa_json": json.dumps(qa), "subtitle_qa_json": json.dumps(qa), "audio_qa_json": json.dumps(qa),
+            "factual_qa_json": json.dumps({"status": "PASS", "no_new_factual_claims": True}),
+            "instagram_compatibility_json": json.dumps({"compliant": True, "errors": []}),
+            "facebook_compatibility_json": json.dumps({"compliant": True, "errors": []}),
+            "status": "READY_FOR_REVIEW" if qa_pass else "BLOCKED", "cost_status": "not_billed", "cost_usd": 0.0,
+            "currency": "USD", "created_at": app.now(),
+        }
+        with app.connect() as connection:
+            connection.execute(
+                f"INSERT INTO final_reel_assets({','.join(row)}) VALUES({','.join('?' for _ in row)})",
+                tuple(row.values()),
+            )
+        return app.final_reel_asset(row["id"])
+
+    def _fake_composer(self, duration=13.6):
+        def compose(source_asset_id, **kwargs):
+            # The real composer produces distinct bytes per transform; the duration gives each fixture a unique checksum.
+            return self._final_reel_fixture(source_asset_id, duration=duration)
+        return compose
+
+    def test_final_reel_composition_gate_and_per_version_approval(self):
+        _, asset_id = self.approved_meta_video()
+        with self.assertRaisesRegex(ValueError, "Final Reel composition blocked"):
+            app.create_final_reel("GA-DOES-NOT-EXIST", composer=self._fake_composer())
+        first = app.create_final_reel(asset_id, composer=self._fake_composer(duration=13.6))
+        second = app.create_final_reel(asset_id, composer=self._fake_composer(duration=13.7))
+        self.assertNotEqual(first["id"], second["id"])
+        self.assertIsNone(first["latest_review"])
+        approved = app.review_final_reel(first["id"], "APPROVED", "Reel Reviewer", "Looks good")
+        self.assertEqual(approved["latest_review"]["action"], "APPROVED")
+        self.assertIsNone(app.final_reel_asset(second["id"])["latest_review"])
+        with app.connect() as connection, self.assertRaises(sqlite3.IntegrityError):
+            connection.execute("UPDATE final_reel_assets SET narration_text='edit' WHERE id=?", (first["id"],))
+        room = app.event_room(first["event_id"])
+        self.assertEqual({reel["id"] for reel in room["final_reels"]}, {first["id"], second["id"]})
+        self.assertEqual(room["final_reel_source_asset_id"], asset_id)
+        by_id = {asset["id"]: asset for render in room["render_jobs"] for asset in render["assets"]}
+        self.assertTrue(by_id[asset_id]["final_reel"]["eligible"], by_id[asset_id]["final_reel"])
+
+    def test_final_reel_source_gate_rejects_ineligible_media(self):
+        _, asset_id = self.approved_meta_video(review=False)
+        with self.assertRaisesRegex(ValueError, "Final Reel composition blocked"):
+            app.create_final_reel("GA-NOT-A-VIDEO", composer=self._fake_composer())
+        with self.assertRaisesRegex(ValueError, "cannot be approved"):
+            app.review_final_reel(self._final_reel_fixture(asset_id, qa_pass=False)["id"], "APPROVED", "Reviewer")
+
+    def test_distribution_binds_approved_final_reel_not_raw_video(self):
+        _, asset_id = self.approved_meta_video()
+        reel = self._final_reel_fixture(asset_id)
+        app.review_final_reel(reel["id"], "APPROVED", "Reel Reviewer")
+        with self.assertRaisesRegex(ValueError, "approved Final Reel"):
+            app.create_distribution_package(asset_id, "INSTAGRAM_REELS")
+        package = app.create_final_reel_distribution_package(reel["id"], "INSTAGRAM_REELS")
+        self.assertEqual(
+            (package["media_source"], package["final_reel_asset_id"], package["asset_checksum_sha256"]),
+            ("FINAL_REEL", reel["id"], reel["checksum_sha256"]),
+        )
+        app.review_distribution_package(package["id"], "APPROVED", "Distribution Reviewer")
+        with self.meta_live():
+            gate = app._publish_gate(app.distribution_package(package["id"]))
+        self.assertTrue(gate["allowed"], gate["blockers"])
+        self.assertEqual(gate["final_reel_asset_id"], reel["id"])
+        with app.connect() as connection:
+            media = app._distribution_media(connection, "FINAL_REEL", reel["id"])
+        self.assertEqual(media["storage_uri"], reel["storage_uri"])
+
+    def test_final_reel_http_routes_and_ui_surface(self):
+        _, asset_id = self.approved_meta_video()
+        reel = self._final_reel_fixture(asset_id)
+        server = ThreadingHTTPServer(("127.0.0.1", 0), app.Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.shutdown)
+        connection = HTTPConnection("127.0.0.1", server.server_address[1], timeout=5)
+        connection.request("GET", f"/api/final-reels/{reel['id']}")
+        response = connection.getresponse()
+        self.assertEqual((response.status, json.loads(response.read())["asset"]["id"]), (200, reel["id"]))
+        connection.request("GET", f"/api/final-reels/{reel['id']}/content")
+        content = connection.getresponse()
+        self.assertEqual(content.status, 200)
+        self.assertEqual(content.getheader("Content-Type"), "video/mp4")
+        self.assertTrue(len(content.read()) > 0)
+        connection.request("POST", f"/api/final-reels/{reel['id']}/review",
+                           body=json.dumps({"action": "APPROVED", "reviewer": "HTTP Reviewer"}),
+                           headers={"Content-Type": "application/json"})
+        reviewed = connection.getresponse()
+        self.assertEqual((reviewed.status, json.loads(reviewed.read())["asset"]["latest_review"]["action"]), (201, "APPROVED"))
+        source = Path(app.__file__).with_name("app.js").read_text(encoding="utf-8")
+        for phrase in ("Create final Reel", "final-reels", "Narration (approved package text only)", "Subtitle QA",
+                       "Audio QA", "Instagram compatibility", "Facebook compatibility", "Final Reel review",
+                       "CHANGES_REQUIRED", "REJECTED", "Lineage & technical details"):
+            self.assertIn(phrase, source)
+
+    def test_final_reel_narration_is_package_exact_and_schema_is_immutable(self):
+        package = {
+            "hook": {"text": "Registered growers can sell through authorised platforms"},
+            "script": [{"sequence": 1, "text": "The Union government permitted the sale."}],
+        }
+        claims = [{"text": "The Union government permitted the sale."}]
+        narration = final_reel_composer.approved_narration(package)
+        self.assertEqual(
+            narration,
+            "Registered growers can sell through authorised platforms. The Union government permitted the sale.",
+        )
+        self.assertEqual(final_reel_composer.validate_factual_narration(narration, package, claims)["status"], "PASS")
+        self.assertEqual(
+            final_reel_composer.validate_factual_narration(narration + " Prices doubled.", package, claims)["status"],
+            "FLAG",
+        )
+        phrases = final_reel_composer.subtitle_phrases(narration)
+        self.assertTrue(all(len(phrase.split()) <= 5 for phrase in phrases))
+        self.assertEqual(" ".join(phrases), narration)
+        edit = (8).to_bytes(4, "big") + b"edts"
+        track = (8 + len(edit)).to_bytes(4, "big") + b"trak" + edit
+        movie = (8 + len(track)).to_bytes(4, "big") + b"moov" + track
+        neutralized, count = final_reel_composer._neutralize_mp4_edit_lists(movie)
+        self.assertEqual((count, len(neutralized)), (1, len(movie)))
+        self.assertNotIn(b"edts", neutralized)
+        self.assertIn(b"free", neutralized)
+        with app.connect() as connection:
+            tables = {row[0] for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('final_reel_assets','final_reel_reviews')"
+            )}
+            triggers = {row[0] for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='trigger' AND name LIKE 'final_reel_%_immutable_%'"
+            )}
+        self.assertEqual(tables, {"final_reel_assets", "final_reel_reviews"})
+        self.assertEqual(len(triggers), 4)
 
     def test_https_transport_marks_post_send_timeouts_non_retryable(self):
         class TimeoutConnection:

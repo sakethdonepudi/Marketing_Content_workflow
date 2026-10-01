@@ -232,9 +232,13 @@ function steps(data) {
     : renderJob ? {state: tone(renderJob.status) === 'bad' ? 'bad' : 'warn', status: label(renderJob.status)}
     : {state: '', status: 'Not started'};
 
+  const newestReel = (data.final_reels || [])[0];
+  const reelReview = newestReel?.latest_review;
   const newestAsset = renders.flatMap(job => job.assets || []).sort((a, b) => (b.created_at || '').localeCompare(a.created_at || ''))[0];
   const latestReview = newestAsset?.latest_review;
-  const review = latestReview ? {state: latestReview.action === 'APPROVED' ? 'done' : latestReview.action === 'REJECTED' ? 'bad' : 'warn', status: label(latestReview.action)}
+  const review = reelReview ? {state: reelReview.action === 'APPROVED' ? 'done' : reelReview.action === 'REJECTED' ? 'bad' : 'warn', status: `Final Reel · ${label(reelReview.action)}`}
+    : newestReel ? {state: 'active', status: 'Final Reel · awaiting review'}
+    : latestReview ? {state: latestReview.action === 'APPROVED' ? 'done' : latestReview.action === 'REJECTED' ? 'bad' : 'warn', status: label(latestReview.action)}
     : renders.some(job => job.status === 'READY_FOR_REVIEW' || job.status === 'HUMAN_REVIEW') ? {state: 'active', status: 'Awaiting human review'} : {state: '', status: 'After media'};
 
   return [
@@ -425,6 +429,16 @@ function renderActionBar(data) {
       }, {disabled: !gate.eligible || !gate.live_renderer_configured}),
       progressFor('media', (data.render_jobs || []).find(isActive)),
     );
+    const reelSource = data.final_reel_source_asset_id;
+    const newReel = actionButton('Create final Reel', 'final-reel', () => post(
+      `/api/generated-assets/${encodeURIComponent(reelSource)}/final-reels`, {}, 'final-reel',
+      'Composing 9:16 Reel (narration + burned-in subtitles + quiet music)…',
+      () => 'Final Reel composed — human review required', 'media',
+    ), {primary: false, disabled: !reelSource, allowDuringActive: true});
+    const reelCopy = actionCopy('Final Reel',
+      reelSource ? `Compose a new 9:16 Reel from ${reelSource}: approved narration, burned-in subtitles, and quiet music. Never overwrites a prior version.`
+        : 'Compose a Final Reel once a QA-passed generated video exists.');
+    bar.append(reelCopy, newReel, progressFor('final-reel', null));
   }
 }
 
@@ -688,6 +702,105 @@ function openLightbox(src) {
 }
 document.getElementById('lightbox').onclick = () => { document.getElementById('lightbox').hidden = true; };
 
+function reelReviewActions(reel) {
+  const actions = el('div', 'review-actions');
+  for (const action of ['APPROVED', 'CHANGES_REQUIRED', 'REJECTED']) {
+    const key = `reel-review-${reel.id}-${action}`;
+    actions.append(actionButton(label(action), key, () => {
+      const reviewer = window.prompt('Reviewer name for this Final Reel'); if (!reviewer?.trim()) return;
+      const comment = window.prompt('Optional review comment') || '';
+      post(`/api/final-reels/${encodeURIComponent(reel.id)}/review`, {action, reviewer, comment}, key,
+        'Recording immutable Final Reel review…',
+        result => `${label(result.asset.latest_review.action)} for Final Reel ${result.asset.id}`, 'media');
+    }, {primary: action === 'APPROVED', allowDuringActive: true, disabled: action === 'APPROVED' && reel.status !== 'READY_FOR_REVIEW'}));
+  }
+  return actions;
+}
+
+function finalReelCard(reel) {
+  const src = `/api/final-reels/${encodeURIComponent(reel.id)}/content`;
+  const frame = el('div', 'preview-frame');
+  const video = el('video');
+  video.controls = true; video.playsInline = true; video.preload = 'metadata'; video.src = src; video.className = 'preview-video';
+  frame.append(video, el('div', 'preview-badge', plainPill('Final Reel · 9:16 composited', 'good')));
+  frame.append(el('div', 'preview-actions', externalLink('Open full size', src, 'btn ghost')));
+  const left = el('div', '', frame,
+    el('div', 'preview-caption', `${reel.width}×${reel.height} · ${reel.duration_seconds}s · ${reel.mime_type} · ${bytes(reel.file_size)} · ${label(reel.status)}`),
+    el('div', 'doc', el('div', '', el('div', 'doc-label', 'Narration (approved package text only)'),
+      el('p', 'body-text pre-wrap', reel.narration_text))));
+
+  const technical = reel.technical_qa || {};
+  const subtitles = reel.subtitle_qa || {};
+  const audio = reel.audio_qa || {};
+  const factual = reel.factual_qa || {};
+  const instagram = reel.instagram_compatibility || {};
+  const facebook = reel.facebook_compatibility || {};
+  const review = reel.latest_review;
+
+  const side = card('', cardHead(reel.id, pill(reel.status), plainPill(`Voice · ${reel.voice_model}`, '')));
+  side.append(review?.action === 'APPROVED'
+    ? callout('good', 'Final Reel approved', 'Approval binds to this exact immutable version only. It never publishes.')
+    : callout('info', 'Human review required', 'Ready for review is not approval. Distribution uses the approved Final Reel when one exists.'));
+  side.append(el('ul', 'qa-list',
+    qaRow('Technical QA', technical.status || 'UNKNOWN', (technical.errors || []).join(' ')
+      || `${reel.width}×${reel.height} · ${reel.duration_seconds}s · ${reel.codec || '—'}${reel.has_audio ? ` + ${reel.audio_codec || 'audio'}` : ''}`),
+    qaRow('Subtitle QA', subtitles.status || 'UNKNOWN', subtitles.burned_in
+      ? `Burned-in · ${(subtitles.checks || []).length} cue(s) · matches narration` : 'Not burned in'),
+    qaRow('Audio QA', audio.status || 'UNKNOWN', audio.status
+      ? `music ${audio.music_volume ?? '—'} below speech ${audio.speech_volume ?? '—'}` : 'Audio status unavailable'),
+    qaRow('Factual QA', factual.status || 'UNKNOWN', factual.no_new_factual_claims
+      ? 'No new factual claims' : 'Factual check flagged'),
+    qaRow('Instagram compatibility', instagram.compliant ? 'PASS' : 'FLAG', (instagram.errors || []).join(' ') || 'Reels specs · no edit lists'),
+    qaRow('Facebook compatibility', facebook.compliant ? 'PASS' : 'FLAG', (facebook.errors || []).join(' ') || 'Reels specs'),
+    qaRow('Human review', review?.action || 'REQUIRED', review
+      ? `${review.reviewer} · ${fmt(review.created_at)}${review.comment ? ` · ${review.comment}` : ''}`
+      : 'Required for this exact Final Reel version'),
+  ));
+  side.append(el('div', 'review-workflow', el('strong', '', 'Final Reel review'), reelReviewActions(reel),
+    el('span', 'secondary-text', 'Approval is per exact Final Reel version and is never inherited.')));
+  side.append(facts([
+    ['Source video', `${reel.source_asset_id} v${reel.source_asset_version}`],
+    ['Source render job', reel.source_render_job_id],
+    ['Content package', `${reel.content_package_id} v${reel.content_package_version}`],
+    ['Voice', `${reel.voice_provider} · ${reel.voice_model}`],
+    ['Cost', reel.cost_status === 'known' ? money(reel.cost_usd) : label(reel.cost_status)],
+    ['Created', fmt(reel.created_at)],
+  ]));
+
+  const details = [facts([
+    ['Final Reel', reel.id], ['Transform hash', `${(reel.transform_hash || '').slice(0, 24)}…`],
+    ['Checksum', reel.checksum_sha256], ['Storage', reel.storage_uri],
+    ['Source checksum', reel.source_asset_checksum_sha256],
+    ['Frame rate', reel.frame_rate ? `${reel.frame_rate} fps` : '—'],
+    ['Audio', reel.has_audio ? (reel.audio_codec || 'yes') : 'no'],
+    ['Policy', (reel.transform_manifest || {}).policy_version || '—'],
+  ])];
+  if (reel.subtitle_qa?.checks?.length) details.push(el('h3', '', 'Subtitle OCR checks'), bullets(
+    reel.subtitle_qa.checks.map(check => `“${check.cue || check.text}” · coverage ${check.token_coverage}`)));
+  if (reel.instagram_compatibility || reel.facebook_compatibility) details.push(facts([
+    ['Spec version', instagram.spec_api_version || facebook.spec_api_version || '—'],
+  ]));
+  if (reel.reviews?.length) details.push(el('h3', '', 'Review history'), timeline(reel.reviews.map(item => ({
+    at: item.created_at, title: label(item.action),
+    detail: `${item.reviewer}${item.comment ? ` · ${item.comment}` : ''}`, tone: tone(item.action),
+  }))));
+  return card('reel-card', el('div', 'media-layout', left, el('div', '', side, disclosure('Lineage & technical details', details))));
+}
+
+function renderFinalReels(data, root) {
+  const reels = data.final_reels || [];
+  const source = data.final_reel_source_asset_id;
+  const section = el('div', 'final-reel-section');
+  section.append(cardHead(`Final Reels (${reels.length})`,
+    source ? plainPill(`Source ready · ${source}`, 'good') : plainPill('No eligible source', 'warn')));
+  if (!reels.length) {
+    section.append(empty('No Final Reel yet', 'Create a 9:16 Reel from a QA-passed generated video. Every composition is a new immutable version.'));
+  } else {
+    reels.forEach(reel => section.append(finalReelCard(reel)));
+  }
+  root.append(section);
+}
+
 function renderMedia(data, root) {
   const gate = data.render_gate || {};
   const notices = [];
@@ -862,6 +975,7 @@ function renderMedia(data, root) {
   ))));
   const cost = renderCostSummary(data);
   if (cost) root.append(cost);
+  renderFinalReels(data, root);
 }
 
 function renderActivity(data, root) {
@@ -919,13 +1033,18 @@ function publishJobCard(job) {
   return body;
 }
 
-function platformCard(asset, platform, distribution) {
-  const packages = (distribution.packages || []).filter(item => item.generated_asset_id === asset.id && item.platform === platform);
+function platformCard(source, platform, distribution) {
+  const isReel = source.kind === 'FINAL_REEL';
+  const matches = item => isReel ? item.final_reel_asset_id === source.id : item.generated_asset_id === source.id;
+  const packages = (distribution.packages || []).filter(item => matches(item) && item.platform === platform);
   const pkg = packages[0];
   const container = card('', cardHead(PLATFORM_LABELS[platform], pkg ? pill(pkg.latest_review?.action || 'REQUIRED', pkg.latest_review ? label(pkg.latest_review.action) : 'Platform approval required') : plainPill('No package yet')));
-  const createKey = `dist-create-${asset.id}-${platform}`;
+  const createKey = `dist-create-${source.kind}-${source.id}-${platform}`;
+  const endpoint = isReel
+    ? `/api/final-reels/${encodeURIComponent(source.id)}/distribution-packages`
+    : `/api/generated-assets/${encodeURIComponent(source.id)}/distribution-packages`;
   container.append(actionButton(pkg ? 'Rebuild platform package' : `Create ${PLATFORM_LABELS[platform]} package`, createKey, () =>
-    post(`/api/generated-assets/${encodeURIComponent(asset.id)}/distribution-packages`, {platform}, createKey,
+    post(endpoint, {platform}, createKey,
       'Building copy from the approved package…', result => `Package v${result.distribution_package.version_number} created`, 'distribution'),
   {primary: !pkg, allowDuringActive: true}), progressFor(createKey, null));
   if (!pkg) return container;
@@ -942,8 +1061,12 @@ function platformCard(asset, platform, distribution) {
     el('div', '', el('div', 'doc-label', 'Cover'), el('p', 'secondary-text', pkg.cover?.strategy === 'thumb_offset' ? `Frame at ${pkg.cover.time_ms} ms (thumb_offset)` : (pkg.platform_metadata?.cover_note || 'Provider default'))),
   ));
   container.append(facts([
-    ['Package', `${pkg.id} v${pkg.version_number}`], ['Media', `${pkg.generated_asset_id} v${pkg.asset_version} · ${pkg.asset_checksum_sha256.slice(0, 12)}…`],
-    ['Media approval', pkg.media_review_id], ['Content package', `${pkg.content_package_id} v${pkg.content_package_version}`],
+    ['Package', `${pkg.id} v${pkg.version_number}`],
+    ['Media source', pkg.media_source === 'FINAL_REEL'
+      ? `Approved Final Reel ${pkg.final_reel_asset_id} · ${pkg.asset_checksum_sha256.slice(0, 12)}…`
+      : `Raw video ${pkg.generated_asset_id} v${pkg.asset_version} · ${pkg.asset_checksum_sha256.slice(0, 12)}…`],
+    ['Final Reel source', pkg.media_source === 'FINAL_REEL' ? `${pkg.generated_asset_id} v${pkg.asset_version}` : undefined],
+    ['Media approval', pkg.final_reel_review_id || pkg.media_review_id], ['Content package', `${pkg.content_package_id} v${pkg.content_package_version}`],
     ['Claim set', `${pkg.approved_claim_set_id} v${pkg.approved_claim_set_version}`], ['Copy policy', pkg.copy_policy_version],
   ]));
   const reviewActions = el('div', 'review-actions');
@@ -958,7 +1081,8 @@ function platformCard(asset, platform, distribution) {
   }
   container.append(el('div', 'review-workflow', el('strong', '', 'Platform package review'), reviewActions,
     el('span', 'secondary-text', 'Each platform needs its own approval. Approval alone never publishes.')));
-  const jobs = (distribution.publish_jobs || []).filter(job => job.distribution_package_id === pkg.id || (job.generated_asset_id === asset.id && job.platform === platform));
+  const jobs = (distribution.publish_jobs || []).filter(job => job.distribution_package_id === pkg.id
+    || (isReel ? job.final_reel_asset_id === source.id : job.generated_asset_id === source.id) && job.platform === platform);
   const active = jobs.find(job => PUBLISH_ACTIVE.includes(job.status));
   const published = jobs.find(job => job.status === 'PUBLISHED');
   const gate = pkg.publish_gate || {allowed: false, blockers: []};
@@ -991,16 +1115,28 @@ function platformCard(asset, platform, distribution) {
 function renderDistribution(data, root) {
   const distribution = data.distribution || {};
   root.append(switchBanner(distribution));
-  const approved = (data.render_jobs || []).flatMap(job => (job.assets || []).map(asset => ({asset, job})))
-    .filter(({asset}) => isVideo(asset.media_type) && !asset.fixture_only && asset.latest_review?.action === 'APPROVED');
-  if (!approved.length) {
-    root.append(empty('No approved video yet', 'Distribution starts from a live video whose latest human review is APPROVED.'));
+  const approvedReels = (data.final_reels || []).filter(reel =>
+    reel.status === 'READY_FOR_REVIEW' && reel.latest_review?.action === 'APPROVED');
+  const approvedVideos = (data.render_jobs || []).flatMap(job => (job.assets || []).map(asset => ({asset, job})))
+    .filter(({asset}) => isVideo(asset.media_type) && !asset.fixture_only && asset.latest_review?.action === 'APPROVED')
+    // An approved Final Reel supersedes the raw generated video for the same source.
+    .filter(({asset}) => !approvedReels.some(reel => reel.source_asset_id === asset.id));
+  if (!approvedReels.length && !approvedVideos.length) {
+    root.append(empty('No approved Final Reel yet',
+      'Distribution starts from an approved Final Reel (or, when no Reel exists, an approved live video). Approve one first.'));
     return;
   }
-  for (const {asset} of approved) {
+  for (const reel of approvedReels) {
+    root.append(card('', cardHead(`Approved Final Reel ${reel.id}`, plainPill('Final Reel APPROVED', 'good')),
+      el('p', 'secondary-text', `Source ${reel.source_asset_id} v${reel.source_asset_version} · ${reel.width}×${reel.height} · ${reel.duration_seconds}s · checksum ${reel.checksum_sha256.slice(0, 16)}…`)));
+    const source = {kind: 'FINAL_REEL', id: reel.id};
+    root.append(el('div', 'split', platformCard(source, 'INSTAGRAM_REELS', distribution), platformCard(source, 'FACEBOOK_REELS', distribution)));
+  }
+  for (const {asset} of approvedVideos) {
     root.append(card('', cardHead(`Approved video ${asset.id} · v${asset.version_number}`, plainPill('Media APPROVED', 'good')),
       el('p', 'secondary-text', `${asset.width}×${asset.height} · ${asset.duration_seconds}s · checksum ${asset.checksum_sha256.slice(0, 16)}…`)));
-    root.append(el('div', 'split', platformCard(asset, 'INSTAGRAM_REELS', distribution), platformCard(asset, 'FACEBOOK_REELS', distribution)));
+    const source = {kind: 'GENERATED_ASSET', id: asset.id};
+    root.append(el('div', 'split', platformCard(source, 'INSTAGRAM_REELS', distribution), platformCard(source, 'FACEBOOK_REELS', distribution)));
   }
 }
 
