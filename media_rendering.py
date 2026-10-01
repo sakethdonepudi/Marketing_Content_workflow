@@ -629,6 +629,10 @@ class XAIImageRenderer(MediaRenderer):
 
     @staticmethod
     def build_prompt(request):
+        media_brief = request.get("media_brief") or {}
+        approved_prompt = media_brief.get("generation_prompt")
+        if isinstance(approved_prompt, str) and approved_prompt.strip():
+            return approved_prompt.strip()
         constraints = request.get("creative_constraints") or {}
         style = constraints.get("non_factual_style_elements") or ()
         if isinstance(style, str):

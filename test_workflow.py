@@ -2999,6 +2999,19 @@ class WorkflowTests(unittest.TestCase):
         for fragment in ("numerical value", "quotations", "unsupported entity"):
             self.assertIn(fragment, job["error_message"])
 
+    def test_xai_image_uses_approved_package_generation_prompt_exactly(self):
+        approved = (
+            "High-quality photograph of dried FCV tobacco leaves, 3:4 portrait aspect ratio, "
+            "no people, no text, no logos, no symbols, no signage"
+        )
+        request = {
+            "media_brief": {"generation_prompt": approved},
+            "visual_prompts": ["This storyboard prompt must not replace the approved renderer prompt."],
+            "thumbnail_concept": {"headline": "This must not be included."},
+            "creative_constraints": {"non_factual_style_elements": ["This must not be appended."]},
+        }
+        self.assertEqual(XAIImageRenderer.build_prompt(request), approved)
+
     # ---------- Architecture 06D: xAI video ----------
 
     def test_image_and_video_media_types_are_separate(self):
