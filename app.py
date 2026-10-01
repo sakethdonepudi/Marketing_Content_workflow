@@ -2915,8 +2915,14 @@ def resume_verification(run_id, provider=None, *, background=True):
             raise ValueError("Only verification paused by a recoverable provider or retrieval timeout can be resumed.")
         connection.execute(
             "UPDATE verification_runs SET status='QUEUED',progress_message='Resume queued from last safe checkpoint',"
-            "recoverable=0,resume_state=NULL,resume_reason=NULL,resumed_at=?,completed_at=NULL WHERE id=?",
-            (now(), run_id),
+            "recoverable=0,resume_state=NULL,resume_reason=NULL,resumed_at=?,completed_at=NULL,max_attempts=?,"
+            "search_timeout_seconds=COALESCE(search_timeout_seconds,?),"
+            "retrieval_timeout_seconds=COALESCE(retrieval_timeout_seconds,?),"
+            "total_timeout_seconds=COALESCE(total_timeout_seconds,?) WHERE id=?",
+            (
+                now(), VERIFICATION_TRANSIENT_RETRIES + 1, VERIFICATION_SEARCH_TIMEOUT_SECONDS,
+                VERIFICATION_RETRIEVAL_TIMEOUT_SECONDS, VERIFICATION_TOTAL_TIMEOUT_SECONDS, run_id,
+            ),
         )
         connection.execute(
             "INSERT INTO verification_run_status_history(run_id,from_status,to_status,message,changed_at) "
