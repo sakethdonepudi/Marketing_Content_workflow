@@ -21,9 +21,9 @@ The Event Room’s **Content decision** action first runs a deterministic eligib
 
 The **Production** tab is a separate explicit action. It is enabled only for the current executable `CREATE` decision with a current production-approved claim set and format-compatible rights-cleared media. Set `ANTHROPIC_API_KEY` to enable the live adapter; the model defaults to `claude-opus-4-5-20251101` and is configurable through `ANTHROPIC_MODEL`. The provider receives only approved claim versions and tightly scoped creative context. One structured call returns an editorial package, which must pass the local claim/version/media validator before an immutable package reaches `READY_FOR_APPROVAL`. There is no Publish action.
 
-**Generate media** is a second, explicit action after a package reaches `READY_FOR_APPROVAL`. Provider selection is configured independently for image, video, and audio with `RENDERER_PROVIDER_IMAGE`, `RENDERER_PROVIDER_VIDEO`, and `RENDERER_PROVIDER_AUDIO`. This repository currently includes the generic renderer boundary and a deterministic IMAGE fixture for tests/demonstrations; it does not claim a live renderer integration. With provider settings blank, the UI clearly reports that live rendering is unavailable and creates no job. Setting `fixture` is appropriate only in an isolated test or demonstration environment.
+**Generate media** is a second, explicit action after a package reaches `READY_FOR_APPROVAL`. Provider selection is configured independently for image, video, and audio with `RENDERER_PROVIDER_IMAGE`, `RENDERER_PROVIDER_VIDEO`, and `RENDERER_PROVIDER_AUDIO`. This repository includes the generic renderer boundary, one live still-image adapter (`xai`, Grok Imagine), and a deterministic IMAGE fixture for tests/demonstrations. With provider settings blank, the UI clearly reports that live rendering is unavailable and creates no job. Setting `fixture` is appropriate only in an isolated test or demonstration environment.
 
-Architecture 06C adds a provider-neutral asynchronous lifecycle behind the same renderer contract: submit, bounded poll, normalized completion/failure, temporary-output download, and controlled storage. No supported live renderer credentials are present in this environment, so live rendering reports `LIVE_RENDERER_NOT_CONFIGURED`; fixture output is never substituted silently. Future live adapters must use `LIVE_RENDERER_API_KEY` or a provider-specific secret, and must normalize their responses without exposing provider-specific payloads to business logic.
+Architecture 06C adds a provider-neutral asynchronous lifecycle behind the same renderer contract: submit, bounded poll, normalized completion/failure, temporary-output download, and controlled storage. Live rendering is enabled only when `RENDERER_PROVIDER_IMAGE=xai` is set explicitly. The credential is `LIVE_RENDERER_API_KEY` when present; otherwise the xAI renderer reuses the existing `XAI_API_KEY` internally without copying it. Only the source variable name is ever surfaced, never the value. Without a usable credential the UI shows "Image renderer not configured" and no job is created. A caller cannot substitute a different provider, including the fixture, through the API.
 
 Every render revalidates the exact package, production job, executable decision, approved claim versions, evidence snapshots, and reference-media rights before the provider call and again after it returns. Output bytes are copied through the storage abstraction (local development storage defaults to `.context/generated_media`), checksummed, deterministically inspected, and linked to an immutable request snapshot. A passing artifact stops at `READY_FOR_REVIEW`; human editorial review remains mandatory. Repeated clicks reuse the same logical result, while explicit regeneration creates a new render job and immutable asset version without overwriting prior history.
 
@@ -92,6 +92,16 @@ Quotations require verbatim source text; paraphrases retain publisher attributio
 
 The xAI Responses API reports raw `cost_in_usd_ticks`. Per the official response schema, `100,000,000` ticks equal one US cent, so ReachOut converts `10,000,000,000` ticks to one US dollar and retains the raw ticks. Missing usage—including timed-out requests—is `unknown`, never zero. Deterministic fixture runs report literal zero usage because no provider call occurs.
 
+### Architecture 06F-R — verification reliability
+
+Migration `015_verification_reliability.sql` adds additive phase checkpoints, independent provider-attempt records, explicit recoverable-timeout state, and pairwise source-family provenance. The factual policy is unchanged: official primary support or two genuinely independent reporting families is still required, and any contradiction or unresolved required claim still fails closed.
+
+Verification now checkpoints primary evidence extraction, corroboration discovery, source retrieval, claim/source matching, contradiction analysis, and final adjudication. A transient timeout pauses the existing run with a `REVIEW_REQUIRED` claim set; it does not create an `INSUFFICIENT_EVIDENCE` decision. “Resume verification” keeps the same run, snapshots, lineage, completed checkpoints, and partial analysis while recording every new provider request as a separate attempt linked to its predecessor.
+
+Live discovery uses a 180-second search timeout, a 30-second source-retrieval phase timeout, and a 300-second per-execution total budget by default. Only connection/response timeout, temporary network interruption, retryable HTTP 408/409/429, or temporary 5xx responses receive one bounded retry. `Retry-After` is respected up to the configured 30-second cap. Authentication failure, malformed provider output, invalid sources, contradictions, policy rejection, and insufficient evidence are never retried. Failed attempts without authoritative billing remain `unknown`, even when a later attempt succeeds.
+
+Source families are conservatively merged for the same normalized host, the same registered publisher, identical normalized text, or syndication-level text overlap. Every pair is stored as `SAME_FAMILY` or `INDEPENDENT_FAMILY` with its hosts, similarity, and reason. Concrete references to notifications, orders, ministries, regulators, filings, courts, or other first-party records are passed to discovery as official-source hints; they remain leads until fetched, source-validated, and matched to a claim.
+
 ## Content CEO
 
 Migration `009_content_ceo.sql` adds a media inventory, publishing history, Content CEO runs and audit history, and immutable structured decisions. A decision records `CREATE`, `HOLD`, `MONITOR`, `SKIP`, or `HUMAN_REVIEW`; the recommended format; language; duration; priority; factual rationale; exact claim-set/evidence versions; blockers; timestamp; policy version; and whether it is executable.
@@ -106,7 +116,7 @@ Migration `010_content_production_orchestrator.sql` adds the explicit production
 
 `content_production.py` defines the generic provider interface, live Anthropic adapter, and controlled fixture adapter. The live adapter sends one `POST /v1/messages` request with no tools and uses Anthropic structured outputs. The response is not trusted merely because it matches the schema: a deterministic validator checks exact approved claim-version references, unknown references, numerical values, quotations, certainty upgrades, format/language/duration, revoked evidence, current media, and mid-run version changes. A failed check creates no package and routes the job to `HUMAN_REVIEW` or `BLOCKED`.
 
-Usage fields are persisted exactly when Anthropic returns them. Cost remains `unknown` unless both optional operator-maintained per-million token rates and a cost-policy version are configured; the application never guesses a price or converts missing usage to zero.
+Usage fields are persisted exactly when Anthropic returns them. Cost remains `unknown` unless Anthropic returns an authoritative cost value; the application never converts token counts with local price assumptions or treats missing usage as zero.
 
 ## Media rendering orchestrator
 
@@ -114,7 +124,7 @@ Migration `011_media_rendering.sql` adds the RenderJob state machine, immutable 
 
 `media_rendering.py` defines the replaceable `MediaRenderer` interface and deterministic fixture renderer. `media_storage.py` defines the replaceable storage contract and content-addressed local implementation. Stored asset metadata includes the originating RenderJob, exact package/version, provider/model, provider IDs when available, dimensions or duration, MIME type, SHA-256 checksum, prompt/config versions, rights-cleared references, provenance, provider-returned text metadata, validation result, and immutable version. Identical binaries are linked rather than duplicated.
 
-Validation checks response presence, non-zero bytes, MIME/media consistency, persisted storage, checksum, PNG structure and dimensions, output count, minimum dimensions, aspect ratio, exact lineage, current rights, and post-render invalidation. No OCR or semantic visual QA is claimed: provider-returned textual metadata is retained and unexpected text is rejected when detectable. Fixture assets are visibly labeled, non-executable, and never treated as live production output. Usage and provider costs remain null/`unknown` when absent; no price is guessed.
+Validation checks response presence, non-zero bytes, MIME/media consistency, persisted storage, checksum, PNG structure and dimensions, output count, minimum dimensions, aspect ratio, exact lineage, current rights, and post-render invalidation. Fixture assets are visibly labeled, non-executable, and never treated as live production output. Usage and provider costs remain null/`unknown` when absent; no price is guessed. Architecture 06E adds actual local OCR and multimodal semantic QA as described below.
 
 ## Live-provider lifecycle and media QA
 
@@ -128,6 +138,53 @@ QA is deliberately split into four visible states:
 - Human review: always `REQUIRED`. Neither a passing technical check nor `READY_FOR_REVIEW` is publication approval.
 
 Provider-reported cost is preferred when available. Otherwise rendering cost remains null/`unknown`. The append-only `cost_ledger` provides a normalized stage/reference model for eventual whole-story cost aggregation without altering prior research, verification, Content CEO, or production records. Signed output URLs, credentials, authorization headers, and secret-bearing provider metadata are scrubbed and never used as durable storage references.
+
+### xAI image adapter
+
+`XAIImageRenderer` calls `POST https://api.x.ai/v1/images/generations` once per RenderJob attempt. The xAI image endpoint is synchronous, so there is no provider job ID or polling; the lifecycle is recorded as `SUBMITTED → COMPLETED → DOWNLOADED` with `poll_count = 0`. The request is derived only from the immutable prompt snapshot (visual prompts, thumbnail concept, non-factual style, aspect ratio, output count) plus fixed constraints: no rendered text, numbers, logos, flags, maps, party symbols, recognizable real people, crowds, or persuasive messaging. Text overlays are left for a later, reviewed compositing step. The exact safe request payload is persisted in the `SUBMITTED` provider event.
+
+- Aspect ratio: the canonical image-post ratio is **3:4** (target 1200×1600). The production validator rejects IMAGE packages with any other ratio, and xAI is asked for native `aspect_ratio: "3:4"`; generated media is never stretched or cropped. Historical 4:5 packages and fixture assets remain readable, but xAI cannot render them and they are rejected **before** a job or network call (`RENDERER_CAPABILITY_MISMATCH`).
+- Replays: if a live provider returns bytes identical to an existing asset, the job goes to `HUMAN_REVIEW` with `DUPLICATE_PROVIDER_OUTPUT`; the earlier asset is never modified.
+- Download: the temporary output URL is fetched over HTTPS without the API key, capped at 25 MB, then saved through `MediaStorage`. The signed URL is not persisted.
+- Errors: 401/403 → `AUTH_ERROR` (no retry); 429 → `RATE_LIMITED` (bounded retry honoring `Retry-After`, capped at 60 s); 5xx → `PROVIDER_5XX` (bounded retry with exponential backoff); content-policy 4xx → `CONTENT_POLICY_REJECTED` → `HUMAN_REVIEW`; other 400/422 → `INVALID_REQUEST`; malformed or output-less responses → `INVALID_RESPONSE`; download failure → `DOWNLOAD_FAILED`. A timeout **after** the request was sent is not retried because the provider may already have billed the render.
+- Cost: `usage.cost_in_usd_ticks` is converted to provider-reported USD (`pricing_version = xai-reported-cost-ticks`). Missing usage stays `unknown`.
+- Video is implemented by Architecture 06D below. Audio remains unsupported and fails closed.
+
+`media_inspection.py` decodes PNG (chunk CRCs and pixel payload), JPEG (segment chain, frame header, scan, end marker), and WebP (RIFF/VP8/VP8L/VP8X) without new dependencies. Technical QA uses decoded format and dimensions, and rejects mismatches between the sniffed format, the result MIME type, and the provider-declared MIME type.
+
+Assets report `current_for_review` at read time: a physically valid asset is not current once a newer ContentPackage exists or its lineage is no longer eligible. `cost_summary` in the Event Room aggregates live research, verification, Content CEO, production, and rendering spend, reporting unknown-cost runs separately instead of counting them as zero.
+
+## Architecture 06D — live Claude packages and xAI video
+
+Canonical flow: verified event → Content CEO decision → **live Claude package** → immutable media prompt → xAI image or video render → QA → human review. Nothing publishes, schedules, or auto-approves.
+
+**Claude production.** Package generation always calls Claude when requested live. Without `ANTHROPIC_API_KEY` the request fails before any job is created ("Claude production provider unavailable"); it never falls back to the fixture. The HTTP API accepts the fixture provider only with `REACHOUT_DEMO_MODE=1`; tests call it directly. The adapter authenticates with `x-api-key` (OAuth `sk-ant-oat` tokens use `Authorization: Bearer` plus the OAuth beta header), treats `refusal` and `max_tokens` stops as failures, and stores the exact credential-free request (`production_jobs.request_snapshot_json`/`_hash`) alongside the existing response snapshot, usage, and request ID. Cost stays `unknown` unless Anthropic itself reports an authoritative value. Schema `production-package-v2` adds `media_brief` (media type, visual brief, generation prompt, negative constraints, factual constraints). Visual text may not introduce numbers, quotations, or named entities absent from the approved claims.
+
+**Video.** `XAIVideoRenderer` submits to `POST /v1/videos/generations`, polls `GET /v1/videos/{request_id}` a bounded number of times (`XAI_VIDEO_MAX_POLL_ATTEMPTS` × `XAI_VIDEO_POLL_INTERVAL_SECONDS`), and downloads the MP4 without sending the API key. Before any paid submission it lists `GET /v1/video-generation-models` and refuses if the configured model is missing. Provider capabilities are declared per provider and media type: video supports 9:16, 16:9, 1:1, 4:3, 3:4, 3:2, 2:3; 1–15 s; 480p/720p/1080p. Modes:
+
+- Text-to-video: REEL packages; the package aspect ratio and duration are requested natively.
+- Image-to-video: "Generate video from image" binds one exact live image by ID and checksum. `aspect_ratio` is omitted because xAI would stretch the source; the video inherits the source ratio. Fixture images can never be sources. A different source image always creates a new job.
+- Reference-to-video: supported by the adapter (capped at 720p) but not exposed in the UI yet.
+
+Provider events stream into `render_provider_events` as they happen, so the UI shows the phase (Submitted → Generating n% → Downloading → Validating). Polling exhaustion, provider failures, expiry, moderation (`respect_moderation: false`), download failures, and malformed, zero-duration, wrong-ratio or truncated MP4s all fail closed. The MP4 inspector (`media_inspection.inspect_video`) decodes duration, dimensions, frame rate, codec, and audio presence from the ISO-BMFF structure. Image and video costs are reported separately (`IMAGE_RENDERING`, `VIDEO_RENDERING`); missing usage stays unknown.
+
+**Semantic QA foundation.** Seven advisory checks are recorded individually as PASS, FLAG, or UNKNOWN: subject match, unsupported text, unintended symbols or logos, unexpected public figures, reference consistency, generation defects, and factual contradictions. Any FLAG routes to human review; nothing can approve. The model never verifies a public figure's identity.
+
+Migration `013_live_production_and_video.sql` is additive and forward-only: production request snapshots; render-job mode, requested ratio, duration and resolution, and source asset ID and checksum; asset codec and audio flag.
+
+## Architecture 06E — production-safe paid media
+
+Migration `014_production_safe_media.sql` is additive and forward-only. It adds resumable-job metadata, stable request fingerprints and client replay keys, immutable source/QA derivatives, immutable versioned QA runs, and immutable per-asset review actions. Existing 06C/06D records remain readable.
+
+**No-resubmit recovery.** A timed-out or interrupted asynchronous xAI job with a saved provider job ID remains `PROVIDER_PENDING` (its compatible database status remains `RENDERING`). “Resume status check” performs one read-only lookup of that exact ID. Processing stays pending; completion downloads and validates the original output; terminal failure is recorded; unknown/not-found status requires human intervention. Startup only marks unfinished work for recovery and never submits replacement generation.
+
+**Paid-call idempotency.** The backend fingerprints event, package/version, media type, generation mode, exact source ID/checksum, immutable prompt request, output shape/duration/resolution, provider, and model. SQLite transaction locking plus a partial unique active-fingerprint index prevents duplicate submissions across double clicks, refresh retries, tabs, threads, and processes. Client request IDs replay the original job. UI controls disable as “Submitting…” and every live media call requires explicit confirmation; video confirmation shows the provider/model, source thumbnail and checksum, ratio, duration, resolution, package version, and billing-after-timeout warning.
+
+**Source preparation.** Image-to-video never mutates the generated image. It creates or reuses an immutable `VIDEO_SOURCE` JPEG derivative, preserves aspect ratio, performs no crop/stretch, stores original and derivative checksums plus complete transformation parameters, and binds `GeneratedAsset → DerivedAsset → RenderJob`. `VIDEO_SOURCE_MAX_BYTES` defaults to 4 MiB; oversize preparation fails before model discovery or paid submission.
+
+**OCR and visual QA.** On macOS, `media_tools.py` uses Apple Vision for visible-text detection and AVFoundation for representative video frames (beginning, 25%, midpoint, 75%, end). OCR detections retain confidence, bounding boxes, frame references, and deterministic policy checks for unexpected lettering, malformed headlines, watermarks, invented numbers/names, and political slogans. Video frames are immutable `QA_FRAME` derivatives with lineage. `visual_qa.py` uses configured Claude image understanding with strict structured PASS/FLAG/UNKNOWN checks; it is advisory, never verifies a person's identity, and never approves media. Missing/malformed provider output becomes UNKNOWN or a human-review warning. Costs are split into package, image, video, OCR, and visual-QA stages; only provider-returned authoritative cost is “known.”
+
+**Human review.** Every generated asset version can be marked `APPROVED`, `CHANGES_REQUIRED`, or `REJECTED` with reviewer, timestamp, and optional comment. Reviews reference the latest QA run IDs and never inherit across regenerated versions. `APPROVED` means approved media asset only—not approval to publish. No publishing, scheduling, or social-platform route exists.
 
 ## Structured errors
 
@@ -145,7 +202,7 @@ Example:
 python3 -m unittest -v
 ```
 
-Tests cover fresh and upgrade migrations, ingestion and clustering, research and verification safeguards, Content CEO policy, production entry gates, strict structured-output validation, claim locking, duplicate jobs, race invalidation, immutable packages, renderer entry gates, provider configuration, checksums and persistence, idempotency, regeneration, bounded transient retries, malformed/corrupt media, rights/evidence invalidation, immutable asset versions, usage/cost handling, and fixture isolation.
+Tests cover fresh and upgrade migrations, ingestion and clustering, research and verification safeguards, Content CEO policy, production entry gates, strict structured-output validation, claim locking, duplicate jobs, race invalidation, immutable packages, renderer entry gates, provider configuration, checksums and persistence, idempotency, regeneration, bounded transient retries, malformed/corrupt media, rights/evidence invalidation, immutable asset versions, usage/cost handling, fixture isolation, the xAI adapter (configuration, capability gating, request derivation, download without credentials, error normalization, Retry-After, post-send timeout safety, MIME/dimension checks, secret scrubbing), PNG/JPEG/WebP decoding, asset currency after package supersession, and per-story cost aggregation.
 
 ## API
 
@@ -160,14 +217,18 @@ Tests cover fresh and upgrade migrations, ingestion and clustering, research and
 - `GET /api/render-jobs/{job_id}` — render state, attempts, validation, usage, and asset lineage
 - `GET /api/generated-assets/{asset_id}` — generated-asset metadata and provenance
 - `GET /api/generated-assets/{asset_id}/content` — controlled-storage asset bytes for preview
+- `GET /api/derived-assets/{derived_asset_id}/content` — controlled derivative bytes for review
 - `POST /api/ingest-url` — `{ "url": "https://public.example/report" }`
 - `POST /api/ingest-configured` — polls due sources; `{ "force": true }` bypasses the poll interval for testing
 - `POST /api/events` — disabled; events must originate from qualified source signals
 - `POST /api/events/{id}/research` — `{ "provider": "test" }` or explicit `{ "provider": "grok" }`
 - `POST /api/research/{run_id}/verify` — explicit `{ "provider": "test" }` or paid `{ "provider": "grok" }`
 - `POST /api/events/{id}/content-decision` — deterministic preview `{ "provider": "test" }` or explicit live `{ "provider": "grok" }`
-- `POST /api/content-decisions/{decision_id}/production` — explicit live `{ "provider": "anthropic" }`; optional `{ "regenerate": true }` creates a new version
-- `POST /api/content-packages/{package_id}/render` — explicit configured renderer call with media type; optional `{ "regenerate": true }` creates a new immutable render version
+- `POST /api/content-decisions/{decision_id}/production` — explicit confirmed live Claude call with `client_request_id`; optional `{ "regenerate": true }`
+- `POST /api/content-packages/{package_id}/render` — explicit confirmed configured renderer call with `client_request_id`; optional `{ "regenerate": true }`
+- `POST /api/render-jobs/{job_id}/resume` — one free/read-only check of the saved provider job; never resubmits
+- `POST /api/generated-assets/{asset_id}/qa` — immutable manual OCR/visual QA rerun
+- `POST /api/generated-assets/{asset_id}/review` — asset-version-only `APPROVED`, `CHANGES_REQUIRED`, or `REJECTED`
 - `POST /api/events/{id}/transition` — `{ "state": "VERIFYING" }`
 
 The API remains bound to localhost and has no authentication. Add authentication, request authorization, a production datastore, source-specific extraction adapters, and an external scheduler before deployment.

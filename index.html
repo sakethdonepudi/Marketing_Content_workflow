@@ -8,91 +8,90 @@
 </head>
 <body>
   <div class="shell">
-    <aside>
-      <div class="brand"><span class="mark">R</span><span>ReachOut<span class="muted"> / OS</span></span></div>
-      <nav><a class="active" href="#">Overview</a><a href="#events">Live desk</a><a href="#pipeline">Pipeline</a><a href="#instagram">Instagram</a></nav>
-      <div class="asidefoot">N. Chandrababu Naidu · Andhra Pradesh <span class="dot"></span></div>
+    <aside class="sidebar">
+      <div class="brand"><span class="mark">R</span><span>ReachOut <span class="muted">OS</span></span></div>
+      <nav>
+        <button class="nav-item active" id="nav-desk" type="button">Live desk</button>
+      </nav>
+      <div class="side-section">
+        <div class="side-label">Providers</div>
+        <ul class="provider-list" id="provider-list"></ul>
+      </div>
+      <div class="side-foot">
+        <div class="side-label">Workspace</div>
+        <div>N. Chandrababu Naidu</div>
+        <div class="muted">Andhra Pradesh, India</div>
+      </div>
     </aside>
+
     <main>
-      <header>
-        <div><div class="eyebrow">PUBLIC LEADERSHIP / ANDHRA PRADESH</div><h1>Live desk</h1><p>Attributed primary-source and independent reporting signals for N. Chandrababu Naidu.</p></div>
-        <div class="right"><span class="badge"><i></i> Local preview</span><span id="clock"></span></div>
-      </header>
-      <section class="hero">
-        <div><span class="eyebrow">SOURCE MONITOR</span><h2>Individual reports, separated from listings.</h2><p>Listings stay references. Only dated, relevant items can reach event discovery.</p><small id="ingest-status" aria-live="polite"></small></div>
-        <button id="ingest">Ingest URL <span>↗</span></button>
+      <!-- Desk view -->
+      <section id="desk-view" class="view">
+        <header class="page-head">
+          <div>
+            <div class="eyebrow">Public leadership · Andhra Pradesh</div>
+            <h1>Live desk</h1>
+            <p class="lede">Attributed primary-source and independent reporting, verified before anything is produced.</p>
+          </div>
+          <div class="head-meta"><span class="live-dot"></span><span id="clock">—</span></div>
+        </header>
+
+        <form class="ingest" id="ingest-form" autocomplete="off">
+          <label class="sr-only" for="ingest-url">Public report URL</label>
+          <input id="ingest-url" type="url" placeholder="Paste a public report URL to ingest…" required>
+          <button id="ingest" type="submit" class="btn primary">Ingest URL</button>
+          <span id="ingest-status" class="form-status" aria-live="polite"></span>
+        </form>
+
+        <div class="stat-row">
+          <div class="stat"><span class="stat-value" id="discovered-event-count">0</span><span class="stat-label">Events</span></div>
+          <div class="stat"><span class="stat-value" id="review-count">0</span><span class="stat-label">Held for review</span></div>
+          <div class="stat"><span class="stat-value" id="reference-count">0</span><span class="stat-label">References</span></div>
+          <div class="stat"><span class="stat-value" id="rejected-count">0</span><span class="stat-label">Rejected</span></div>
+          <div class="stat stat-muted"><span class="stat-value">—</span><span class="stat-label">Instagram · not connected</span></div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-head">
+            <h2>Events</h2>
+            <span class="muted" id="event-count">0 events</span>
+          </div>
+          <div class="event-table-head"><span>Event</span><span>Pipeline</span><span>Sources</span><span>Published</span></div>
+          <div id="event-list" class="event-list"></div>
+        </div>
       </section>
-      <section class="section" id="instagram">
-        <div class="sectionhead"><h3>Instagram performance</h3><span class="tag">ACCOUNT NOT CONNECTED</span></div>
-        <div class="metrics" id="metrics"></div>
-        <p class="note">No live analytics yet. “Reads” is not a standard Instagram insight; available metrics depend on the connected account and media.</p>
+
+      <!-- Event view -->
+      <section id="event-view" class="view" hidden>
+        <button class="back-link" id="close-room" type="button">← Live desk</button>
+        <header class="event-head">
+          <div>
+            <div class="eyebrow" id="room-eyebrow">Event</div>
+            <h1 id="room-title">Event</h1>
+            <div class="chip-row" id="room-meta"></div>
+          </div>
+        </header>
+
+        <ol class="stepper" id="stepper" aria-label="Pipeline progress"></ol>
+
+        <div class="tabs" role="tablist" id="tabs">
+          <button data-tab="overview" type="button" role="tab">Overview</button>
+          <button data-tab="evidence" type="button" role="tab">Evidence</button>
+          <button data-tab="verification" type="button" role="tab">Verification</button>
+          <button data-tab="decision" type="button" role="tab">Decision</button>
+          <button data-tab="package" type="button" role="tab">Package</button>
+          <button data-tab="media" type="button" role="tab">Media</button>
+          <button data-tab="activity" type="button" role="tab">Activity</button>
+        </div>
+
+        <div id="action-bar" class="action-bar"></div>
+        <div id="room-content" class="room-content" aria-live="polite"></div>
       </section>
-      <section class="section" id="events">
-        <div class="sectionhead"><h3>Live intelligence</h3><span class="subtle" id="event-count">0 events</span></div>
-        <div class="signal-counts" aria-label="Signal disposition counts">
-          <span><strong id="reference-count">0</strong> references</span>
-          <span><strong id="review-count">0</strong> review</span>
-          <span><strong id="rejected-count">0</strong> rejected</span>
-          <span><strong id="discovered-event-count">0</strong> events</span>
-        </div>
-        <div class="tablehead"><span>EVENT</span><span>SOURCES</span><span>PRIORITY</span><span>STATUS</span><span>PUBLICATION TIME</span></div>
-        <div id="event-list" class="event-list"></div>
-      </section>
-      <section class="event-room" id="event-room" hidden aria-live="polite">
-        <div class="room-head">
-          <div><div class="eyebrow">SELECTED EVENT</div><h2 id="room-title">Event room</h2><p id="room-meta"></p></div>
-          <button class="quiet-button" id="close-room" type="button">Close</button>
-        </div>
-        <div class="research-controls">
-          <label>Provider
-            <select id="research-provider">
-              <option value="test">Deterministic test data</option>
-              <option value="grok">Grok · live paid call</option>
-            </select>
-          </label>
-          <label class="search-toggle"><input id="research-search" type="checkbox"> Allow one bounded web-search turn</label>
-          <button id="research-event" type="button">Research event</button>
-          <button id="find-corroboration" class="secondary-action" type="button">Find corroboration</button>
-          <span id="research-progress"></span>
-        </div>
-        <div class="room-tabs" role="tablist">
-          <button class="active" data-tab="overview" type="button">Overview</button>
-          <button data-tab="sources" type="button">Sources</button>
-          <button data-tab="claims" type="button">Claims</button>
-          <button data-tab="verification" type="button">Verification</button>
-          <button data-tab="content" type="button">Content decision</button>
-          <button data-tab="production" type="button">Production</button>
-          <button data-tab="history" type="button">Research history</button>
-        </div>
-        <div class="content-controls">
-          <label>Content CEO
-            <select id="content-provider">
-              <option value="test">Deterministic preview</option>
-              <option value="grok">Grok · live paid call</option>
-            </select>
-          </label>
-          <button id="decide-content" type="button">Decide content</button>
-          <span id="content-progress"></span>
-        </div>
-        <div class="content-controls production-controls">
-          <span><strong>Content package</strong><small> Anthropic · one structured call · no publishing</small></span>
-          <button id="generate-package" type="button">Generate content package</button>
-          <span id="production-progress"></span>
-        </div>
-        <div class="content-controls production-controls render-controls">
-          <span><strong>Media rendering</strong><small id="renderer-config"> Explicit generation · human review required</small></span>
-          <button id="generate-media" type="button">Generate media</button>
-          <span id="render-progress"></span>
-        </div>
-        <div id="room-content" class="room-content"></div>
-      </section>
-      <section class="section" id="pipeline">
-        <div class="sectionhead"><h3>Production pipeline</h3><span class="subtle">Event → published</span></div>
-        <div class="pipeline"><div>01 <strong>Research</strong><small>Detect and verify</small></div><div>02 <strong>Story</strong><small>Claims to script</small></div><div>03 <strong>Produce</strong><small>Assets and reel</small></div><div>04 <strong>Review</strong><small>QA and approval</small></div><div>05 <strong>Publish</strong><small>Instagram and insights</small></div></div>
-      </section>
-      <footer>ReachOut OS · Architecture 06C · Local preview</footer>
+
+      <footer class="foot">ReachOut OS · Architecture 06C · Local preview · No publishing actions exist</footer>
     </main>
   </div>
+  <div id="lightbox" class="lightbox" hidden><img alt="Generated media, full size"><button type="button" class="btn ghost" id="lightbox-close">Close</button></div>
   <script src="/app.js"></script>
 </body>
 </html>

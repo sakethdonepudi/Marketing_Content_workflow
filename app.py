@@ -7,12 +7,10 @@ import os
 import re
 import socket
 import sqlite3
-import struct
 import sys
 import time
 import uuid
 import xml.etree.ElementTree as ET
-import zlib
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
@@ -28,22 +26,48 @@ from research import MissingAPIKeyError, ResearchProviderError, USD_TICKS_PER_DO
 from verification import VerificationProviderResult, verification_provider_for
 from content_ceo import ContentProviderResult, content_provider_for
 from content_production import (
+    FORMAT_MEDIA_TYPES,
     PROMPT_SCHEMA_VERSION,
     ProductionProviderResult,
+    ProductionProviderUnavailable,
+    production_configuration,
     production_provider_for,
     validate_production_package,
 )
 from media_rendering import (
+    AsyncMediaRenderer,
+    provider_capabilities,
+    ratio_label,
     RENDER_GENERATION_CONFIG_VERSION,
     RENDER_PROMPT_VERSION,
     InvalidRendererResponse,
     MissingRendererConfiguration,
+    ProviderPollResult,
+    RenderResult,
+    RendererContentPolicyError,
+    RendererDownloadError,
+    RendererNetworkError,
+    RendererPollingExhaustedError,
+    RendererProviderJobFailed,
+    RendererRateLimitError,
+    RendererRejectedError,
+    RendererServerError,
+    RendererTimeoutError,
     configured_renderer_name,
     renderer_configuration,
     renderer_for,
 )
 from media_storage import LocalMediaStorage
-from media_qa import MEDIA_QA_POLICY_VERSION, MediaQAResult, NoopVisualQAProvider, evaluate_text_overlay
+from media_inspection import ImageDecodeError, inspect_image, inspect_video
+from media_qa import (
+    MEDIA_QA_POLICY_VERSION, MediaQAResult, NoopVisualQAProvider, evaluate_ocr_policy,
+    evaluate_text_overlay, normalize_semantic_checks,
+)
+from media_tools import (
+    MediaToolUnavailable, analysis_jpeg, frame_extractor_for, ocr_provider_for,
+    prepare_video_source, sample_times, warm_media_probe,
+)
+from visual_qa import visual_qa_provider_for
 
 ROOT = Path(__file__).parent
 
@@ -79,8 +103,18 @@ RESEARCH_MAX_RETRIES = max(0, int(os.environ.get("RESEARCH_MAX_RETRIES", "1")))
 RESEARCH_EXECUTOR = ThreadPoolExecutor(max_workers=max(1, int(os.environ.get("RESEARCH_WORKERS", "2"))))
 VERIFICATION_SEARCH_TURNS = max(1, min(3, int(os.environ.get("VERIFICATION_SEARCH_TURNS", "1"))))
 VERIFICATION_TOKEN_LIMIT = max(256, int(os.environ.get("VERIFICATION_TOKEN_LIMIT", "1200")))
-VERIFICATION_TIMEOUT_SECONDS = max(10, int(os.environ.get("VERIFICATION_TIMEOUT_SECONDS", "75")))
-VERIFICATION_MAX_RETRIES = max(0, int(os.environ.get("VERIFICATION_MAX_RETRIES", "0")))
+VERIFICATION_SEARCH_TIMEOUT_SECONDS = max(
+    30, int(os.environ.get("VERIFICATION_SEARCH_TIMEOUT_SECONDS", "180"))
+)
+VERIFICATION_RETRIEVAL_TIMEOUT_SECONDS = max(10, int(os.environ.get("VERIFICATION_RETRIEVAL_TIMEOUT_SECONDS", "30")))
+VERIFICATION_TOTAL_TIMEOUT_SECONDS = max(
+    VERIFICATION_SEARCH_TIMEOUT_SECONDS, int(os.environ.get("VERIFICATION_TOTAL_TIMEOUT_SECONDS", "300"))
+)
+VERIFICATION_TRANSIENT_RETRIES = max(0, min(1, int(os.environ.get("VERIFICATION_TRANSIENT_RETRIES", "1"))))
+VERIFICATION_RETRY_BACKOFF_SECONDS = max(0.0, float(os.environ.get("VERIFICATION_RETRY_BACKOFF_SECONDS", "2")))
+VERIFICATION_RETRY_MAX_BACKOFF_SECONDS = max(
+    VERIFICATION_RETRY_BACKOFF_SECONDS, float(os.environ.get("VERIFICATION_RETRY_MAX_BACKOFF_SECONDS", "30"))
+)
 VERIFICATION_MAX_LEADS = max(1, min(10, int(os.environ.get("VERIFICATION_MAX_LEADS", "5"))))
 VERIFICATION_EXECUTOR = ThreadPoolExecutor(max_workers=1)
 CONTENT_POLICY_VERSION = os.environ.get("CONTENT_POLICY_VERSION", "content-ceo-v1.1")
@@ -90,7 +124,7 @@ CONTENT_TOKEN_LIMIT = max(256, int(os.environ.get("CONTENT_TOKEN_LIMIT", "900"))
 CONTENT_TIMEOUT_SECONDS = max(5, int(os.environ.get("CONTENT_TIMEOUT_SECONDS", "45")))
 CONTENT_EXECUTOR = ThreadPoolExecutor(max_workers=1)
 PRODUCTION_POLICY_VERSION = os.environ.get("PRODUCTION_POLICY_VERSION", "content-production-v1")
-PRODUCTION_TOKEN_LIMIT = max(512, int(os.environ.get("PRODUCTION_TOKEN_LIMIT", "3000")))
+PRODUCTION_TOKEN_LIMIT = max(512, int(os.environ.get("PRODUCTION_TOKEN_LIMIT", "8000")))
 PRODUCTION_CONNECTION_TIMEOUT_SECONDS = max(2, int(os.environ.get("PRODUCTION_CONNECTION_TIMEOUT_SECONDS", "10")))
 PRODUCTION_RESPONSE_TIMEOUT_SECONDS = max(5, int(os.environ.get("PRODUCTION_RESPONSE_TIMEOUT_SECONDS", "60")))
 PRODUCTION_MAX_RETRIES = max(0, min(2, int(os.environ.get("PRODUCTION_MAX_RETRIES", "0"))))
@@ -106,15 +140,25 @@ RENDER_POLICY_VERSION = os.environ.get("RENDER_POLICY_VERSION", "media-render-po
 RENDERER_CONFIG_VERSION = os.environ.get("RENDERER_CONFIG_VERSION", "live-renderer-config-v1")
 RENDER_STORAGE_ROOT = Path(os.environ.get("RENDER_STORAGE_ROOT", ROOT / ".context" / "generated_media"))
 RENDER_TIMEOUT_SECONDS = max(5, int(os.environ.get("RENDER_TIMEOUT_SECONDS", "90")))
-LIVE_RENDERER_TIMEOUT_SECONDS = max(5, int(os.environ.get("LIVE_RENDERER_TIMEOUT_SECONDS", "90")))
+LIVE_RENDERER_TIMEOUT_SECONDS = max(5, int(os.environ.get("LIVE_RENDERER_TIMEOUT_SECONDS", "180")))
 RENDER_MAX_RETRIES = max(0, min(3, int(os.environ.get("RENDER_MAX_RETRIES", "1"))))
+LIVE_RENDERER_MAX_RETRIES = max(0, min(3, int(os.environ.get("LIVE_RENDERER_MAX_RETRIES", "1"))))
+RENDER_MIN_VIDEO_SHORT_SIDE = max(1, int(os.environ.get("RENDER_MIN_VIDEO_SHORT_SIDE", "360")))
+RENDER_VIDEO_DURATION_TOLERANCE_SECONDS = max(0.0, float(os.environ.get("RENDER_VIDEO_DURATION_TOLERANCE_SECONDS", "1.5")))
+RENDER_TARGET_DIMENSIONS = {"3:4": (1200, 1600), "4:5": (1200, 1500), "1:1": (1080, 1080), "9:16": (1080, 1920)}
+RENDER_BACKOFF_SECONDS = max(0.0, float(os.environ.get("RENDER_BACKOFF_SECONDS", "2")))
+RENDER_MAX_BACKOFF_SECONDS = max(0.0, float(os.environ.get("RENDER_MAX_BACKOFF_SECONDS", "30")))
 RENDER_MIN_IMAGE_WIDTH = max(64, int(os.environ.get("RENDER_MIN_IMAGE_WIDTH", "1080")))
 RENDER_MIN_IMAGE_HEIGHT = max(64, int(os.environ.get("RENDER_MIN_IMAGE_HEIGHT", "1080")))
 RENDER_ASPECT_TOLERANCE = max(0.01, float(os.environ.get("RENDER_ASPECT_TOLERANCE", "0.03")))
+VIDEO_SOURCE_MAX_BYTES = max(256_000, int(os.environ.get("VIDEO_SOURCE_MAX_BYTES", str(4 * 1024 * 1024))))
+VIDEO_SOURCE_MIN_SHORT_SIDE = max(360, int(os.environ.get("VIDEO_SOURCE_MIN_SHORT_SIDE", "720")))
 RENDER_EXECUTOR = ThreadPoolExecutor(max_workers=max(1, int(os.environ.get("RENDER_WORKERS", "1"))))
 RENDER_TRANSITIONS = {
     "QUEUED": {"PREPARING", "BLOCKED", "CANCELLED"},
     "PREPARING": {"RENDERING", "BLOCKED", "HUMAN_REVIEW", "FAILED", "CANCELLED"},
+    # PROVIDER_PENDING is stored as resume_state while status remains RENDERING so
+    # existing databases and the active-job uniqueness constraints remain compatible.
     "RENDERING": {"VALIDATING", "BLOCKED", "HUMAN_REVIEW", "FAILED", "CANCELLED"},
     "VALIDATING": {"READY_FOR_REVIEW", "BLOCKED", "HUMAN_REVIEW", "FAILED"},
     "READY_FOR_REVIEW": set(), "HUMAN_REVIEW": set(), "BLOCKED": set(), "FAILED": set(), "CANCELLED": set(),
@@ -212,6 +256,9 @@ def init():
     apply_reference_material_correction()
     if SOURCES_CONFIG.exists():
         sync_sources(load_source_config())
+    recover_unfinished_media_jobs()
+    if os.environ.get("OCR_PROVIDER", "auto").strip().lower() not in ("", "none", "off"):
+        warm_media_probe()
 
 
 def create_event(title, source, source_url="", priority="NORMAL", detected_at=None, event_time=None):
@@ -1963,6 +2010,14 @@ def enqueue_verification(research_run_id, provider_name="grok", *, background=Tr
         if active:
             connection.commit()
             return {"run": dict(active), "duplicate": True, "cached": False}
+        paused = connection.execute(
+            "SELECT * FROM verification_runs WHERE research_run_id=? AND recoverable=1 "
+            "AND resume_state='PAUSED_TRANSIENT' ORDER BY requested_at DESC LIMIT 1",
+            (research_run_id,),
+        ).fetchone()
+        if paused:
+            connection.commit()
+            return {"run": dict(paused), "duplicate": True, "cached": False, "resume_required": True}
         cached = connection.execute(
             "SELECT * FROM verification_runs WHERE research_run_id=? AND provider=? AND model=? "
             "AND final_evidence_version=? AND claim_set_version=? AND status='COMPLETED' "
@@ -2001,12 +2056,15 @@ def enqueue_verification(research_run_id, provider_name="grok", *, background=Tr
         connection.execute(
             "INSERT INTO verification_runs(id,event_id,research_run_id,provider,model,mode,status,initial_evidence_version,"
             "claim_set_version,requested_at,progress,progress_message,max_attempts,search_turn_limit,token_limit,"
-            "limit_guaranteed,limit_notes,summary_json) VALUES(?,?,?,?,?,?,'QUEUED',?,?,?,0,'Queued',?,?,?,?,?,?)",
+            "limit_guaranteed,limit_notes,summary_json,current_phase,search_timeout_seconds,retrieval_timeout_seconds,"
+            "total_timeout_seconds) VALUES(?,?,?,?,?,?,'QUEUED',?,?,?,0,'Queued',?,?,?,?,?,?,'PRIMARY_EVIDENCE_EXTRACTION',?,?,?)",
             (
                 run_id, research_run["event_id"], research_run_id, provider.name, provider.model, provider.mode,
-                evidence_version, claims_version, timestamp, VERIFICATION_MAX_RETRIES + 1, search_turns,
+                evidence_version, claims_version, timestamp, VERIFICATION_TRANSIENT_RETRIES + 1, search_turns,
                 VERIFICATION_TOKEN_LIMIT, int(provider.mode == "live"), limit_notes,
                 json.dumps({"test_leads": test_leads or []}) if provider.mode == "test" else None,
+                VERIFICATION_SEARCH_TIMEOUT_SECONDS, VERIFICATION_RETRIEVAL_TIMEOUT_SECONDS,
+                VERIFICATION_TOTAL_TIMEOUT_SECONDS,
             ),
         )
         connection.execute(
@@ -2102,9 +2160,32 @@ def _verification_gap_bundle(connection, run, versions):
         })
         gaps.extend(f"{version['claim_id']}: {item}" for item in missing)
     gaps.extend(summary.get("unknowns") or [])
+    official_terms = re.compile(
+        r"\b(notification|order|gazette|ministry|department|regulator|authority|board|commission|"
+        r"company filing|stock exchange filing|court order|judgment|government|official)\b",
+        re.I,
+    )
+    official_hints = []
+    evidence_rows = connection.execute(
+        "SELECT canonical_url,text FROM evidence_snapshots WHERE run_id=? ORDER BY id", (run["research_run_id"],)
+    ).fetchall()
+    for evidence in evidence_rows:
+        for sentence in re.split(r"(?<=[.!?])\s+|\n+", evidence["text"] or ""):
+            matches = sorted({match.group(0).lower() for match in official_terms.finditer(sentence)})
+            if not matches:
+                continue
+            official_hints.append({
+                "source_url": evidence["canonical_url"], "reference_text": sentence.strip()[:600],
+                "reference_terms": matches,
+            })
+            if len(official_hints) >= 8:
+                break
+        if len(official_hints) >= 8:
+            break
     return {
         "workspace": workspace_identity()["display_name"], "event_id": run["event_id"],
         "claims": claims, "gaps": list(dict.fromkeys(gaps)),
+        "official_source_hints": official_hints,
         "test_leads": test_payload.get("test_leads") or [],
     }
 
@@ -2126,6 +2207,13 @@ def _regroup_evidence_families(connection, run_id):
         if left != right:
             parent[max(left, right)] = min(left, right)
 
+    registrations = {}
+    for row in rows:
+        registration = _registration_for_verification_url(row["canonical_url"])
+        metadata = (registration or {}).get("metadata") or {}
+        registrations[row["id"]] = str(metadata.get("publisher") or "").strip().lower()
+
+    assessments = []
     for left in range(len(rows)):
         for right in range(left + 1, len(rows)):
             same_text = rows[left]["text_family_hash"] == rows[right]["text_family_hash"]
@@ -2133,8 +2221,24 @@ def _regroup_evidence_families(connection, run_id):
                 None, _normalized_text(rows[left]["text"]).lower()[:20000],
                 _normalized_text(rows[right]["text"]).lower()[:20000],
             ).ratio()
-            if same_text or similarity_score >= 0.86:
+            left_host = _normalized_host(rows[left]["canonical_url"])
+            right_host = _normalized_host(rows[right]["canonical_url"])
+            same_host = left_host == right_host
+            left_publisher = registrations[rows[left]["id"]]
+            same_publisher = bool(left_publisher and left_publisher == registrations[rows[right]["id"]])
+            if same_host:
+                relationship, reason = "SAME_FAMILY", "URLs share the same normalized publisher host."
+            elif same_publisher:
+                relationship, reason = "SAME_FAMILY", "Registered source provenance identifies the same publisher."
+            elif same_text:
+                relationship, reason = "SAME_FAMILY", "Normalized article text is identical."
+            elif similarity_score >= 0.72:
+                relationship, reason = "SAME_FAMILY", "High text overlap indicates a mirror, syndication, or copied release."
+            else:
+                relationship, reason = "INDEPENDENT_FAMILY", "Distinct registered publishers and no syndication-level text overlap."
+            if relationship == "SAME_FAMILY":
                 union(left, right)
+            assessments.append((rows[left], rows[right], relationship, reason, similarity_score, left_host, right_host))
     groups = {}
     for index, row in enumerate(rows):
         groups.setdefault(find(index), []).append(row)
@@ -2145,6 +2249,16 @@ def _regroup_evidence_families(connection, run_id):
             connection.execute(
                 "UPDATE verification_snapshots SET evidence_family_id=? WHERE id=?", (family_id, item["id"])
             )
+    for left, right, relationship, reason, similarity, left_host, right_host in assessments:
+        connection.execute(
+            "INSERT OR IGNORE INTO verification_source_family_assessments(id,verification_run_id,left_snapshot_id,"
+            "right_snapshot_id,relationship,reason,text_similarity,left_host,right_host,assessed_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (
+                "VF-" + uuid.uuid4().hex[:12].upper(), run_id, left["id"], right["id"], relationship,
+                reason, similarity, left_host, right_host, now(),
+            ),
+        )
 
 
 def _best_claim_excerpt(claim_text, source_text):
@@ -2242,10 +2356,15 @@ def _evaluate_verification_claim(connection, run, version, snapshots):
     return decision, rationale, list(dict.fromkeys(missing)), evaluated, len(independent_families)
 
 
-def _inspect_verification_leads(connection, run, gap_bundle, leads):
+def _inspect_verification_leads(connection, run, gap_bundle, leads, *, deadline=None):
     inspected = []
     allowed_claims = gap_bundle["claims"]
     for proposed in (leads or [])[:VERIFICATION_MAX_LEADS]:
+        if deadline is not None and time.monotonic() >= deadline:
+            return {
+                "snapshots": inspected,
+                "transient_error": "Corroborating-source retrieval exceeded its bounded phase timeout.",
+            }
         url = proposed.get("url", "")
         lead_id = "VL-" + uuid.uuid4().hex[:12].upper()
         try:
@@ -2266,6 +2385,14 @@ def _inspect_verification_leads(connection, run, gap_bundle, leads):
             "SELECT * FROM verification_leads WHERE verification_run_id=? AND url=?", (run["id"], url)
         ).fetchone()
         if not lead:
+            continue
+        if lead["status"] == "INGESTED":
+            existing_snapshot = connection.execute(
+                "SELECT * FROM verification_snapshots WHERE verification_run_id=? AND origin_kind='corroboration' "
+                "AND origin_id=?", (run["id"], lead["id"]),
+            ).fetchone()
+            if existing_snapshot:
+                inspected.append(dict(existing_snapshot))
             continue
         registration = _registration_for_verification_url(url)
         if not registration:
@@ -2306,10 +2433,325 @@ def _inspect_verification_leads(connection, run, gap_bundle, leads):
                 (status, safe_reason, now(), lead["id"]),
             )
             log_error("verification_lead_rejected", safe_reason, run_id=run["id"], lead_url=url, status=status)
-    return inspected
+            timeout_reason = getattr(error, "reason", None)
+            if isinstance(error, TimeoutError) or isinstance(timeout_reason, (TimeoutError, socket.timeout)):
+                return {"snapshots": inspected, "transient_error": safe_reason}
+    return {"snapshots": inspected, "transient_error": None}
+
+
+VERIFICATION_PHASES = (
+    "PRIMARY_EVIDENCE_EXTRACTION", "CORROBORATION_DISCOVERY", "CORROBORATING_SOURCE_RETRIEVAL",
+    "CLAIM_SOURCE_MATCHING", "CONTRADICTION_ANALYSIS", "FINAL_CLAIM_ADJUDICATION",
+)
+
+
+def _verification_checkpoint(connection, run_id, phase, status, payload):
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    checkpoint_id = "VC-" + uuid.uuid4().hex[:12].upper()
+    connection.execute(
+        "INSERT OR IGNORE INTO verification_checkpoints(id,verification_run_id,phase,status,payload_json,payload_hash,created_at) "
+        "VALUES(?,?,?,?,?,?,?)",
+        (checkpoint_id, run_id, phase, status, encoded, hashlib.sha256(encoded.encode()).hexdigest(), now()),
+    )
+    if status == "COMPLETED":
+        connection.execute(
+            "UPDATE verification_runs SET last_completed_phase=?,last_checkpoint_at=? WHERE id=?",
+            (phase, now(), run_id),
+        )
+
+
+def _completed_checkpoint(connection, run_id, phase):
+    row = connection.execute(
+        "SELECT * FROM verification_checkpoints WHERE verification_run_id=? AND phase=? AND status='COMPLETED' "
+        "ORDER BY created_at DESC LIMIT 1", (run_id, phase),
+    ).fetchone()
+    if row is None:
+        return None
+    return {**dict(row), "payload": json.loads(row["payload_json"] or "{}")}
+
+
+def _verification_failure_category(error):
+    code = str(getattr(error, "code", "verification_error")).lower()
+    if code in ("connection_timeout", "response_timeout") or isinstance(error, (TimeoutError, socket.timeout)):
+        return "TRANSIENT_PROVIDER_TIMEOUT"
+    if code in ("missing_api_key", "http_401", "http_403"):
+        return "AUTH_FAILURE"
+    if code == "invalid_provider_response":
+        return "INVALID_PROVIDER_OUTPUT"
+    if bool(getattr(error, "retryable", False)) and (
+        code == "network_error" or code == "http_408" or code == "http_409" or code == "http_429"
+        or (code.startswith("http_") and code[5:].isdigit() and int(code[5:]) >= 500)
+    ):
+        return "TRANSIENT_PROVIDER_FAILURE"
+    return "PROVIDER_FAILURE"
+
+
+def _start_verification_attempt(connection, run, provider, phase, retry_of=None):
+    attempt_number = connection.execute(
+        "SELECT COALESCE(MAX(attempt_number),0)+1 FROM verification_attempts WHERE verification_run_id=?", (run["id"],)
+    ).fetchone()[0]
+    attempt_id = "VA-" + uuid.uuid4().hex[:12].upper()
+    connection.execute(
+        "INSERT INTO verification_attempts(id,verification_run_id,attempt_number,phase,provider,model,status,started_at,"
+        "cost_status,retry_of_attempt_id) VALUES(?,?,?,?,?,?,'RUNNING',?,'unknown',?)",
+        (attempt_id, run["id"], attempt_number, phase, provider.name, provider.model, now(), retry_of),
+    )
+    return attempt_id
+
+
+def _finish_verification_attempt(connection, attempt_id, *, result=None, error=None, elapsed_seconds=None, retry_after=None):
+    if result is not None:
+        connection.execute(
+            "UPDATE verification_attempts SET status='COMPLETED',ended_at=?,elapsed_seconds=?,provider_request_id=?,"
+            "input_tokens=?,output_tokens=?,total_tokens=?,actual_search_calls=?,actual_open_calls=?,"
+            "actual_sources_returned=?,cost_status=?,cost_usd=?,cost_usd_ticks=? WHERE id=?",
+            (
+                now(), result.elapsed_seconds if result.elapsed_seconds is not None else elapsed_seconds,
+                result.provider_request_id, result.input_tokens, result.output_tokens, result.total_tokens,
+                result.actual_search_calls, result.actual_open_calls, result.actual_sources_returned,
+                "known" if result.cost_usd is not None else "unknown", result.cost_usd, result.cost_usd_ticks, attempt_id,
+            ),
+        )
+        return
+    category = _verification_failure_category(error)
+    connection.execute(
+        "UPDATE verification_attempts SET status='FAILED',ended_at=?,elapsed_seconds=?,failure_category=?,failure_code=?,"
+        "failure_message=?,retry_after_seconds=? WHERE id=?",
+        (
+            now(), elapsed_seconds, category, getattr(error, "code", "verification_error"),
+            str(error or "verification provider failed")[:500], retry_after, attempt_id,
+        ),
+    )
+
+
+def _verification_attempt_totals(connection, run_id):
+    attempts = [dict(row) for row in connection.execute(
+        "SELECT * FROM verification_attempts WHERE verification_run_id=? AND phase='CORROBORATION_DISCOVERY' "
+        "ORDER BY attempt_number", (run_id,),
+    )]
+    def sum_known(field):
+        values = [row[field] for row in attempts if row[field] is not None]
+        return sum(values) if values else None
+    all_costs_known = bool(attempts) and all(row["cost_status"] == "known" for row in attempts)
+    latest_request = next((row["provider_request_id"] for row in reversed(attempts) if row["provider_request_id"]), None)
+    return {
+        "attempt_count": len(attempts), "input_tokens": sum_known("input_tokens"),
+        "output_tokens": sum_known("output_tokens"), "total_tokens": sum_known("total_tokens"),
+        "actual_search_calls": sum_known("actual_search_calls"), "actual_open_calls": sum_known("actual_open_calls"),
+        "actual_sources_returned": sum_known("actual_sources_returned"),
+        "cost_status": "known" if all_costs_known else "unknown",
+        "cost_usd": sum_known("cost_usd") if all_costs_known else None,
+        "cost_usd_ticks": sum_known("cost_usd_ticks") if all_costs_known else None,
+        "provider_request_id": latest_request, "provider_elapsed_seconds": sum_known("elapsed_seconds"),
+    }
+
+
+def _ensure_incomplete_claim_set(connection, run, reason):
+    existing = connection.execute(
+        "SELECT id FROM approved_claim_sets WHERE verification_run_id=? AND status='REVIEW_REQUIRED' "
+        "ORDER BY version_number DESC LIMIT 1", (run["id"],),
+    ).fetchone()
+    if existing:
+        return existing["id"]
+    snapshots = [dict(row) for row in connection.execute(
+        "SELECT canonical_url,content_hash FROM verification_snapshots WHERE verification_run_id=?", (run["id"],)
+    )]
+    evidence_version = hashlib.sha256(json.dumps(sorted(
+        (item["canonical_url"], item["content_hash"]) for item in snapshots
+    )).encode()).hexdigest()
+    version = connection.execute(
+        "SELECT COALESCE(MAX(version_number),0)+1 FROM approved_claim_sets WHERE event_id=?", (run["event_id"],)
+    ).fetchone()[0]
+    claim_set_id = "CS-" + uuid.uuid4().hex[:12].upper()
+    connection.execute(
+        "INSERT INTO approved_claim_sets(id,event_id,verification_run_id,version_number,evidence_version,claim_set_version,"
+        "status,created_at) VALUES(?,?,?,?,?,?,'REVIEW_REQUIRED',?)",
+        (claim_set_id, run["event_id"], run["id"], version, evidence_version, run["claim_set_version"], now()),
+    )
+    return claim_set_id
+
+
+def _pause_verification(connection, run, category, message, *, phase, partial_payload=None):
+    if partial_payload is not None:
+        _verification_checkpoint(connection, run["id"], phase, "PARTIAL", partial_payload)
+    claim_set_id = _ensure_incomplete_claim_set(connection, run, message)
+    totals = _verification_attempt_totals(connection, run["id"])
+    summary = {
+        "verification_incomplete": True, "failure_category": category, "paused_phase": phase,
+        "claim_set_id": claim_set_id, "claim_set_status": "REVIEW_REQUIRED",
+    }
+    _record_verification_status(
+        connection, run["id"], "RUNNING", "FAILED",
+        "Verification paused because the evidence provider timed out." if category == "TRANSIENT_PROVIDER_TIMEOUT" else message,
+        progress=min(int(run["progress"] or 0), 95), current_phase=phase, resume_state="PAUSED_TRANSIENT",
+        recoverable=1, resume_reason=message, decision_explanation=(
+            "Verification is incomplete because a recoverable provider or retrieval timeout occurred. "
+            "No unresolved claim was converted to insufficient evidence or approved."
+        ), summary_json=json.dumps(summary, ensure_ascii=False), error_code=category, error_message=message,
+        **totals,
+    )
+    connection.execute(
+        "UPDATE events SET verification_status='REVIEW_REQUIRED',updated_at=? WHERE id=?", (now(), run["event_id"])
+    )
+
+
+def _claim_analysis_payload(connection, run, versions):
+    snapshots = [dict(row) for row in connection.execute(
+        "SELECT * FROM verification_snapshots WHERE verification_run_id=? ORDER BY id", (run["id"],)
+    )]
+    analyses = []
+    for version in versions:
+        decision, rationale, missing, evidence, family_count = _evaluate_verification_claim(
+            connection, run, version, snapshots
+        )
+        analyses.append({
+            "claim_version_id": version["id"], "claim_id": version["claim_id"], "decision": decision,
+            "rationale": rationale, "missing": missing, "independent_family_count": family_count,
+            "evidence": [{"snapshot_id": item["snapshot"]["id"], "relationship": item["relationship"],
+                          "excerpt": item["excerpt"], "score": item["score"]} for item in evidence],
+        })
+    return {"snapshot_ids": [item["id"] for item in snapshots], "claims": analyses}
+
+
+def _finalize_verification(connection, run, versions, result, domains, provider_failure=None):
+    snapshots = [dict(row) for row in connection.execute(
+        "SELECT * FROM verification_snapshots WHERE verification_run_id=? ORDER BY id", (run["id"],)
+    )]
+    decisions = []
+    family_sizes = {}
+    for item in snapshots:
+        family_sizes[item["evidence_family_id"]] = family_sizes.get(item["evidence_family_id"], 0) + 1
+    for version in versions:
+        decision, rationale, missing, evidence, family_count = _evaluate_verification_claim(
+            connection, run, version, snapshots
+        )
+        existing = connection.execute(
+            "SELECT * FROM verification_decisions WHERE verification_run_id=? AND claim_version_id=?",
+            (run["id"], version["id"]),
+        ).fetchone()
+        decision_id = existing["id"] if existing else "VD-" + uuid.uuid4().hex[:12].upper()
+        approved = int(decision == "SUPPORTED")
+        if existing is None:
+            connection.execute(
+                "INSERT INTO verification_decisions(id,verification_run_id,claim_version_id,decision,approved,"
+                "required_for_event,independent_family_count,rationale,missing_information_json,decided_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (decision_id, run["id"], version["id"], decision, approved, version["required_for_event"],
+                 family_count, rationale, json.dumps(missing, ensure_ascii=False), now()),
+            )
+        else:
+            prior_evidence = [dict(row) for row in connection.execute(
+                "SELECT * FROM verification_decision_evidence WHERE decision_id=? ORDER BY id", (decision_id,),
+            )]
+            revision_payload = {"decision": dict(existing), "evidence": prior_evidence}
+            encoded_revision = json.dumps(revision_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            connection.execute(
+                "INSERT INTO verification_decision_revisions(id,verification_run_id,claim_version_id,"
+                "superseded_decision_id,snapshot_json,snapshot_hash,reason,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                (
+                    "VDR-" + uuid.uuid4().hex[:12].upper(), run["id"], version["id"], decision_id,
+                    encoded_revision, hashlib.sha256(encoded_revision.encode()).hexdigest(),
+                    "Explicit resume re-adjudicated the claim using preserved plus newly retrieved evidence.", now(),
+                ),
+            )
+            connection.execute("DELETE FROM verification_decision_evidence WHERE decision_id=?", (decision_id,))
+            connection.execute(
+                "UPDATE verification_decisions SET decision=?,approved=?,required_for_event=?,independent_family_count=?,"
+                "rationale=?,missing_information_json=?,decided_at=? WHERE id=?",
+                (
+                    decision, approved, version["required_for_event"], family_count, rationale,
+                    json.dumps(missing, ensure_ascii=False), now(), decision_id,
+                ),
+            )
+        if run["mode"] == "live":
+            ledger_status = decision if decision in ("SUPPORTED", "CONFLICTED", "INSUFFICIENT_EVIDENCE") else "INSUFFICIENT_EVIDENCE"
+            ledger_claim = connection.execute(
+                "SELECT verification_status FROM claims WHERE id=?", (version["claim_id"],)
+            ).fetchone()
+            if ledger_claim and ledger_claim["verification_status"] != ledger_status:
+                connection.execute("UPDATE claims SET verification_status=?,updated_at=? WHERE id=?",
+                                   (ledger_status, now(), version["claim_id"]))
+                connection.execute(
+                    "INSERT INTO claim_status_history(claim_id,from_status,to_status,reason,changed_at) VALUES(?,?,?,?,?)",
+                    (version["claim_id"], ledger_claim["verification_status"], ledger_status,
+                     f"Verification run {run['id']}: {rationale}", now()),
+                )
+        for item in evidence:
+            snapshot = item["snapshot"]
+            directness = (
+                "direct_primary" if snapshot["source_class"] == "official_primary"
+                else "syndicated_report" if family_sizes[snapshot["evidence_family_id"]] > 1
+                else "independent_report"
+            )
+            connection.execute(
+                "INSERT OR IGNORE INTO verification_decision_evidence(decision_id,snapshot_id,relationship,excerpt,"
+                "excerpt_valid,directness,evidence_family_id,rationale) VALUES(?,?,?,?,1,?,?,?)",
+                (decision_id, snapshot["id"], item["relationship"], item["excerpt"], directness,
+                 snapshot["evidence_family_id"], f"Claim-token overlap {item['score']:.2f}; inspected full stored page."),
+            )
+        decisions.append({"id": decision_id, "claim_version_id": version["id"], "decision": decision,
+                          "approved": approved, "required": bool(version["required_for_event"])})
+    required_pass = all(item["decision"] == "SUPPORTED" for item in decisions if item["required"])
+    has_required = any(item["required"] for item in decisions)
+    production_pass = run["mode"] == "live" and not provider_failure and has_required and required_pass
+    if run["mode"] == "test":
+        set_status, explanation = "TEST_ONLY", "TEST DATA verification is excluded from production event verification."
+    elif provider_failure:
+        set_status = "REVIEW_REQUIRED"
+        explanation = "Verification failed at the provider boundary; local evidence remains reviewable but incomplete."
+    elif production_pass:
+        set_status, explanation = "APPROVED", "Every required claim passed the documented claim-specific corroboration policy."
+    else:
+        set_status = "REVIEW_REQUIRED"
+        explanation = "At least one required claim lacks claim-specific official evidence or two independent families."
+    final_version = hashlib.sha256(json.dumps(sorted(set(
+        (item["canonical_url"], item["content_hash"]) for item in snapshots
+    ))).encode()).hexdigest()
+    set_version = connection.execute(
+        "SELECT COALESCE(MAX(version_number),0)+1 FROM approved_claim_sets WHERE event_id=?", (run["event_id"],)
+    ).fetchone()[0]
+    claim_set_id = "CS-" + uuid.uuid4().hex[:12].upper()
+    connection.execute(
+        "INSERT INTO approved_claim_sets(id,event_id,verification_run_id,version_number,evidence_version,claim_set_version,"
+        "status,created_at) VALUES(?,?,?,?,?,?,?,?)",
+        (claim_set_id, run["event_id"], run["id"], set_version, final_version, run["claim_set_version"], set_status, now()),
+    )
+    for item in decisions:
+        if item["approved"]:
+            connection.execute(
+                "INSERT INTO approved_claim_set_items(claim_set_id,claim_version_id,verification_decision_id) VALUES(?,?,?)",
+                (claim_set_id, item["claim_version_id"], item["id"]),
+            )
+    summary = {
+        **result.result, "domains": domains,
+        "inspected_sources": sum(lead["status"] == "INGESTED" for lead in connection.execute(
+            "SELECT status FROM verification_leads WHERE verification_run_id=?", (run["id"],)
+        )), "claim_set_id": claim_set_id, "claim_set_status": set_status,
+    }
+    totals = _verification_attempt_totals(connection, run["id"])
+    _record_verification_status(
+        connection, run["id"], "RUNNING", "FAILED" if provider_failure else "COMPLETED",
+        provider_failure[1] if provider_failure else "Verification decisions complete", completed_at=now(), progress=100,
+        current_phase="FINAL_CLAIM_ADJUDICATION", recoverable=0, resume_state=None, resume_reason=None,
+        final_evidence_version=final_version, decision_explanation=explanation,
+        summary_json=json.dumps(summary, ensure_ascii=False), error_code=provider_failure[0] if provider_failure else None,
+        error_message=provider_failure[1] if provider_failure else None, **totals,
+    )
+    _verification_checkpoint(connection, run["id"], "FINAL_CLAIM_ADJUDICATION", "COMPLETED",
+                             {"claim_set_id": claim_set_id, "claim_set_status": set_status})
+    event = connection.execute("SELECT status FROM events WHERE id=?", (run["event_id"],)).fetchone()
+    if production_pass and event["status"] == "VERIFYING":
+        connection.execute("UPDATE events SET status='VERIFIED',verification_status='VERIFIED',updated_at=? WHERE id=?",
+                           (now(), run["event_id"]))
+        connection.execute("INSERT INTO transitions(event_id,from_state,to_state,at) VALUES(?,'VERIFYING','VERIFIED',?)",
+                           (run["event_id"], now()))
+    else:
+        connection.execute("UPDATE events SET verification_status=?,updated_at=? WHERE id=?",
+                           ("TEST_ONLY" if run["mode"] == "test" else "REVIEW_REQUIRED", now(), run["event_id"]))
 
 
 def run_verification_job(run_id, provider=None):
+    execution_started = time.monotonic()
     with connect() as connection:
         run = connection.execute("SELECT * FROM verification_runs WHERE id=?", (run_id,)).fetchone()
         if run is None:
@@ -2317,204 +2759,178 @@ def run_verification_job(run_id, provider=None):
         if run["status"] != "QUEUED":
             return dict(run)
         provider = provider or verification_provider_for("test" if run["mode"] == "test" else "grok")
-        _record_verification_status(
-            connection, run_id, "QUEUED", "RUNNING", "Preparing claim-specific evidence gaps",
-            started_at=now(), progress=10,
-        )
-        connection.execute(
-            "UPDATE events SET verification_status='RUNNING',updated_at=? WHERE id=?", (now(), run["event_id"])
-        )
+        _record_verification_status(connection, run_id, "QUEUED", "RUNNING", "Preparing primary evidence checkpoint",
+                                    started_at=run["started_at"] or now(), progress=max(5, int(run["progress"] or 0)),
+                                    recoverable=0, resume_state=None, resume_reason=None)
+        connection.execute("UPDATE events SET verification_status='RUNNING',updated_at=? WHERE id=?", (now(), run["event_id"]))
         run = connection.execute("SELECT * FROM verification_runs WHERE id=?", (run_id,)).fetchone()
         versions = _ensure_claim_versions(connection, run["research_run_id"])
-        for version in versions:
-            connection.execute(
-                "INSERT OR IGNORE INTO verification_run_claims(verification_run_id,claim_version_id,required_for_event) VALUES(?,?,?)",
-                (run_id, version["id"], version["required_for_event"]),
-            )
-        _snapshot_research_evidence(connection, run)
-        gap_bundle = _verification_gap_bundle(connection, run, versions)
+        if not _completed_checkpoint(connection, run_id, "PRIMARY_EVIDENCE_EXTRACTION"):
+            for version in versions:
+                connection.execute(
+                    "INSERT OR IGNORE INTO verification_run_claims(verification_run_id,claim_version_id,required_for_event) "
+                    "VALUES(?,?,?)", (run_id, version["id"], version["required_for_event"]),
+                )
+            snapshots = _snapshot_research_evidence(connection, run)
+            gap_bundle = _verification_gap_bundle(connection, run, versions)
+            _verification_checkpoint(connection, run_id, "PRIMARY_EVIDENCE_EXTRACTION", "COMPLETED", {
+                "snapshot_ids": [item["id"] for item in snapshots], "claim_version_ids": [item["id"] for item in versions],
+                "official_source_hints": gap_bundle["official_source_hints"],
+            })
+        else:
+            gap_bundle = _verification_gap_bundle(connection, run, versions)
         connection.execute(
-            "UPDATE verification_runs SET progress=25,progress_message='Seeking targeted corroboration' WHERE id=?", (run_id,)
+            "UPDATE verification_runs SET current_phase='CORROBORATION_DISCOVERY',progress=25,"
+            "progress_message='Seeking targeted corroboration' WHERE id=?", (run_id,),
         )
-    result = None
-    error = None
-    attempts = 0
     domains = _verification_domains(run["research_run_id"])
-    if run["mode"] == "live" and not domains:
-        error = ValueError("no verified corroboration domains are registered")
+    discovery_checkpoint = None
+    with connect() as connection:
+        discovery_checkpoint = _completed_checkpoint(connection, run_id, "CORROBORATION_DISCOVERY")
+    result = None
+    provider_failure = None
+    if discovery_checkpoint:
+        result = VerificationProviderResult(result=discovery_checkpoint["payload"]["provider_result"])
+    elif run["mode"] == "live" and not domains:
+        provider_failure = ("verification_error", "no verified corroboration domains are registered")
+        result = VerificationProviderResult(result={"search_summary": provider_failure[1], "unresolved_gaps": gap_bundle["gaps"], "leads": []})
     else:
-        for attempts in range(1, int(run["max_attempts"]) + 1):
+        error = None
+        previous_attempt_id = None
+        for local_attempt in range(1, int(run["max_attempts"]) + 1):
+            with connect() as connection:
+                previous = connection.execute(
+                    "SELECT id FROM verification_attempts WHERE verification_run_id=? ORDER BY attempt_number DESC LIMIT 1",
+                    (run_id,),
+                ).fetchone()
+                previous_attempt_id = previous["id"] if previous else previous_attempt_id
+                attempt_id = _start_verification_attempt(
+                    connection, run, provider, "CORROBORATION_DISCOVERY", previous_attempt_id
+                )
+            attempt_started = time.monotonic()
             try:
                 result = provider.find_corroboration(
                     gap_bundle, allowed_domains=domains, search_turn_limit=int(run["search_turn_limit"]),
-                    token_limit=int(run["token_limit"]), timeout_seconds=VERIFICATION_TIMEOUT_SECONDS,
+                    token_limit=int(run["token_limit"]), timeout_seconds=int(run["search_timeout_seconds"] or VERIFICATION_SEARCH_TIMEOUT_SECONDS),
                 )
+                with connect() as connection:
+                    _finish_verification_attempt(connection, attempt_id, result=result,
+                                                 elapsed_seconds=time.monotonic() - attempt_started)
                 break
-            except ResearchProviderError as caught:
-                error = caught
-                if not caught.retryable or attempts >= int(run["max_attempts"]):
-                    break
-                time.sleep(min(2 ** (attempts - 1), 4))
             except Exception as caught:
                 error = caught
-                break
-    provider_failure = None
-    if result is None:
-        safe_message = str(error or "verification provider failed")[:500]
-        safe_code = getattr(error, "code", "verification_error")
-        provider_failure = (safe_code, safe_message)
-        result = VerificationProviderResult(result={
-            "search_summary": "The provider failed before returning new discovery leads.",
-            "unresolved_gaps": gap_bundle["gaps"],
-            "leads": [],
-        })
-        log_error("verification_failed", safe_message, run_id=run_id, error_code=safe_code)
+                category = _verification_failure_category(caught)
+                retry_after = getattr(caught, "retry_after_seconds", None)
+                with connect() as connection:
+                    _finish_verification_attempt(connection, attempt_id, error=caught,
+                                                 elapsed_seconds=time.monotonic() - attempt_started,
+                                                 retry_after=retry_after)
+                retryable = category in ("TRANSIENT_PROVIDER_TIMEOUT", "TRANSIENT_PROVIDER_FAILURE")
+                if not retryable or local_attempt >= int(run["max_attempts"]):
+                    break
+                delay = retry_after if retry_after is not None else VERIFICATION_RETRY_BACKOFF_SECONDS * (2 ** (local_attempt - 1))
+                time.sleep(min(max(0.0, delay), VERIFICATION_RETRY_MAX_BACKOFF_SECONDS))
+        if result is None:
+            category = _verification_failure_category(error)
+            safe_message = str(error or "verification provider failed")[:500]
+            if category in ("TRANSIENT_PROVIDER_TIMEOUT", "TRANSIENT_PROVIDER_FAILURE"):
+                with connect() as connection:
+                    current = connection.execute("SELECT * FROM verification_runs WHERE id=?", (run_id,)).fetchone()
+                    _pause_verification(connection, current, category, safe_message, phase="CORROBORATION_DISCOVERY")
+                return verification_run(run_id)
+            provider_failure = (getattr(error, "code", "verification_error"), safe_message)
+            result = VerificationProviderResult(result={
+                "search_summary": "The provider failed before returning new discovery leads.",
+                "unresolved_gaps": gap_bundle["gaps"], "leads": [],
+            })
+            log_error("verification_failed", safe_message, run_id=run_id, error_code=provider_failure[0])
+        else:
+            with connect() as connection:
+                _verification_checkpoint(connection, run_id, "CORROBORATION_DISCOVERY", "COMPLETED",
+                                         {"provider_result": result.result})
+
     with connect() as connection:
         run = connection.execute("SELECT * FROM verification_runs WHERE id=?", (run_id,)).fetchone()
         connection.execute(
-            "UPDATE verification_runs SET progress=50,progress_message='Inspecting discovered source pages' WHERE id=?",
-            (run_id,),
+            "UPDATE verification_runs SET current_phase='CORROBORATING_SOURCE_RETRIEVAL',progress=50,"
+            "progress_message='Inspecting discovered source pages' WHERE id=?", (run_id,),
         )
-        _inspect_verification_leads(connection, run, gap_bundle, result.result.get("leads") or [])
-        _regroup_evidence_families(connection, run_id)
-        snapshots = [dict(row) for row in connection.execute(
-            "SELECT * FROM verification_snapshots WHERE verification_run_id=? ORDER BY id", (run_id,)
-        )]
-        connection.execute(
-            "UPDATE verification_runs SET progress=75,progress_message='Evaluating claims by evidence family' WHERE id=?",
-            (run_id,),
-        )
-        decisions = []
-        for version in versions:
-            decision, rationale, missing, evidence, family_count = _evaluate_verification_claim(
-                connection, run, version, snapshots
+        retrieval_checkpoint = _completed_checkpoint(connection, run_id, "CORROBORATING_SOURCE_RETRIEVAL")
+        if not retrieval_checkpoint:
+            retrieval_provider = type("LocalRetrieval", (), {"name": "local-source-fetch", "model": "registered-source-ingestion"})()
+            retrieval_attempt = _start_verification_attempt(
+                connection, run, retrieval_provider, "CORROBORATING_SOURCE_RETRIEVAL"
             )
-            decision_id = "VD-" + uuid.uuid4().hex[:12].upper()
-            approved = int(decision == "SUPPORTED")
+            retrieval_started = time.monotonic()
+            retrieval_deadline = min(
+                execution_started + int(run["total_timeout_seconds"] or VERIFICATION_TOTAL_TIMEOUT_SECONDS),
+                retrieval_started + int(run["retrieval_timeout_seconds"] or VERIFICATION_RETRIEVAL_TIMEOUT_SECONDS),
+            )
+            retrieval = _inspect_verification_leads(
+                connection, run, gap_bundle, result.result.get("leads") or [], deadline=retrieval_deadline,
+            )
+            if retrieval["transient_error"]:
+                retrieval_error = TimeoutError(retrieval["transient_error"])
+                _finish_verification_attempt(connection, retrieval_attempt, error=retrieval_error,
+                                             elapsed_seconds=time.monotonic() - retrieval_started)
+                _regroup_evidence_families(connection, run_id)
+                partial = _claim_analysis_payload(connection, run, versions)
+                _verification_checkpoint(connection, run_id, "CLAIM_SOURCE_MATCHING", "PARTIAL", partial)
+                _pause_verification(connection, run, "RETRIEVAL_TIMEOUT", retrieval["transient_error"],
+                                    phase="CORROBORATING_SOURCE_RETRIEVAL", partial_payload={
+                                        "retrieved_snapshot_ids": [item["id"] for item in retrieval["snapshots"]],
+                                    })
+                return verification_run(run_id)
             connection.execute(
-                "INSERT INTO verification_decisions(id,verification_run_id,claim_version_id,decision,approved,"
-                "required_for_event,independent_family_count,rationale,missing_information_json,decided_at) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?)",
-                (
-                    decision_id, run_id, version["id"], decision, approved, version["required_for_event"],
-                    family_count, rationale, json.dumps(missing, ensure_ascii=False), now(),
-                ),
+                "UPDATE verification_attempts SET status='COMPLETED',ended_at=?,elapsed_seconds=?,cost_status='not_billed' "
+                "WHERE id=?", (now(), time.monotonic() - retrieval_started, retrieval_attempt),
             )
-            if run["mode"] == "live":
-                ledger_status = decision if decision in ("SUPPORTED", "CONFLICTED", "INSUFFICIENT_EVIDENCE") else "INSUFFICIENT_EVIDENCE"
-                ledger_claim = connection.execute(
-                    "SELECT verification_status FROM claims WHERE id=?", (version["claim_id"],)
-                ).fetchone()
-                if ledger_claim and ledger_claim["verification_status"] != ledger_status:
-                    connection.execute(
-                        "UPDATE claims SET verification_status=?,updated_at=? WHERE id=?",
-                        (ledger_status, now(), version["claim_id"]),
-                    )
-                    connection.execute(
-                        "INSERT INTO claim_status_history(claim_id,from_status,to_status,reason,changed_at) "
-                        "VALUES(?,?,?,?,?)",
-                        (
-                            version["claim_id"], ledger_claim["verification_status"], ledger_status,
-                            f"Verification run {run_id}: {rationale}", now(),
-                        ),
-                    )
-            family_sizes = {}
-            for item in snapshots:
-                family_sizes[item["evidence_family_id"]] = family_sizes.get(item["evidence_family_id"], 0) + 1
-            for item in evidence:
-                snapshot = item["snapshot"]
-                directness = (
-                    "direct_primary" if snapshot["source_class"] == "official_primary"
-                    else "syndicated_report" if family_sizes[snapshot["evidence_family_id"]] > 1
-                    else "independent_report"
-                )
-                connection.execute(
-                    "INSERT INTO verification_decision_evidence(decision_id,snapshot_id,relationship,excerpt,excerpt_valid,"
-                    "directness,evidence_family_id,rationale) VALUES(?,?,?,?,1,?,?,?)",
-                    (
-                        decision_id, snapshot["id"], item["relationship"], item["excerpt"], directness,
-                        snapshot["evidence_family_id"], f"Claim-token overlap {item['score']:.2f}; inspected full stored page.",
-                    ),
-                )
-            decisions.append({
-                "id": decision_id, "claim_version_id": version["id"], "decision": decision,
-                "approved": approved, "required": bool(version["required_for_event"]),
+            _verification_checkpoint(connection, run_id, "CORROBORATING_SOURCE_RETRIEVAL", "COMPLETED", {
+                "retrieved_snapshot_ids": [item["id"] for item in retrieval["snapshots"]],
             })
-        required_pass = all(item["decision"] == "SUPPORTED" for item in decisions if item["required"])
-        has_required = any(item["required"] for item in decisions)
-        production_pass = run["mode"] == "live" and not provider_failure and has_required and required_pass
-        if run["mode"] == "test":
-            set_status = "TEST_ONLY"
-            explanation = "TEST DATA verification is excluded from production event verification."
-        elif provider_failure:
-            set_status = "REVIEW_REQUIRED"
-            explanation = (
-                "Corroboration provider failed before returning inspectable leads; existing evidence was evaluated, "
-                "but the event remains REVIEW_REQUIRED."
-            )
-        elif production_pass:
-            set_status = "APPROVED"
-            explanation = "Every required claim passed the documented claim-specific corroboration policy."
-        else:
-            set_status = "REVIEW_REQUIRED"
-            explanation = "At least one required claim lacks claim-specific official evidence or two independent families."
-        final_version = hashlib.sha256(json.dumps(sorted(set(
-            (item["canonical_url"], item["content_hash"]) for item in snapshots
-        ))).encode()).hexdigest()
-        set_version = connection.execute(
-            "SELECT COALESCE(MAX(version_number),0)+1 FROM approved_claim_sets WHERE event_id=?", (run["event_id"],)
-        ).fetchone()[0]
-        claim_set_id = "CS-" + uuid.uuid4().hex[:12].upper()
+        _regroup_evidence_families(connection, run_id)
         connection.execute(
-            "INSERT INTO approved_claim_sets(id,event_id,verification_run_id,version_number,evidence_version,claim_set_version,"
-            "status,created_at) VALUES(?,?,?,?,?,?,?,?)",
-            (claim_set_id, run["event_id"], run_id, set_version, final_version, run["claim_set_version"], set_status, now()),
+            "UPDATE verification_runs SET current_phase='CLAIM_SOURCE_MATCHING',progress=75,"
+            "progress_message='Matching claims to independent evidence families' WHERE id=?", (run_id,),
         )
-        for item in decisions:
-            if item["approved"]:
-                connection.execute(
-                    "INSERT INTO approved_claim_set_items(claim_set_id,claim_version_id,verification_decision_id) VALUES(?,?,?)",
-                    (claim_set_id, item["claim_version_id"], item["id"]),
-                )
-        summary = {
-            **result.result,
-            "domains": domains,
-            "inspected_sources": sum(lead["status"] == "INGESTED" for lead in connection.execute(
-                "SELECT status FROM verification_leads WHERE verification_run_id=?", (run_id,)
-            )),
-            "claim_set_id": claim_set_id,
-            "claim_set_status": set_status,
-        }
-        _record_verification_status(
-            connection, run_id, "RUNNING", "FAILED" if provider_failure else "COMPLETED",
-            provider_failure[1] if provider_failure else "Verification decisions complete",
-            completed_at=now(), progress=100, attempt_count=attempts,
-            final_evidence_version=final_version, actual_search_calls=result.actual_search_calls,
-            actual_open_calls=result.actual_open_calls, actual_sources_returned=result.actual_sources_returned,
-            input_tokens=result.input_tokens, output_tokens=result.output_tokens, total_tokens=result.total_tokens,
-            cost_usd=result.cost_usd, cost_usd_ticks=result.cost_usd_ticks,
-            cost_status="known" if result.cost_usd is not None else "unknown",
-            provider_request_id=result.provider_request_id, provider_elapsed_seconds=result.elapsed_seconds,
-            decision_explanation=explanation, summary_json=json.dumps(summary, ensure_ascii=False),
-            error_code=provider_failure[0] if provider_failure else None,
-            error_message=provider_failure[1] if provider_failure else None,
+        analysis = _claim_analysis_payload(connection, run, versions)
+        _verification_checkpoint(connection, run_id, "CLAIM_SOURCE_MATCHING", "COMPLETED", analysis)
+        connection.execute(
+            "UPDATE verification_runs SET current_phase='CONTRADICTION_ANALYSIS',progress=85,"
+            "progress_message='Checking claim-specific contradictions' WHERE id=?", (run_id,),
         )
-        event = connection.execute("SELECT status FROM events WHERE id=?", (run["event_id"],)).fetchone()
-        if production_pass and event["status"] == "VERIFYING":
-            connection.execute(
-                "UPDATE events SET status='VERIFIED',verification_status='VERIFIED',updated_at=? WHERE id=?",
-                (now(), run["event_id"]),
-            )
-            connection.execute(
-                "INSERT INTO transitions(event_id,from_state,to_state,at) VALUES(?,'VERIFYING','VERIFIED',?)",
-                (run["event_id"], now()),
-            )
-        else:
-            verification_status = "TEST_ONLY" if run["mode"] == "test" else "REVIEW_REQUIRED"
-            connection.execute(
-                "UPDATE events SET verification_status=?,updated_at=? WHERE id=?",
-                (verification_status, now(), run["event_id"]),
-            )
+        conflicts = [item["claim_version_id"] for item in analysis["claims"] if item["decision"] == "CONFLICTED"]
+        _verification_checkpoint(connection, run_id, "CONTRADICTION_ANALYSIS", "COMPLETED",
+                                 {"conflicted_claim_version_ids": conflicts})
+        _finalize_verification(connection, run, versions, result, domains, provider_failure)
+    return verification_run(run_id)
+
+
+def resume_verification(run_id, provider=None, *, background=True):
+    with connect() as connection:
+        run = connection.execute("SELECT * FROM verification_runs WHERE id=?", (run_id,)).fetchone()
+        if run is None:
+            raise KeyError(run_id)
+        if not run["recoverable"] or run["resume_state"] != "PAUSED_TRANSIENT":
+            raise ValueError("Only verification paused by a recoverable provider or retrieval timeout can be resumed.")
+        connection.execute(
+            "UPDATE verification_runs SET status='QUEUED',progress_message='Resume queued from last safe checkpoint',"
+            "recoverable=0,resume_state=NULL,resume_reason=NULL,resumed_at=?,completed_at=NULL WHERE id=?",
+            (now(), run_id),
+        )
+        connection.execute(
+            "INSERT INTO verification_run_status_history(run_id,from_status,to_status,message,changed_at) "
+            "VALUES(?,'FAILED','QUEUED','Explicit resume requested; prior attempts and checkpoints preserved',?)",
+            (run_id, now()),
+        )
+        queued = dict(connection.execute("SELECT * FROM verification_runs WHERE id=?", (run_id,)).fetchone())
+    selected_provider = provider or verification_provider_for("test" if queued["mode"] == "test" else "grok")
+    if background:
+        VERIFICATION_EXECUTOR.submit(run_verification_job, run_id, selected_provider)
+    else:
+        run_verification_job(run_id, selected_provider)
+        queued = verification_run(run_id)
+    return {"run": queued, "resumed": True, "new_run": False}
 
 
 def register_media_asset(
@@ -2858,6 +3274,15 @@ def _insert_content_decision(connection, run, input_version, proposal):
 
 
 def enqueue_content_decision(event_id, provider_name="test", *, background=True):
+    with connect() as connection:
+        incomplete = connection.execute(
+            "SELECT id FROM verification_runs WHERE event_id=? AND recoverable=1 "
+            "AND resume_state='PAUSED_TRANSIENT' ORDER BY requested_at DESC LIMIT 1", (event_id,),
+        ).fetchone()
+    if incomplete:
+        raise ValueError(
+            f"Verification {incomplete['id']} is incomplete after a recoverable timeout; resume verification before Content CEO."
+        )
     provider = content_provider_for(provider_name)
     bundle, input_version = _content_input_bundle(event_id, provider.mode)
     timestamp = now()
@@ -3198,19 +3623,36 @@ def _transition_production_job(connection, job_id, to_status, message, metadata=
     )
 
 
-def enqueue_production(content_decision_id, provider_name="anthropic", *, background=True, regenerate=False):
+def enqueue_production(content_decision_id, provider_name="anthropic", *, background=True, regenerate=False,
+                       client_request_id=None):
     provider = production_provider_for(provider_name)
+    if provider.mode == "live" and not production_configuration()["live"]:
+        # Never fall back to the fixture: a live request without Claude fails closed before any job exists.
+        raise ProductionProviderUnavailable("Claude production provider unavailable: ANTHROPIC_API_KEY is not configured.")
     snapshot = _production_eligibility(content_decision_id)
     if not snapshot["eligible"]:
         raise ValueError("Production entry gate blocked: " + " ".join(snapshot["blockers"]))
     timestamp = now()
     with connect() as connection:
         connection.execute("BEGIN IMMEDIATE")
+        if client_request_id:
+            replay = connection.execute(
+                "SELECT pj.* FROM paid_request_keys prk JOIN production_jobs pj ON pj.id=prk.job_id "
+                "WHERE prk.request_key=? AND prk.kind='PRODUCTION'", (client_request_id,),
+            ).fetchone()
+            if replay:
+                connection.commit()
+                return {"job": dict(replay), "duplicate": True, "cached": False}
         active = connection.execute(
             "SELECT * FROM production_jobs WHERE content_decision_id=? AND status IN ('QUEUED','GENERATING','VALIDATING')",
             (content_decision_id,),
         ).fetchone()
         if active:
+            if client_request_id:
+                connection.execute(
+                    "INSERT OR IGNORE INTO paid_request_keys(request_key,kind,job_id,created_at) VALUES(?,'PRODUCTION',?,?)",
+                    (client_request_id, active["id"], timestamp),
+                )
             connection.commit()
             return {"job": dict(active), "duplicate": True, "cached": False}
         prior = connection.execute(
@@ -3241,6 +3683,12 @@ def enqueue_production(content_decision_id, provider_name="anthropic", *, backgr
                 timestamp, timestamp, timestamp,
             ),
         )
+        connection.execute("UPDATE production_jobs SET client_request_id=? WHERE id=?", (client_request_id, job_id))
+        if client_request_id:
+            connection.execute(
+                "INSERT INTO paid_request_keys(request_key,kind,job_id,created_at) VALUES(?,'PRODUCTION',?,?)",
+                (client_request_id, job_id, timestamp),
+            )
         for claim in snapshot["claims"]:
             connection.execute(
                 "INSERT INTO production_job_claims(job_id,claim_version_id,claim_id,version_number,content_hash,text,"
@@ -3330,6 +3778,13 @@ def run_production_job(job_id, provider=None):
         _transition_production_job(connection, job_id, "GENERATING", "Generating one structured content package.")
         connection.execute("UPDATE production_jobs SET started_at=? WHERE id=?", (now(), job_id))
     locked_context = _job_locked_context(job_id)
+    if hasattr(provider, "request_snapshot"):
+        snapshot_json = json.dumps(provider.request_snapshot(locked_context, PRODUCTION_TOKEN_LIMIT), ensure_ascii=False, sort_keys=True)
+        with connect() as connection:
+            connection.execute(
+                "UPDATE production_jobs SET request_snapshot_json=?,request_snapshot_hash=? WHERE id=?",
+                (snapshot_json, hashlib.sha256(snapshot_json.encode()).hexdigest(), job_id),
+            )
     result = None
     error = None
     for attempt in range(PRODUCTION_MAX_RETRIES + 1):
@@ -3445,11 +3900,35 @@ def production_job(job_id):
 
 
 def _default_render_media_type(content_format):
-    return {"IMAGE": "IMAGE", "REEL": "VIDEO", "STORY": "IMAGE", "CAROUSEL": "IMAGE"}.get(content_format)
+    return FORMAT_MEDIA_TYPES.get(content_format)
 
 
-def _render_eligibility(content_package_id, media_type=None):
+def _source_asset_blockers(connection, source_asset_id, content_package_id):
+    """An image-to-video source must be the exact, live, validated, current image of this package."""
+    row = connection.execute(
+        "SELECT ga.*,rj.status AS job_status FROM generated_assets ga JOIN render_jobs rj ON rj.id=ga.render_job_id "
+        "WHERE ga.id=?", (source_asset_id,),
+    ).fetchone()
+    if row is None:
+        return None, [f"Source asset {source_asset_id} does not exist."]
+    asset = dict(row)
     blockers = []
+    if asset["content_package_id"] != content_package_id:
+        blockers.append("The source image belongs to a different ContentPackage.")
+    if asset["media_type"] != "IMAGE":
+        blockers.append("Only a generated IMAGE can be a video source.")
+    if asset["fixture_only"]:
+        blockers.append("Fixture placeholder images can never be a video source.")
+    if asset["status"] != "VALIDATED" or not asset["executable"] or not asset["usable_for_review"] or asset["stale"]:
+        blockers.append("The source image is not a validated, usable, current live asset.")
+    if asset["job_status"] != "READY_FOR_REVIEW":
+        blockers.append("The source image's render job did not finish at READY_FOR_REVIEW.")
+    return asset, blockers
+
+
+def _render_eligibility(content_package_id, media_type=None, source_asset_id=None):
+    blockers = []
+    source_asset = None
     with connect() as connection:
         row = connection.execute(
             "SELECT cp.*,pj.status AS production_job_status,pj.validation_status AS production_validation_status,"
@@ -3469,8 +3948,16 @@ def _render_eligibility(content_package_id, media_type=None):
         if media_type not in ("IMAGE", "VIDEO", "AUDIO", "THUMBNAIL", "CAROUSEL_SLIDE", "VOICEOVER", "SHORT_FORM_VIDEO", "LONG_FORM_VIDEO"):
             blockers.append("The requested media type is unsupported.")
         expected = _default_render_media_type(package["requested_format"])
-        if media_type != expected:
+        if media_type == "VIDEO" and expected == "IMAGE":
+            if not source_asset_id:
+                blockers.append("Image posts can only generate video from an explicitly selected approved source image.")
+        elif media_type != expected:
             blockers.append(f"Content format {package['requested_format']} currently requires media type {expected}.")
+        if source_asset_id:
+            if media_type != "VIDEO":
+                blockers.append("A source asset is only valid for VIDEO rendering.")
+            source_asset, source_blockers = _source_asset_blockers(connection, source_asset_id, package["id"])
+            blockers.extend(source_blockers)
         latest = connection.execute(
             "SELECT id FROM content_packages WHERE event_id=? ORDER BY version_number DESC LIMIT 1", (package["event_id"],)
         ).fetchone()
@@ -3545,15 +4032,34 @@ def _render_eligibility(content_package_id, media_type=None):
         "prompt_version": RENDER_PROMPT_VERSION, "config_version": RENDER_GENERATION_CONFIG_VERSION,
         "renderer_config_version": RENDERER_CONFIG_VERSION, "media_qa_policy_version": MEDIA_QA_POLICY_VERSION,
     }
+    if source_asset:
+        # Bound only when present so existing image lineage hashes stay unchanged.
+        lineage["source_asset"] = (source_asset["id"], source_asset["checksum_sha256"])
     return {
-        "eligible": not blockers, "blockers": list(dict.fromkeys(blockers)), "package": package,
+        "eligible": not blockers, "blockers": list(dict.fromkeys(blockers)), "package": package, "source_asset": source_asset,
         "package_payload": prompt_package, "media_type": media_type, "input_media": input_media,
         "claim_version_ids": claim_ids, "evidence_snapshot_ids": evidence_ids,
         "input_version": _version_hash(lineage),
     }
 
 
-def _build_render_request(gate, provider, regeneration_number):
+def _requested_render_shape(gate, generation_mode, renderer=None):
+    """Aspect ratio and duration the renderer must produce natively (image-to-video inherits the source ratio)."""
+    package = gate["package_payload"]
+    metadata = package.get("platform_metadata") or {}
+    if generation_mode in ("IMAGE_TO_VIDEO", "REFERENCE_TO_VIDEO") and gate.get("source_asset"):
+        source = gate["source_asset"]
+        capabilities = provider_capabilities(getattr(renderer, "name", "xai"), "VIDEO") or {}
+        aspect = ratio_label(source["width"], source["height"], capabilities.get("aspect_ratios", ())) or (
+            f"{source['width']}x{source['height']}"
+        )
+        return aspect, metadata.get("duration_seconds")
+    if gate["media_type"] == "IMAGE":
+        return metadata.get("aspect_ratio"), None
+    return metadata.get("aspect_ratio"), metadata.get("duration_seconds")
+
+
+def _build_render_request(gate, provider, regeneration_number, generation_mode=None):
     package = gate["package_payload"]
     media_type = gate["media_type"]
     reference_ids = [
@@ -3578,12 +4084,15 @@ def _build_render_request(gate, provider, regeneration_number):
             "no_new_facts": True, "no_political_targeting": True,
         },
     }
+    if package.get("media_brief"):
+        common["media_brief"] = package["media_brief"]
     if media_type == "IMAGE":
         prompts = [scene["visual_prompt"] for scene in package["storyboard"] if scene.get("visual_prompt")]
         if not prompts or not package.get("thumbnail"):
             raise ValueError("The ContentPackage is missing required image creative instructions.")
         aspect = package["platform_metadata"]["aspect_ratio"]
-        width, height = (1200, 1500) if aspect == "4:5" else (1080, 1080)
+        # Target dimensions per ratio; historical 4:5 packages stay readable but cannot render live.
+        width, height = RENDER_TARGET_DIMENSIONS.get(aspect, (1080, 1080))
         common.update({
             "visual_prompts": prompts,
             "thumbnail_concept": package["thumbnail"],
@@ -3596,13 +4105,22 @@ def _build_render_request(gate, provider, regeneration_number):
     elif media_type in ("VIDEO", "SHORT_FORM_VIDEO", "LONG_FORM_VIDEO"):
         if not package.get("storyboard") or not package.get("script"):
             raise ValueError("The ContentPackage is missing required video storyboard or script instructions.")
+        mode = generation_mode or "TEXT_TO_VIDEO"
+        aspect, duration = _requested_render_shape(gate, mode, provider)
         common.update({
             "storyboard": package["storyboard"], "script": package["script"],
+            "visual_prompts": [scene["visual_prompt"] for scene in package["storyboard"] if scene.get("visual_prompt")],
             "generation_parameters": {
-                "duration_seconds": package["platform_metadata"]["duration_seconds"],
-                "aspect_ratio": package["platform_metadata"]["aspect_ratio"],
+                "duration_seconds": duration, "aspect_ratio": aspect, "generation_mode": mode,
+                "resolution": getattr(provider, "resolution", None),
             },
         })
+        if gate.get("source_asset"):
+            source = gate["source_asset"]
+            common["source_asset"] = {
+                "id": source["id"], "checksum_sha256": source["checksum_sha256"], "mime_type": source["mime_type"],
+                "width": source["width"], "height": source["height"], "render_job_id": source["render_job_id"],
+            }
     elif media_type in ("AUDIO", "VOICEOVER"):
         if not package.get("script"):
             raise ValueError("The ContentPackage is missing required audio narration instructions.")
@@ -3616,6 +4134,87 @@ def _build_render_request(gate, provider, regeneration_number):
     else:
         raise ValueError("The selected media type is not implemented for render request construction.")
     return common
+
+
+def _render_request_fingerprint(gate, renderer, request, generation_mode):
+    """Stable identity of an equivalent paid request; regeneration numbering is excluded."""
+    normalized = json.loads(json.dumps(request))
+    (normalized.get("generation_parameters") or {}).pop("seed", None)
+    source = gate.get("source_asset")
+    return _version_hash({
+        "event": gate["package"]["event_id"], "package": gate["package"]["id"],
+        "package_version": gate["package"]["version_number"], "media_type": gate["media_type"],
+        "generation_mode": generation_mode, "source_asset": (
+            [source["id"], source["checksum_sha256"]] if source else None
+        ), "request": normalized, "provider": renderer.name, "model": renderer.model,
+    })
+
+
+def _prepare_video_source_derivative(job, request, storage):
+    """Create/reuse an immutable upload derivative while preserving the original asset."""
+    source = request.get("source_asset")
+    if not source or job.get("generation_mode") not in ("IMAGE_TO_VIDEO", "REFERENCE_TO_VIDEO"):
+        return request
+    transform_spec = {
+        "version": "video-source-jpeg-v1", "max_bytes": VIDEO_SOURCE_MAX_BYTES,
+        "min_short_side": VIDEO_SOURCE_MIN_SHORT_SIDE, "source_checksum": source["checksum_sha256"],
+    }
+    transform_hash = _version_hash(transform_spec)
+    with connect() as connection:
+        existing = connection.execute(
+            "SELECT * FROM derived_assets WHERE source_asset_id=? AND purpose='VIDEO_SOURCE' AND transform_hash=?",
+            (source["id"], transform_hash),
+        ).fetchone()
+        original = connection.execute(
+            "SELECT storage_uri,checksum_sha256 FROM generated_assets WHERE id=?", (source["id"],)
+        ).fetchone()
+    if original is None or original["checksum_sha256"] != source["checksum_sha256"]:
+        raise ValueError("The original video source no longer matches its immutable checksum.")
+    if existing:
+        derivative = dict(existing)
+    else:
+        original_bytes = storage.get(original["storage_uri"])
+        if hashlib.sha256(original_bytes).hexdigest() != source["checksum_sha256"]:
+            raise ValueError("The original source file failed checksum verification.")
+        derivative_bytes, transformation = prepare_video_source(
+            original_bytes, max_bytes=VIDEO_SOURCE_MAX_BYTES, min_short_side=VIDEO_SOURCE_MIN_SHORT_SIDE,
+        )
+        if len(derivative_bytes) > VIDEO_SOURCE_MAX_BYTES:
+            raise ValueError("VIDEO_SOURCE_TOO_LARGE: derived image exceeds VIDEO_SOURCE_MAX_BYTES.")
+        stored = storage.save(derivative_bytes, extension="jpg", metadata={"purpose": "VIDEO_SOURCE"})
+        derivative = {
+            "id": "DA-" + uuid.uuid4().hex[:12].upper(), "source_asset_id": source["id"],
+            "source_checksum_sha256": source["checksum_sha256"], "purpose": "VIDEO_SOURCE",
+            "storage_uri": stored.storage_uri, "mime_type": "image/jpeg", "width": transformation["width"],
+            "height": transformation["height"], "file_size": stored.file_size,
+            "checksum_sha256": stored.checksum_sha256, "frame_time_seconds": None,
+            "transform_json": json.dumps(transformation, sort_keys=True), "transform_hash": transform_hash,
+            "created_at": now(),
+        }
+        with connect() as connection:
+            connection.execute(
+                "INSERT OR IGNORE INTO derived_assets(id,source_asset_id,source_checksum_sha256,purpose,storage_uri,mime_type,"
+                "width,height,file_size,checksum_sha256,frame_time_seconds,transform_json,transform_hash,created_at) "
+                "VALUES(:id,:source_asset_id,:source_checksum_sha256,:purpose,:storage_uri,:mime_type,:width,:height,"
+                ":file_size,:checksum_sha256,:frame_time_seconds,:transform_json,:transform_hash,:created_at)", derivative,
+            )
+            derivative = dict(connection.execute(
+                "SELECT * FROM derived_assets WHERE source_asset_id=? AND purpose='VIDEO_SOURCE' AND transform_hash=?",
+                (source["id"], transform_hash),
+            ).fetchone())
+    if derivative["file_size"] > VIDEO_SOURCE_MAX_BYTES:
+        raise ValueError("VIDEO_SOURCE_TOO_LARGE: stored derivative exceeds VIDEO_SOURCE_MAX_BYTES.")
+    with connect() as connection:
+        connection.execute("UPDATE render_jobs SET source_derivative_id=?,updated_at=? WHERE id=?",
+                           (derivative["id"], now(), job["id"]))
+    prepared = json.loads(json.dumps(request))
+    prepared["original_source_asset"] = dict(source)
+    prepared["source_asset"] = {
+        "id": derivative["id"], "checksum_sha256": derivative["checksum_sha256"],
+        "mime_type": derivative["mime_type"], "width": derivative["width"], "height": derivative["height"],
+        "source_asset_id": derivative["source_asset_id"], "source_checksum_sha256": derivative["source_checksum_sha256"],
+    }
+    return prepared
 
 
 def _transition_render_job(connection, job_id, to_status, message, metadata=None):
@@ -3640,62 +4239,123 @@ def _transition_render_job(connection, job_id, to_status, message, metadata=None
 
 def enqueue_render(
     content_package_id, media_type=None, provider_name=None, *, background=True, regenerate=False,
-    renderer=None, visual_qa_provider=None,
+    renderer=None, visual_qa_provider=None, source_asset_id=None, generation_mode=None, client_request_id=None,
+    ocr_provider=None, frame_extractor=None,
 ):
-    gate = _render_eligibility(content_package_id, media_type)
+    gate = _render_eligibility(content_package_id, media_type, source_asset_id)
     if not gate["eligible"]:
         raise ValueError("Render entry gate blocked: " + " ".join(gate["blockers"]))
     if renderer is None:
-        provider_name = provider_name or configured_renderer_name(gate["media_type"])
-        if not provider_name:
+        configured = configured_renderer_name(gate["media_type"])
+        if not configured:
             raise MissingRendererConfiguration(
                 f"LIVE_RENDERER_NOT_CONFIGURED: No live renderer is configured for {gate['media_type']}."
             )
+        if provider_name and provider_name != configured:
+            # A caller can never substitute a different provider, including the fixture.
+            raise MissingRendererConfiguration(
+                f"RENDERER_PROVIDER_MISMATCH: {gate['media_type']} rendering is configured for {configured}."
+            )
+        provider_name = configured
         configuration = renderer_configuration(gate["media_type"])
         if provider_name != "fixture" and not configuration["live"]:
             raise MissingRendererConfiguration(configuration["status"])
         renderer = renderer_for(provider_name, gate["media_type"])
+    if gate["media_type"] == "IMAGE":
+        generation_mode = "IMAGE"
+    elif source_asset_id:
+        generation_mode = generation_mode if generation_mode == "REFERENCE_TO_VIDEO" else "IMAGE_TO_VIDEO"
+    else:
+        if generation_mode in ("IMAGE_TO_VIDEO", "REFERENCE_TO_VIDEO"):
+            raise ValueError(f"{generation_mode} requires an explicitly selected approved source image.")
+        generation_mode = "TEXT_TO_VIDEO"
+    requested_aspect, requested_duration = _requested_render_shape(gate, generation_mode, renderer)
+    unsupported = getattr(renderer, "unsupported_reason", None)
+    if unsupported and gate["media_type"] == "IMAGE":
+        reason = unsupported(gate["media_type"], requested_aspect)
+    elif unsupported:
+        reason = unsupported(gate["media_type"], requested_aspect, duration_seconds=requested_duration, generation_mode=generation_mode)
+    else:
+        reason = None
+    if reason:
+        raise ValueError("RENDERER_CAPABILITY_MISMATCH: " + reason)
+    source = gate.get("source_asset")
     timestamp = now()
     with connect() as connection:
         connection.execute("BEGIN IMMEDIATE")
-        active = connection.execute(
-            "SELECT * FROM render_jobs WHERE content_package_id=? AND media_type=? "
-            "AND status IN ('QUEUED','PREPARING','RENDERING','VALIDATING')",
+        if client_request_id:
+            replay = connection.execute(
+                "SELECT rj.* FROM paid_request_keys prk JOIN render_jobs rj ON rj.id=prk.job_id "
+                "WHERE prk.request_key=? AND prk.kind='RENDER'", (client_request_id,),
+            ).fetchone()
+            if replay:
+                connection.commit()
+                return {"job": dict(replay), "duplicate": True, "cached": False}
+        # A different source image is a different target: it never reuses another source's result.
+        prior = connection.execute(
+            "SELECT * FROM render_jobs WHERE content_package_id=? AND media_type=? AND COALESCE(source_asset_id,'')=? "
+            "ORDER BY regeneration_number DESC LIMIT 1",
+            (content_package_id, gate["media_type"], source["id"] if source else ""),
+        ).fetchone()
+        latest_number = connection.execute(
+            "SELECT COALESCE(MAX(regeneration_number),0) FROM render_jobs WHERE content_package_id=? AND media_type=?",
             (content_package_id, gate["media_type"]),
+        ).fetchone()[0]
+        regeneration_number = latest_number + 1
+        request = _build_render_request(gate, renderer, regeneration_number, generation_mode)
+        request_json = json.dumps(request, ensure_ascii=False, sort_keys=True)
+        request_fingerprint = _render_request_fingerprint(gate, renderer, request, generation_mode)
+        active = connection.execute(
+            "SELECT * FROM render_jobs WHERE request_fingerprint=? "
+            "AND status IN ('QUEUED','PREPARING','RENDERING','VALIDATING') ORDER BY created_at LIMIT 1",
+            (request_fingerprint,),
         ).fetchone()
         if active:
+            if client_request_id:
+                connection.execute(
+                    "INSERT OR IGNORE INTO paid_request_keys(request_key,kind,job_id,created_at) VALUES(?,'RENDER',?,?)",
+                    (client_request_id, active["id"], timestamp),
+                )
             connection.commit()
             return {"job": dict(active), "duplicate": True, "cached": False}
-        prior = connection.execute(
-            "SELECT * FROM render_jobs WHERE content_package_id=? AND media_type=? ORDER BY regeneration_number DESC LIMIT 1",
-            (content_package_id, gate["media_type"]),
-        ).fetchone()
         if prior and not regenerate:
             connection.commit()
             return {"job": dict(prior), "duplicate": False, "cached": True}
-        regeneration_number = prior["regeneration_number"] + 1 if prior else 1
-        request = _build_render_request(gate, renderer, regeneration_number)
-        request_json = json.dumps(request, ensure_ascii=False, sort_keys=True)
         idempotency_key = _version_hash({
             "package": content_package_id, "version": gate["package"]["version_number"],
             "media_type": gate["media_type"], "provider": renderer.name, "model": renderer.model,
             "config": RENDER_GENERATION_CONFIG_VERSION, "renderer_config": RENDERER_CONFIG_VERSION,
             "qa_policy": MEDIA_QA_POLICY_VERSION, "regeneration": regeneration_number,
+            **({"mode": generation_mode, "source": [source["id"], source["checksum_sha256"]] if source else None}
+               if gate["media_type"] != "IMAGE" else {}),
         })
         job_id = "RJ-" + uuid.uuid4().hex[:12].upper()
         connection.execute(
             "INSERT INTO render_jobs(id,event_id,content_decision_id,production_job_id,content_package_id,"
             "content_package_version,media_type,provider,model,provider_mode,prompt_version,generation_config_version,"
             "input_version,input_media_asset_ids_json,idempotency_key,regeneration_number,max_retries,status,fixture_only,"
-            "created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'QUEUED',?,?,?)",
+            "created_at,updated_at,generation_mode,requested_aspect_ratio,requested_duration_seconds,requested_resolution,"
+            "source_asset_id,source_asset_checksum) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'QUEUED',?,?,?,?,?,?,?,?,?)",
             (
                 job_id, gate["package"]["event_id"], gate["package"]["content_decision_id"], gate["package"]["job_id"],
                 content_package_id, gate["package"]["version_number"], gate["media_type"], renderer.name, renderer.model,
                 renderer.mode, RENDER_PROMPT_VERSION, RENDER_GENERATION_CONFIG_VERSION, gate["input_version"],
-                json.dumps(request["reference_asset_ids"]), idempotency_key, regeneration_number, RENDER_MAX_RETRIES,
-                int(renderer.mode == "fixture"), timestamp, timestamp,
+                json.dumps(request["reference_asset_ids"]), idempotency_key, regeneration_number,
+                LIVE_RENDERER_MAX_RETRIES if renderer.mode == "live" else RENDER_MAX_RETRIES,
+                int(renderer.mode == "fixture"), timestamp, timestamp, generation_mode, requested_aspect,
+                requested_duration, request["generation_parameters"].get("resolution"),
+                source["id"] if source else None, source["checksum_sha256"] if source else None,
             ),
         )
+        connection.execute(
+            "UPDATE render_jobs SET request_fingerprint=?,client_request_id=? WHERE id=?",
+            (request_fingerprint, client_request_id, job_id),
+        )
+        if client_request_id:
+            connection.execute(
+                "INSERT INTO paid_request_keys(request_key,kind,job_id,created_at) VALUES(?,'RENDER',?,?)",
+                (client_request_id, job_id, timestamp),
+            )
         connection.execute(
             "INSERT INTO render_prompt_snapshots(id,render_job_id,content_package_id,content_package_version,media_type,"
             "provider,model,prompt_version,generation_config_version,request_json,request_hash,reference_asset_ids_json,created_at) "
@@ -3715,42 +4375,17 @@ def enqueue_render(
         job = dict(connection.execute("SELECT * FROM render_jobs WHERE id=?", (job_id,)).fetchone())
         connection.commit()
     if background:
-        RENDER_EXECUTOR.submit(run_render_job, job_id, renderer, None, visual_qa_provider)
+        RENDER_EXECUTOR.submit(
+            run_render_job, job_id, renderer=renderer, visual_qa_provider=visual_qa_provider,
+            ocr_provider=ocr_provider, frame_extractor=frame_extractor,
+        )
     else:
-        run_render_job(job_id, renderer, visual_qa_provider=visual_qa_provider)
+        run_render_job(
+            job_id, renderer, visual_qa_provider=visual_qa_provider,
+            ocr_provider=ocr_provider, frame_extractor=frame_extractor,
+        )
         job = render_job(job_id)
     return {"job": job, "duplicate": False, "cached": False}
-
-
-def _parse_png(data):
-    if not isinstance(data, (bytes, bytearray)) or not data.startswith(b"\x89PNG\r\n\x1a\n"):
-        raise ValueError("PNG signature is invalid.")
-    offset, width, height, idat, ended = 8, None, None, [], False
-    while offset + 12 <= len(data):
-        length = int.from_bytes(data[offset:offset + 4], "big")
-        kind = data[offset + 4:offset + 8]
-        chunk = data[offset + 8:offset + 8 + length]
-        checksum = int.from_bytes(data[offset + 8 + length:offset + 12 + length], "big")
-        if len(chunk) != length or (zlib.crc32(kind + chunk) & 0xFFFFFFFF) != checksum:
-            raise ValueError("PNG chunk is truncated or corrupt.")
-        if kind == b"IHDR":
-            width, height, bit_depth, color_type, compression, filtering, interlace = struct.unpack(">IIBBBBB", chunk)
-            if (bit_depth, color_type, compression, filtering, interlace) != (8, 2, 0, 0, 0):
-                raise ValueError("PNG encoding is outside the supported validation profile.")
-        elif kind == b"IDAT":
-            idat.append(chunk)
-        elif kind == b"IEND":
-            ended = True
-            break
-        offset += 12 + length
-    if not width or not height or not idat or not ended:
-        raise ValueError("PNG is missing required chunks.")
-    decoded = zlib.decompress(b"".join(idat))
-    if len(decoded) != height * (1 + width * 3):
-        raise ValueError("PNG pixel payload has an invalid length.")
-    if any(decoded[row * (1 + width * 3)] != 0 for row in range(height)):
-        raise ValueError("PNG uses an unsupported scanline filter.")
-    return width, height
 
 
 def _safe_render_error(error):
@@ -3802,18 +4437,27 @@ def _validate_render_result(result, request, stored, storage):
         errors.append("Generated asset was not durably persisted.")
     elif hashlib.sha256(storage.get(stored.storage_uri)).hexdigest() != stored.checksum_sha256:
         errors.append("Stored asset checksum does not match the generated binary.")
-    parsed_width = parsed_height = None
+    parsed_width = parsed_height = decoded = None
     if media_type == "IMAGE":
-        if result.mime_type != "image/png":
-            errors.append("IMAGE result must use the expected image/png MIME type.")
+        if result.mime_type not in ("image/png", "image/jpeg", "image/webp"):
+            errors.append("IMAGE result must use a supported PNG, JPEG, or WebP MIME type.")
         else:
             try:
-                parsed_width, parsed_height = _parse_png(result.asset_bytes)
-            except Exception as error:
+                decoded = inspect_image(result.asset_bytes)
+                parsed_width, parsed_height = decoded["width"], decoded["height"]
+            except ImageDecodeError as error:
                 errors.append(f"Generated image is corrupt: {error}")
+            if decoded and decoded["mime_type"] != result.mime_type:
+                errors.append("Generated image MIME type does not match the decoded file format.")
+        declared_mime = (result.provider_metadata or {}).get("declared_mime_type")
+        if decoded and declared_mime and declared_mime != decoded["mime_type"]:
+            errors.append("Provider-declared MIME type does not match the decoded file format.")
         if parsed_width and (parsed_width < RENDER_MIN_IMAGE_WIDTH or parsed_height < RENDER_MIN_IMAGE_HEIGHT):
             errors.append("Generated image dimensions are below minimum policy.")
-        if parsed_width and (result.width != parsed_width or result.height != parsed_height):
+        if parsed_width and (
+            (result.width is not None and result.width != parsed_width)
+            or (result.height is not None and result.height != parsed_height)
+        ):
             errors.append("Provider-reported dimensions do not match the decoded image.")
         expected = request["generation_parameters"]
         if parsed_width and abs(parsed_width / parsed_height - expected["width"] / expected["height"]) > RENDER_ASPECT_TOLERANCE:
@@ -3821,10 +4465,36 @@ def _validate_render_result(result, request, stored, storage):
         if result.image_count not in (None, expected["output_count"]):
             errors.append("Provider output count does not match the request.")
     elif media_type in ("VIDEO", "SHORT_FORM_VIDEO", "LONG_FORM_VIDEO"):
-        if result.mime_type not in ("video/mp4", "video/webm"):
-            errors.append("VIDEO result has an invalid MIME type.")
-        if not result.duration_seconds or result.duration_seconds <= 0:
-            errors.append("Generated video has no valid duration metadata.")
+        video = None
+        if result.mime_type != "video/mp4":
+            errors.append("VIDEO result must be an MP4 container (video/mp4).")
+        else:
+            try:
+                video = inspect_video(result.asset_bytes)
+            except ImageDecodeError as error:
+                errors.append(f"Generated video is corrupt or not decodable: {error}")
+        params = request["generation_parameters"]
+        if video:
+            decoded = video
+            parsed_width, parsed_height = video["width"], video["height"]
+            if video["duration_seconds"] <= 0:
+                errors.append("Generated video has zero duration.")
+            if min(parsed_width, parsed_height) < RENDER_MIN_VIDEO_SHORT_SIDE:
+                errors.append("Generated video resolution is below minimum policy.")
+            requested = params.get("aspect_ratio") or ""
+            if ":" in requested:
+                left, right = (float(part) for part in requested.split(":"))
+                if abs(parsed_width / parsed_height - left / right) > RENDER_ASPECT_TOLERANCE:
+                    errors.append(f"Generated video aspect ratio does not match the requested {requested}.")
+            else:
+                errors.append("The render request has no supported aspect ratio to validate against.")
+            wanted = params.get("duration_seconds")
+            if wanted and abs(video["duration_seconds"] - float(wanted)) > RENDER_VIDEO_DURATION_TOLERANCE_SECONDS:
+                errors.append(f"Generated video duration {video['duration_seconds']}s does not match the requested {wanted}s.")
+            if result.duration_seconds and abs(video["duration_seconds"] - float(result.duration_seconds)) > RENDER_VIDEO_DURATION_TOLERANCE_SECONDS:
+                errors.append("Provider-reported duration does not match the decoded video.")
+        if request.get("source_asset") and not request["source_asset"].get("checksum_sha256"):
+            errors.append("Image-to-video lineage is missing the exact source checksum.")
     elif media_type in ("AUDIO", "VOICEOVER"):
         if result.mime_type not in ("audio/wav", "audio/mpeg", "audio/mp4"):
             errors.append("AUDIO result has an invalid MIME type.")
@@ -3834,11 +4504,21 @@ def _validate_render_result(result, request, stored, storage):
         "valid": not errors, "errors": errors, "validator_version": RENDER_POLICY_VERSION,
         "checksum_sha256": stored.checksum_sha256, "file_size": stored.file_size,
         "decoded_width": parsed_width, "decoded_height": parsed_height,
+        "decoded_format": decoded["format"] if decoded else None,
+        "decoder": decoded["decoder"] if decoded else None,
+        "decoded_duration_seconds": decoded.get("duration_seconds") if decoded else None,
+        "decoded_frame_rate": decoded.get("frame_rate") if decoded else None,
+        "decoded_codec": decoded.get("codec") if decoded else None,
+        "decoded_has_audio": decoded.get("has_audio") if decoded else None,
+        "source_asset": request.get("source_asset"),
+        "provider_reported_dimensions": [result.width, result.height] if result.width or result.height else None,
     }
 
 
 def _persist_provider_events(connection, job_id, attempt_number, lifecycle_events, provider_job_id=None):
     for event in lifecycle_events or ():
+        if event.get("_persisted"):
+            continue
         event_type = event.get("event_type", "POLLED")
         if event_type not in ("SUBMITTED", "POLLED", "RATE_LIMITED", "COMPLETED", "FAILED", "DOWNLOADED"):
             event_type = "POLLED"
@@ -3847,10 +4527,121 @@ def _persist_provider_events(connection, job_id, attempt_number, lifecycle_event
             "provider_job_id,safe_metadata_json,occurred_at) VALUES(?,?,?,?,?,?,?)",
             (
                 job_id, attempt_number, event_type, event.get("status"), event.get("provider_job_id") or provider_job_id,
-                json.dumps(_scrub_provider_metadata(event), ensure_ascii=False, sort_keys=True),
+                json.dumps(_scrub_provider_metadata({k: v for k, v in event.items() if k != "_persisted"}), ensure_ascii=False, sort_keys=True),
                 event.get("at") or now(),
             ),
         )
+
+
+def _package_allowed_text(package, request):
+    values = []
+    for item in request.get("intended_text_overlays") or ():
+        if isinstance(item, dict):
+            values.extend(str(value) for value in item.values() if isinstance(value, str))
+        elif isinstance(item, str):
+            values.append(item)
+    for key in ("headline", "hook", "caption"):
+        item = package.get(key)
+        if isinstance(item, dict):
+            values.extend(str(value) for value in item.values() if isinstance(value, str))
+        elif isinstance(item, str):
+            values.append(item)
+    return values
+
+
+def _run_ocr_and_prepare_visual_inputs(result, request, gate, technical, ocr_provider, frame_extractor, storage):
+    """Run local OCR and return (QA result, visual inputs, sampled frame artifacts)."""
+    images, frame_artifacts = [], []
+    try:
+        if request["media_type"] == "IMAGE":
+            images.append({"label": "generated image", "role": "generated", "jpeg": analysis_jpeg(result.asset_bytes)})
+        elif request["media_type"] in ("VIDEO", "SHORT_FORM_VIDEO", "LONG_FORM_VIDEO"):
+            duration = technical.get("decoded_duration_seconds") or result.duration_seconds
+            # Very short clips get denser sampling so brief scene changes are less
+            # likely to fall between the five mandatory timeline positions.
+            frames = frame_extractor.extract(result.asset_bytes, sample_times(duration, extra=4 if float(duration or 0) <= 6 else 0))
+            if len(frames) < 5:
+                raise MediaToolUnavailable("Video QA requires at least five representative frames.")
+            for index, frame in enumerate(frames):
+                label = f"video frame {index + 1} at {frame['actual_seconds']:.3f}s"
+                images.append({"label": label, "role": "frame", "jpeg": frame["jpeg"]})
+                frame_artifacts.append({**frame, "label": label})
+        if request.get("original_source_asset"):
+            original = request["original_source_asset"]
+            with connect() as connection:
+                row = connection.execute("SELECT storage_uri FROM generated_assets WHERE id=?", (original["id"],)).fetchone()
+            if row:
+                source_bytes = storage.get(row["storage_uri"])
+                images.append({"label": "exact source image reference", "role": "reference", "jpeg": analysis_jpeg(source_bytes)})
+        detections = []
+        seen = set()
+        for image in images:
+            if image["role"] == "reference":
+                continue
+            for detection in ocr_provider.detect(image["jpeg"]):
+                normalized = re.sub(r"\s+", " ", str(detection.get("text") or "")).strip().casefold()
+                if not normalized or normalized in seen:
+                    continue
+                seen.add(normalized)
+                detections.append({**detection, "frame": image["label"]})
+        package = gate["package_payload"]
+        with connect() as connection:
+            claim_texts = [row["text"] for row in connection.execute(
+                "SELECT text FROM claim_versions WHERE id IN (" + ",".join("?" for _ in gate["claim_version_ids"]) + ")"
+                if gate["claim_version_ids"] else "SELECT text FROM claim_versions WHERE 0",
+                gate["claim_version_ids"],
+            )]
+        policy = evaluate_ocr_policy(
+            detections, allowed_texts=_package_allowed_text(package, request), approved_claim_texts=claim_texts,
+        )
+        return MediaQAResult(
+            status="FAILED" if policy["status"] == "FLAG" else "PASSED",
+            flags=tuple(item["check"] for item in policy["checks"] if item["status"] == "FLAG"),
+            details={
+                "ocr_performed": True, "detections": policy["detections"], "checks": policy["checks"],
+                "run_status": policy["status"], "sampled_frames": [item["label"] for item in frame_artifacts],
+                "evidence_warning": "OCR output is QA evidence, not factual truth.",
+            }, provider=ocr_provider.name, model=ocr_provider.model,
+        ), images, frame_artifacts
+    except (MediaToolUnavailable, OSError, ValueError) as error:
+        return MediaQAResult(
+            status="NOT_PERFORMED", flags=("OCR_UNAVAILABLE",),
+            details={"ocr_performed": False, "reason": _safe_render_error(error), "run_status": "UNKNOWN"},
+            provider=getattr(ocr_provider, "name", None), model=getattr(ocr_provider, "model", None),
+        ), images, frame_artifacts
+
+
+def _persist_qa_frame_artifacts(connection, asset_id, frame_artifacts, storage):
+    rows = []
+    source = connection.execute("SELECT checksum_sha256 FROM generated_assets WHERE id=?", (asset_id,)).fetchone()
+    for frame in frame_artifacts:
+        transform = {
+            "operation": "representative_frame_sample", "extractor": "avfoundation",
+            "requested_seconds": frame["requested_seconds"], "actual_seconds": frame["actual_seconds"],
+            "width": frame["width"], "height": frame["height"],
+        }
+        transform_hash = _version_hash(transform)
+        stored = storage.save(frame["jpeg"], extension="jpg", metadata={"purpose": "QA_FRAME"})
+        row = {
+            "id": "DA-" + uuid.uuid4().hex[:12].upper(), "source_asset_id": asset_id,
+            "source_checksum_sha256": source["checksum_sha256"], "purpose": "QA_FRAME",
+            "storage_uri": stored.storage_uri, "mime_type": "image/jpeg", "width": frame["width"],
+            "height": frame["height"], "file_size": stored.file_size, "checksum_sha256": stored.checksum_sha256,
+            "frame_time_seconds": frame["actual_seconds"], "transform_json": json.dumps(transform, sort_keys=True),
+            "transform_hash": transform_hash, "created_at": now(),
+        }
+        connection.execute(
+            "INSERT OR IGNORE INTO derived_assets(id,source_asset_id,source_checksum_sha256,purpose,storage_uri,mime_type,"
+            "width,height,file_size,checksum_sha256,frame_time_seconds,transform_json,transform_hash,created_at) "
+            "VALUES(:id,:source_asset_id,:source_checksum_sha256,:purpose,:storage_uri,:mime_type,:width,:height,"
+            ":file_size,:checksum_sha256,:frame_time_seconds,:transform_json,:transform_hash,:created_at)", row,
+        )
+        saved = connection.execute(
+            "SELECT id,frame_time_seconds,checksum_sha256,storage_uri FROM derived_assets "
+            "WHERE source_asset_id=? AND purpose='QA_FRAME' AND transform_hash=?", (asset_id, transform_hash),
+        ).fetchone()
+        rows.append(dict(saved))
+    return rows
 
 
 def _persist_media_qa(connection, job_id, asset_id, technical, text_qa, semantic_qa):
@@ -3873,6 +4664,41 @@ def _persist_media_qa(connection, job_id, asset_id, technical, text_qa, semantic
                 MEDIA_QA_POLICY_VERSION, now(),
             ),
         )
+    job = connection.execute("SELECT * FROM render_jobs WHERE id=?", (job_id,)).fetchone()
+    versioned = (
+        ("TECHNICAL", "PASS" if technical["valid"] else "FLAG", None, None,
+         [{"check": "TECHNICAL_VALIDATION", "status": "PASS" if technical["valid"] else "FLAG",
+           "reason": "; ".join(technical.get("errors") or ()) or "Decoded media and lineage passed."}], technical),
+        ("OCR", "PASS" if text_qa.status == "PASSED" else "FLAG" if text_qa.status == "FAILED" else "UNKNOWN",
+         text_qa.provider, text_qa.model, (text_qa.details or {}).get("checks") or [], text_qa.details or {}),
+        ("VISUAL", "PASS" if semantic_qa.status == "PASSED" else "FLAG" if semantic_qa.status == "FLAGGED" else "UNKNOWN",
+         semantic_qa.provider, semantic_qa.model, (semantic_qa.details or {}).get("checks") or [], semantic_qa.details or {}),
+    )
+    for kind, status, provider, model, checks, evidence in versioned:
+        run_number = connection.execute(
+            "SELECT COALESCE(MAX(run_number),0)+1 FROM media_qa_runs WHERE generated_asset_id=? AND qa_kind=?",
+            (asset_id, kind),
+        ).fetchone()[0]
+        cost = evidence.get("cost_usd") if isinstance(evidence, dict) else None
+        connection.execute(
+            "INSERT INTO media_qa_runs(id,generated_asset_id,render_job_id,qa_kind,run_number,trigger,status,provider,model,"
+            "prompt_version,content_package_id,content_package_version,checks_json,evidence_json,explanation,"
+            "provider_request_id,usage_json,cost_status,cost_usd,created_at) VALUES(?,?,?,?,?,'AUTOMATIC',?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                "QR-" + uuid.uuid4().hex[:12].upper(), asset_id, job_id, kind, run_number, status, provider, model,
+                ((evidence or {}).get("prompt_version") if isinstance(evidence, dict) else None) or MEDIA_QA_POLICY_VERSION,
+                job["content_package_id"], job["content_package_version"],
+                json.dumps(checks, ensure_ascii=False, sort_keys=True),
+                json.dumps(_scrub_provider_metadata(evidence), ensure_ascii=False, sort_keys=True),
+                (evidence or {}).get("reason") or (evidence or {}).get("summary"),
+                (evidence or {}).get("provider_request_id"),
+                json.dumps((evidence or {}).get("usage") or {}, sort_keys=True),
+                "known" if cost is not None else (
+                    "not_billed" if kind in ("TECHNICAL", "OCR") or provider is None else "unknown"
+                ),
+                cost, now(),
+            ),
+        )
 
 
 def _record_render_cost(connection, job):
@@ -3889,6 +4715,7 @@ def _record_render_cost(connection, job):
                 "provider_units": job.get("provider_units"), "input_units": job.get("input_units"),
                 "output_units": job.get("output_units"), "generation_seconds": job.get("generation_seconds"),
                 "frame_count": job.get("frame_count"), "image_count": job.get("image_count"),
+                "media_type": job.get("media_type"), "generation_mode": job.get("generation_mode"),
             }, sort_keys=True), job.get("pricing_version"), now(),
         ),
     )
@@ -3925,21 +4752,25 @@ def _persist_render_asset(connection, job, result, stored, validation, status, t
         "storage_uri,mime_type,width,height,duration_seconds,frame_rate,file_size,checksum_sha256,prompt_version,"
         "generation_config_version,source_asset_ids_json,provenance_json,provider_metadata_json,detected_text_json,"
         "validation_status,validation_result_json,created_at,usable_for_review,stale,stale_reason,"
-        "technical_validation_status,text_validation_status,semantic_qa_status,human_review_status) "
-        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "technical_validation_status,text_validation_status,semantic_qa_status,human_review_status,codec,has_audio) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (
             asset_id, job["id"], job["event_id"], job["content_package_id"], job["content_package_version"], job["media_type"], version,
             status, int(status == "VALIDATED" and not job["fixture_only"]), job["fixture_only"], job["provider"], job["model"],
             result.provider_asset_id, result.provider_request_id, _safe_provider_url(result.original_provider_url), stored.storage_uri,
-            result.mime_type, result.width, result.height, result.duration_seconds, result.frame_rate, stored.file_size,
+            result.mime_type, validation["technical"].get("decoded_width") or result.width,
+            validation["technical"].get("decoded_height") or result.height,
+            validation["technical"].get("decoded_duration_seconds") or result.duration_seconds,
+            validation["technical"].get("decoded_frame_rate") or result.frame_rate, stored.file_size,
             stored.checksum_sha256, job["prompt_version"], job["generation_config_version"],
             job["input_media_asset_ids_json"], json.dumps(provenance, sort_keys=True),
             json.dumps(_scrub_provider_metadata(result.provider_metadata or {}), sort_keys=True), json.dumps(list(result.detected_text)),
             "PASSED" if ready else "FAILED", json.dumps(validation, ensure_ascii=False), now(),
-            int(validation["technical"]["valid"] and not stale), int(stale),
+            int(ready and not stale), int(stale),
             "Lineage changed during rendering." if stale else None,
             "PASSED" if validation["technical"]["valid"] else "FAILED",
-            text_qa.status, semantic_qa.status, "REQUIRED",
+            text_qa.status, semantic_qa.status, "REQUIRED", validation["technical"].get("decoded_codec"),
+            None if validation["technical"].get("decoded_has_audio") is None else int(validation["technical"]["decoded_has_audio"]),
         ),
     )
     connection.execute(
@@ -3949,23 +4780,114 @@ def _persist_render_asset(connection, job, result, stored, validation, status, t
     return asset_id
 
 
-def run_render_job(job_id, renderer=None, storage=None, visual_qa_provider=None):
+def _expected_render_entities(package, claims):
+    """Named entities the visual QA layer must check; generated imagery never establishes identity."""
+    entities = []
+    for key in ("entities", "named_entities", "public_figures"):
+        for item in package.get(key) or ():
+            name = item.get("name") if isinstance(item, dict) else item
+            if name and str(name) not in entities:
+                entities.append(str(name))
+    for claim in claims:
+        attribution = claim.get("attribution")
+        if attribution and attribution not in entities:
+            entities.append(attribution)
+    return entities
+
+
+PRODUCTION_COST_STAGES = (
+    ("RESEARCH", "research_runs", "cost_usd", "mode='live'"),
+    ("VERIFICATION", "verification_runs", "cost_usd", "mode='live'"),
+    ("CONTENT_CEO", "content_decision_runs", "cost_usd", "mode='live' AND provider_called=1"),
+    ("CONTENT_PRODUCTION", "production_jobs", "cost_usd", "provider_mode='live' AND provider_called=1"),
+    ("IMAGE_RENDERING", "render_jobs", "COALESCE(provider_cost_usd,calculated_cost_usd)",
+     "provider_mode='live' AND provider_called=1 AND media_type IN ('IMAGE','THUMBNAIL','CAROUSEL_SLIDE')"),
+    ("VIDEO_RENDERING", "render_jobs", "COALESCE(provider_cost_usd,calculated_cost_usd)",
+     "provider_mode='live' AND provider_called=1 AND media_type IN ('VIDEO','SHORT_FORM_VIDEO','LONG_FORM_VIDEO')"),
+)
+
+
+def _render_phase(render):
+    """Human-facing phase: QUEUED → SUBMITTED → GENERATING → DOWNLOADING → VALIDATING → final status."""
+    if render.get("resume_state") == "PROVIDER_PENDING":
+        return {"phase": "PROVIDER_PENDING", "progress": None}
+    if render.get("resume_state") == "NEEDS_INTERVENTION":
+        return {"phase": "NEEDS_INTERVENTION", "progress": None}
+    if render.get("resume_state") == "INTERRUPTED":
+        return {"phase": "INTERRUPTED", "progress": None}
+    if render["status"] not in ("QUEUED", "PREPARING", "RENDERING", "VALIDATING"):
+        return {"phase": render["status"], "progress": None}
+    if render["status"] == "VALIDATING":
+        return {"phase": "VALIDATING", "progress": None}
+    events = render.get("provider_events") or []
+    last = events[-1] if events else None
+    if not last:
+        return {"phase": "QUEUED" if render["status"] in ("QUEUED", "PREPARING") else "SUBMITTING", "progress": None}
+    phase = {"SUBMITTED": "SUBMITTED", "POLLED": "GENERATING", "RATE_LIMITED": "GENERATING",
+             "COMPLETED": "DOWNLOADING", "DOWNLOADED": "VALIDATING"}.get(last["event_type"], "GENERATING")
+    return {"phase": phase, "progress": (last.get("safe_metadata") or {}).get("progress")}
+
+
+def production_cost_summary(connection, event_id):
+    """Aggregate live provider spend per stage; unknown costs are counted, never treated as zero."""
+    stages, total, unknown = [], 0.0, 0
+    for stage, table, cost_expression, live_filter in PRODUCTION_COST_STAGES:
+        row = connection.execute(
+            f"SELECT COUNT(*) AS runs,SUM(CASE WHEN cost_status='known' THEN {cost_expression} END) AS known_cost,"
+            f"SUM(CASE WHEN cost_status='known' AND {cost_expression} IS NOT NULL THEN 0 ELSE 1 END) AS unknown_runs "
+            f"FROM {table} WHERE event_id=? AND {live_filter}", (event_id,),
+        ).fetchone()
+        known_cost = round(row["known_cost"], 6) if row["known_cost"] is not None else None
+        stages.append({
+            "stage": stage, "live_runs": row["runs"], "known_cost_usd": known_cost,
+            "unknown_cost_runs": row["unknown_runs"] or 0,
+        })
+        total += known_cost or 0.0
+        unknown += row["unknown_runs"] or 0
+    for kind, stage in (("OCR", "OCR_QA"), ("VISUAL", "VISUAL_QA")):
+        row = connection.execute(
+            "SELECT SUM(CASE WHEN m.cost_status!='not_billed' THEN 1 ELSE 0 END) AS runs,"
+            "SUM(CASE WHEN m.cost_status='known' THEN m.cost_usd END) AS known_cost,"
+            "SUM(CASE WHEN m.cost_status='unknown' THEN 1 ELSE 0 END) AS unknown_runs "
+            "FROM media_qa_runs m JOIN generated_assets ga ON ga.id=m.generated_asset_id "
+            "WHERE ga.event_id=? AND m.qa_kind=?", (event_id, kind),
+        ).fetchone()
+        known_cost = round(row["known_cost"], 6) if row["known_cost"] is not None else None
+        stages.append({"stage": stage, "live_runs": row["runs"] or 0, "known_cost_usd": known_cost,
+                       "unknown_cost_runs": row["unknown_runs"] or 0})
+        total += known_cost or 0.0
+        unknown += row["unknown_runs"] or 0
+    return {
+        "stages": stages, "known_total_usd": round(total, 6),
+        "unknown_cost_runs": unknown, "total_status": "complete" if not unknown else "partial",
+    }
+
+
+def run_render_job(job_id, renderer=None, storage=None, visual_qa_provider=None, prepared_result=None,
+                   ocr_provider=None, frame_extractor=None):
     storage = storage or LocalMediaStorage(RENDER_STORAGE_ROOT)
-    visual_qa_provider = visual_qa_provider or NoopVisualQAProvider()
+    visual_qa_provider = visual_qa_provider or visual_qa_provider_for()
+    ocr_provider = ocr_provider or ocr_provider_for()
+    frame_extractor = frame_extractor or frame_extractor_for()
     with connect() as connection:
         job_row = connection.execute("SELECT * FROM render_jobs WHERE id=?", (job_id,)).fetchone()
         if job_row is None:
             raise KeyError(job_id)
-        if job_row["status"] != "QUEUED":
+        if prepared_result is None and job_row["status"] != "QUEUED":
             return dict(job_row)
+        if prepared_result is not None and (
+            job_row["status"] not in ("RENDERING", "VALIDATING") or not job_row["provider_job_id"]
+        ):
+            raise ValueError("Only a pending submitted provider job can be resumed without resubmission.")
         renderer = renderer or renderer_for(
             "fixture" if job_row["provider_mode"] == "fixture" else job_row["provider"], job_row["media_type"]
         )
-        _transition_render_job(connection, job_id, "PREPARING", "Revalidating package lineage before renderer call.")
-        connection.execute("UPDATE render_jobs SET started_at=? WHERE id=?", (now(), job_id))
+        if prepared_result is None:
+            _transition_render_job(connection, job_id, "PREPARING", "Revalidating package lineage before renderer call.")
+            connection.execute("UPDATE render_jobs SET started_at=? WHERE id=?", (now(), job_id))
     job = render_job(job_id)
-    gate = _render_eligibility(job["content_package_id"], job["media_type"])
-    if not gate["eligible"] or gate["input_version"] != job["input_version"]:
+    gate = _render_eligibility(job["content_package_id"], job["media_type"], job.get("source_asset_id"))
+    if prepared_result is None and (not gate["eligible"] or gate["input_version"] != job["input_version"]):
         errors = gate["blockers"] or ["Render inputs changed before the renderer call."]
         with connect() as connection:
             connection.execute(
@@ -3977,12 +4899,61 @@ def run_render_job(job_id, renderer=None, storage=None, visual_qa_provider=None)
             _record_render_cost(connection, dict(connection.execute("SELECT * FROM render_jobs WHERE id=?", (job_id,)).fetchone()))
         return render_job(job_id)
     with connect() as connection:
-        _transition_render_job(connection, job_id, "RENDERING", "Calling configured renderer with immutable prompt snapshot.")
         prompt = connection.execute("SELECT request_json FROM render_prompt_snapshots WHERE render_job_id=?", (job_id,)).fetchone()
     request = json.loads(prompt["request_json"])
-    result = None
+    try:
+        request = _prepare_video_source_derivative(job, request, storage)
+    except Exception as error:
+        safe_error = _safe_render_error(error)
+        with connect() as connection:
+            connection.execute(
+                "UPDATE render_jobs SET validation_status='FAILED',technical_validation_status='FAILED',"
+                "failure_code='VIDEO_SOURCE_PREPARATION_FAILED',failure_reason=?,updated_at=? WHERE id=?",
+                (safe_error, now(), job_id),
+            )
+            _transition_render_job(connection, job_id, "FAILED", "Video source preparation failed before any paid provider request.")
+        return render_job(job_id)
+    if prepared_result is None:
+        with connect() as connection:
+            _transition_render_job(connection, job_id, "RENDERING", "Calling configured renderer with immutable prompt snapshot.")
+    current_attempt = {"number": 1}
+
+    def stream_event(event):
+        # Persist each provider lifecycle event as it happens so long video renders show live progress.
+        with connect() as connection:
+            _persist_provider_events(connection, job_id, current_attempt["number"], [event], event.get("provider_job_id"))
+            connection.execute(
+                "UPDATE render_jobs SET provider_job_id=COALESCE(?,provider_job_id),provider_status=?,"
+                "submitted_at=CASE WHEN ?='SUBMITTED' THEN ? ELSE submitted_at END,"
+                "poll_count=poll_count+CASE WHEN ? IN ('POLLED','RATE_LIMITED') THEN 1 ELSE 0 END,"
+                "last_polled_at=CASE WHEN ? IN ('POLLED','RATE_LIMITED') THEN ? ELSE last_polled_at END,updated_at=? WHERE id=?",
+                (event.get("provider_job_id"), event.get("status"), event.get("event_type"), event.get("at"),
+                 event.get("event_type"), event.get("event_type"), event.get("at"), now(), job_id),
+            )
+        event["_persisted"] = True
+
+    def load_asset(asset_id, checksum):
+        with connect() as connection:
+            row = connection.execute(
+                "SELECT storage_uri,checksum_sha256 FROM generated_assets WHERE id=?", (asset_id,)
+            ).fetchone()
+            if row is None:
+                row = connection.execute(
+                    "SELECT storage_uri,checksum_sha256 FROM derived_assets WHERE id=?", (asset_id,)
+                ).fetchone()
+        if row is None or row["checksum_sha256"] != checksum:
+            raise ValueError("Source asset lineage does not match the render job.")
+        return storage.get(row["storage_uri"])
+
+    if hasattr(renderer, "event_sink"):
+        renderer.event_sink = stream_event
+    if hasattr(renderer, "asset_loader"):
+        renderer.asset_loader = load_asset
+    result = prepared_result
     last_error = None
-    for attempt in range(1, job["max_retries"] + 2):
+    attempt_range = range(1, job["max_retries"] + 2) if prepared_result is None else ()
+    for attempt in attempt_range:
+        current_attempt["number"] = attempt
         started = now()
         with connect() as connection:
             connection.execute(
@@ -4041,9 +5012,40 @@ def run_render_job(job_id, renderer=None, storage=None, visual_qa_provider=None)
                 )
             if not retryable or attempt > job["max_retries"]:
                 break
+            retry_after = getattr(error, "retry_after_seconds", None)
+            delay = min(RENDER_MAX_BACKOFF_SECONDS, retry_after if retry_after is not None else RENDER_BACKOFF_SECONDS * 2 ** (attempt - 1))
+            if delay > 0:
+                time.sleep(delay)
     if result is None:
         code = getattr(last_error, "code", "UNKNOWN_PROVIDER_ERROR")
         safe_error = _safe_render_error(last_error)
+        pending_codes = {
+            "POLL_ATTEMPTS_EXHAUSTED", "TIMEOUT", "NETWORK_ERROR", "RATE_LIMITED", "PROVIDER_5XX", "DOWNLOAD_FAILED",
+        }
+        submitted_provider_job_id = getattr(last_error, "provider_job_id", None) or render_job(job_id).get("provider_job_id")
+        if submitted_provider_job_id and code in pending_codes:
+            with connect() as connection:
+                connection.execute(
+                    "UPDATE render_jobs SET provider_called=1,resume_state='PROVIDER_PENDING',resume_reason=?,"
+                    "failure_code=?,failure_reason=?,cost_status='unknown',updated_at=? WHERE id=?",
+                    (safe_error, code, safe_error, now(), job_id),
+                )
+                connection.execute(
+                    "INSERT INTO render_job_status_history(render_job_id,from_status,to_status,message,metadata_json,changed_at) "
+                    "VALUES(?,'RENDERING','RENDERING','Local polling stopped; resume the saved provider job instead of submitting again.',?,?)",
+                    (job_id, json.dumps({"resume_state": "PROVIDER_PENDING", "reason": code}), now()),
+                )
+            return render_job(job_id)
+        if submitted_provider_job_id and code == "INVALID_RESPONSE":
+            with connect() as connection:
+                connection.execute(
+                    "UPDATE render_jobs SET provider_called=1,resume_state='NEEDS_INTERVENTION',resume_reason=?,"
+                    "failure_code=?,failure_reason=?,updated_at=? WHERE id=?",
+                    (safe_error, code, safe_error, now(), job_id),
+                )
+                _transition_render_job(connection, job_id, "HUMAN_REVIEW", "Provider status was unknown; human intervention is required and no replacement was submitted.")
+                _record_render_cost(connection, dict(connection.execute("SELECT * FROM render_jobs WHERE id=?", (job_id,)).fetchone()))
+            return render_job(job_id)
         with connect() as connection:
             connection.execute(
                 "UPDATE render_jobs SET provider_called=1,validation_status='FAILED',technical_validation_status='FAILED',"
@@ -4054,14 +5056,15 @@ def run_render_job(job_id, renderer=None, storage=None, visual_qa_provider=None)
             target = "HUMAN_REVIEW" if code in ("PROVIDER_REJECTED", "CONTENT_POLICY_REJECTED") else "FAILED"
             _transition_render_job(connection, job_id, target, "Renderer ended without a valid downloaded media result.")
             _record_render_cost(connection, dict(connection.execute("SELECT * FROM render_jobs WHERE id=?", (job_id,)).fetchone()))
+        log_error("render_failed", safe_error, render_job_id=job_id, error_code=code, provider=job["provider"], target_status=target)
         return render_job(job_id)
     with connect() as connection:
         connection.execute(
             "UPDATE render_jobs SET provider_called=1,provider_job_id=?,provider_request_id=?,provider_status=?,"
-            "submitted_at=?,last_polled_at=?,poll_count=?,provider_started_at=?,provider_completed_at=?,latency_ms=?,"
+            "submitted_at=COALESCE(?,submitted_at),last_polled_at=?,poll_count=MAX(poll_count,?),provider_started_at=COALESCE(?,provider_started_at),provider_completed_at=?,latency_ms=?,"
             "request_count=?,credits_consumed=?,provider_units=?,input_units=?,output_units=?,generation_seconds=?,"
             "frame_count=?,image_count=?,provider_cost_usd=?,calculated_cost_usd=?,cost_status=?,currency=?,"
-            "pricing_version=?,updated_at=? WHERE id=?",
+            "pricing_version=?,resume_state=NULL,resume_reason=NULL,updated_at=? WHERE id=?",
             (
                 result.provider_job_id, result.provider_request_id, result.provider_status, result.submitted_at,
                 result.last_polled_at, result.poll_count, result.provider_started_at, result.provider_completed_at,
@@ -4072,7 +5075,9 @@ def run_render_job(job_id, renderer=None, storage=None, visual_qa_provider=None)
                 result.currency, result.pricing_version, now(), job_id,
             ),
         )
-        _transition_render_job(connection, job_id, "VALIDATING", "Persisting media and running separate technical, text, and semantic QA layers.")
+        current_status = connection.execute("SELECT status FROM render_jobs WHERE id=?", (job_id,)).fetchone()["status"]
+        if current_status != "VALIDATING":
+            _transition_render_job(connection, job_id, "VALIDATING", "Persisting media and running separate technical, text, and semantic QA layers.")
     try:
         extension = {
             "image/png": "png", "image/jpeg": "jpg", "image/webp": "webp", "video/mp4": "mp4",
@@ -4092,15 +5097,32 @@ def run_render_job(job_id, renderer=None, storage=None, visual_qa_provider=None)
             )
             _transition_render_job(connection, job_id, "FAILED", "Asset persistence or technical validation could not complete.")
             _record_render_cost(connection, dict(connection.execute("SELECT * FROM render_jobs WHERE id=?", (job_id,)).fetchone()))
+        log_error("render_storage_failed", safe_error, render_job_id=job_id, error_code="STORAGE_FAILED")
         return render_job(job_id)
-    current = _render_eligibility(job["content_package_id"], job["media_type"])
+    current = _render_eligibility(job["content_package_id"], job["media_type"], job.get("source_asset_id"))
     stale = not current["eligible"] or current["input_version"] != job["input_version"]
     if stale:
         technical["valid"] = False
         technical["errors"] = list(dict.fromkeys(
             technical["errors"] + current["blockers"] + ["Lineage changed during rendering."]
         ))
-    text_qa = evaluate_text_overlay(request, result.detected_text)
+    replay = None
+    if getattr(renderer, "mode", None) == "live":
+        # A fresh paid generation must never return bytes we already hold; treat it as a replayed response.
+        with connect() as connection:
+            replay = connection.execute(
+                "SELECT id FROM generated_assets WHERE checksum_sha256=? LIMIT 1", (stored.checksum_sha256,)
+            ).fetchone()
+        if replay:
+            technical["valid"] = False
+            technical["errors"] = technical["errors"] + [
+                f"DUPLICATE_PROVIDER_OUTPUT: bytes are identical to existing asset {replay['id']}."
+            ]
+    text_qa, visual_inputs, frame_artifacts = _run_ocr_and_prepare_visual_inputs(
+        result, request, gate, technical, ocr_provider, frame_extractor, storage,
+    )
+    if text_qa.status == "NOT_PERFORMED" and result.detected_text:
+        text_qa = evaluate_text_overlay(request, result.detected_text)
     if technical["valid"]:
         try:
             with connect() as connection:
@@ -4111,15 +5133,34 @@ def run_render_job(job_id, renderer=None, storage=None, visual_qa_provider=None)
                 )] if gate["claim_version_ids"] else []
             semantic_qa = visual_qa_provider.qa(
                 generated_asset={
-                    "checksum_sha256": stored.checksum_sha256, "mime_type": result.mime_type,
-                    "width": result.width, "height": result.height, "duration_seconds": result.duration_seconds,
+                    "checksum_sha256": stored.checksum_sha256, "mime_type": result.mime_type, "media_type": job["media_type"],
+                    "width": technical.get("decoded_width") or result.width,
+                    "height": technical.get("decoded_height") or result.height,
+                    "duration_seconds": technical.get("decoded_duration_seconds") or result.duration_seconds,
+                    "source_asset": request.get("source_asset"),
                 },
                 content_package=gate["package_payload"], approved_claims=claims,
-                expected_entities=["N. Chandrababu Naidu", "Andhra Pradesh"],
+                expected_entities=_expected_render_entities(gate["package_payload"], claims),
                 expected_visual_description=request.get("visual_prompts") or request.get("storyboard") or (),
+                images=visual_inputs,
             )
             if semantic_qa.status not in ("PASSED", "FLAGGED", "NOT_PERFORMED"):
                 raise ValueError("Visual QA provider returned an invalid status.")
+            details = dict(semantic_qa.details or {})
+            details["checks"] = normalize_semantic_checks(
+                details.get("checks"), has_reference=bool(request.get("original_source_asset") or request.get("source_asset")),
+                is_video=job["media_type"] in ("VIDEO", "SHORT_FORM_VIDEO", "LONG_FORM_VIDEO"),
+            )
+            if any(item["status"] == "FLAG" for item in details["checks"]) and semantic_qa.status != "FLAGGED":
+                semantic_qa = MediaQAResult(
+                    status="FLAGGED", flags=tuple(semantic_qa.flags) + ("SEMANTIC_CHECK_FLAGGED",), details=details,
+                    confidence=semantic_qa.confidence, provider=semantic_qa.provider, model=semantic_qa.model,
+                )
+            else:
+                semantic_qa = MediaQAResult(
+                    status=semantic_qa.status, flags=semantic_qa.flags, details=details, confidence=semantic_qa.confidence,
+                    provider=semantic_qa.provider, model=semantic_qa.model,
+                )
         except Exception as error:
             semantic_qa = MediaQAResult(
                 status="FLAGGED", flags=("SEMANTIC_QA_PROVIDER_ERROR",),
@@ -4150,6 +5191,20 @@ def run_render_job(job_id, renderer=None, storage=None, visual_qa_provider=None)
         asset_id = _persist_render_asset(
             connection, job, result, stored, overall, asset_status, text_qa, semantic_qa, stale, ready
         )
+        frame_rows = _persist_qa_frame_artifacts(connection, asset_id, frame_artifacts, storage)
+        if frame_rows:
+            text_details = dict(text_qa.details or {})
+            text_details["frame_artifact_ids"] = [item["id"] for item in frame_rows]
+            text_qa = MediaQAResult(
+                status=text_qa.status, flags=text_qa.flags, details=text_details,
+                confidence=text_qa.confidence, provider=text_qa.provider, model=text_qa.model,
+            )
+            semantic_details = dict(semantic_qa.details or {})
+            semantic_details["frame_artifact_ids"] = [item["id"] for item in frame_rows]
+            semantic_qa = MediaQAResult(
+                status=semantic_qa.status, flags=semantic_qa.flags, details=semantic_details,
+                confidence=semantic_qa.confidence, provider=semantic_qa.provider, model=semantic_qa.model,
+            )
         _persist_media_qa(connection, job_id, asset_id, technical, text_qa, semantic_qa)
         output_ids = [row["generated_asset_id"] for row in connection.execute(
             "SELECT generated_asset_id FROM render_job_outputs WHERE render_job_id=? ORDER BY generated_asset_id", (job_id,)
@@ -4161,7 +5216,7 @@ def run_render_job(job_id, renderer=None, storage=None, visual_qa_provider=None)
             (
                 json.dumps(output_ids), "PASSED" if ready else "FAILED",
                 "PASSED" if technical["valid"] else "FAILED", text_qa.status, semantic_qa.status,
-                json.dumps(overall, ensure_ascii=False), None if ready else ("STALE_INPUTS" if stale else "MEDIA_QA_FLAGGED"),
+                json.dumps(overall, ensure_ascii=False), None if ready else ("STALE_INPUTS" if stale else "DUPLICATE_PROVIDER_OUTPUT" if replay else "MEDIA_QA_FLAGGED"),
                 None if ready else " ".join(qa_errors)[:500], now(), job_id,
             ),
         )
@@ -4173,6 +5228,143 @@ def run_render_job(job_id, renderer=None, storage=None, visual_qa_provider=None)
             _transition_render_job(connection, job_id, "HUMAN_REVIEW", "Generated asset requires human review because media QA flagged it.")
         _record_render_cost(connection, dict(connection.execute("SELECT * FROM render_jobs WHERE id=?", (job_id,)).fetchone()))
         connection.commit()
+    return render_job(job_id)
+
+
+def recover_unfinished_media_jobs():
+    """Mark interrupted work for inspection; startup never submits or replaces paid jobs."""
+    with connect() as connection:
+        table = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='render_jobs'"
+        ).fetchone()
+        if not table:
+            return []
+        rows = connection.execute(
+            "SELECT id,status,provider_called,provider_job_id,resume_state FROM render_jobs "
+            "WHERE status IN ('QUEUED','PREPARING','RENDERING','VALIDATING')"
+        ).fetchall()
+        recovered = []
+        for row in rows:
+            if row["provider_job_id"]:
+                resume_state = "PROVIDER_PENDING"
+                reason = "Application startup found an unfinished submitted provider job. Resume checks reuse its saved provider job ID."
+            elif row["provider_called"]:
+                resume_state = "NEEDS_INTERVENTION"
+                reason = "Application startup found provider activity without a resumable provider job ID."
+            else:
+                resume_state = "INTERRUPTED"
+                reason = "Application startup found local work that had not reached a paid provider submission."
+            if row["resume_state"] != resume_state:
+                connection.execute(
+                    "UPDATE render_jobs SET resume_state=?,resume_reason=?,updated_at=? WHERE id=?",
+                    (resume_state, reason, now(), row["id"]),
+                )
+                connection.execute(
+                    "INSERT INTO render_job_status_history(render_job_id,from_status,to_status,message,metadata_json,changed_at) "
+                    "VALUES(?,?,?,?,?,?)",
+                    (row["id"], row["status"], row["status"], reason,
+                     json.dumps({"startup_recovery": True, "resume_state": resume_state}), now()),
+                )
+            recovered.append({"id": row["id"], "status": row["status"], "resume_state": resume_state})
+    return recovered
+
+
+def resume_render_job(job_id, renderer=None, storage=None, visual_qa_provider=None):
+    """Read the saved provider job once. This function has no submission path."""
+    storage = storage or LocalMediaStorage(RENDER_STORAGE_ROOT)
+    with connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        row = connection.execute("SELECT * FROM render_jobs WHERE id=?", (job_id,)).fetchone()
+        if row is None:
+            raise KeyError(job_id)
+        job = dict(row)
+        if job["status"] in ("RENDERING", "VALIDATING") and job.get("resume_state") == "PROVIDER_PENDING":
+            connection.execute(
+                "UPDATE render_jobs SET resume_state='INTERRUPTED',resume_reason='Read-only provider status check in progress.',updated_at=? WHERE id=?",
+                (now(), job_id),
+            )
+            connection.commit()
+    if not job.get("provider_job_id"):
+        raise ValueError("This job has no saved provider job ID and cannot be resumed safely.")
+    if job["status"] not in ("RENDERING", "VALIDATING") or job.get("resume_state") != "PROVIDER_PENDING":
+        raise ValueError("This job is not waiting for a provider status check.")
+    renderer = renderer or renderer_for(job["provider"], job["media_type"])
+    if not isinstance(renderer, AsyncMediaRenderer):
+        raise ValueError("The configured renderer does not support read-only resume checks.")
+    checked_at = now()
+    try:
+        outcome = renderer.resume_status(
+            job["provider_job_id"], timeout_seconds=LIVE_RENDERER_TIMEOUT_SECONDS,
+            submitted_at=job.get("submitted_at"), provider_request_id=job.get("provider_request_id"),
+        )
+    except (RendererNetworkError, RendererTimeoutError, RendererRateLimitError, RendererServerError) as error:
+        with connect() as connection:
+            connection.execute(
+                "UPDATE render_jobs SET last_resume_check_at=?,resume_check_count=resume_check_count+1,"
+                "resume_state='PROVIDER_PENDING',resume_reason=?,updated_at=? WHERE id=?",
+                (checked_at, _safe_render_error(error), now(), job_id),
+            )
+        return render_job(job_id)
+    except Exception as error:
+        safe = _safe_render_error(error)
+        with connect() as connection:
+            connection.execute(
+                "UPDATE render_jobs SET last_resume_check_at=?,resume_check_count=resume_check_count+1,"
+                "resume_state='NEEDS_INTERVENTION',resume_reason=?,provider_failure_code=?,provider_failure_reason=?,updated_at=? WHERE id=?",
+                (checked_at, safe, getattr(error, "code", "STATUS_CHECK_FAILED"), safe, now(), job_id),
+            )
+            _transition_render_job(
+                connection, job_id, "HUMAN_REVIEW",
+                "Provider job could not be identified safely; no replacement generation was submitted.",
+            )
+        return render_job(job_id)
+    with connect() as connection:
+        attempt = connection.execute(
+            "SELECT COALESCE(MAX(attempt_number),1) FROM render_job_attempts WHERE render_job_id=?", (job_id,)
+        ).fetchone()[0]
+        connection.execute(
+            "UPDATE render_jobs SET last_resume_check_at=?,resume_check_count=resume_check_count+1,last_polled_at=?,"
+            "poll_count=poll_count+1,provider_status=?,updated_at=? WHERE id=?",
+            (checked_at, checked_at, outcome.provider_status if isinstance(outcome, RenderResult) else outcome.status, now(), job_id),
+        )
+        _persist_provider_events(connection, job_id, attempt, (
+            {"event_type": "POLLED", "status": outcome.provider_status if isinstance(outcome, RenderResult) else outcome.status,
+             "at": checked_at, "provider_job_id": job["provider_job_id"], "resume_check": True},
+        ), job["provider_job_id"])
+    if isinstance(outcome, RenderResult):
+        return run_render_job(
+            job_id, renderer=renderer, storage=storage, visual_qa_provider=visual_qa_provider,
+            prepared_result=outcome,
+        )
+    status = outcome.status.upper()
+    if status in ("QUEUED", "PENDING", "PROCESSING", "RUNNING", "IN_PROGRESS"):
+        with connect() as connection:
+            connection.execute(
+                "UPDATE render_jobs SET resume_state='PROVIDER_PENDING',resume_reason='Provider reports that generation is still processing.',updated_at=? WHERE id=?",
+                (now(), job_id),
+            )
+        return render_job(job_id)
+    metadata = outcome.metadata or {}
+    if status in ("FAILED", "ERROR", "CANCELLED", "REJECTED", "CONTENT_POLICY_REJECTED"):
+        reason = str(metadata.get("failure_message") or f"Provider job ended with status {status}.")[:500]
+        with connect() as connection:
+            connection.execute(
+                "UPDATE render_jobs SET resume_state=NULL,resume_reason=NULL,provider_failure_code=?,"
+                "provider_failure_reason=?,failure_code=?,failure_reason=?,updated_at=? WHERE id=?",
+                (metadata.get("failure_code") or status, reason, metadata.get("failure_code") or status, reason, now(), job_id),
+            )
+            target = "HUMAN_REVIEW" if status in ("REJECTED", "CONTENT_POLICY_REJECTED") else "FAILED"
+            _transition_render_job(connection, job_id, target, "Saved provider job reached a terminal failure; no replacement was submitted.")
+            _record_render_cost(connection, dict(connection.execute("SELECT * FROM render_jobs WHERE id=?", (job_id,)).fetchone()))
+        return render_job(job_id)
+    with connect() as connection:
+        connection.execute(
+            "UPDATE render_jobs SET resume_state='NEEDS_INTERVENTION',resume_reason=?,failure_code='UNKNOWN_PROVIDER_STATUS',"
+            "failure_reason=?,updated_at=? WHERE id=?",
+            (f"Provider returned unknown status {status}.", f"Provider returned unknown status {status}.", now(), job_id),
+        )
+        _transition_render_job(connection, job_id, "HUMAN_REVIEW", "Provider returned an unknown status; no replacement was submitted.")
+        _record_render_cost(connection, dict(connection.execute("SELECT * FROM render_jobs WHERE id=?", (job_id,)).fetchone()))
     return render_job(job_id)
 
 
@@ -4190,6 +5382,130 @@ def generated_asset(asset_id):
     if row is None:
         raise KeyError(asset_id)
     return dict(row)
+
+
+def review_media_asset(asset_id, action, reviewer, comment=None):
+    if action not in ("APPROVED", "CHANGES_REQUIRED", "REJECTED"):
+        raise ValueError("Review action must be APPROVED, CHANGES_REQUIRED, or REJECTED.")
+    reviewer = str(reviewer or "").strip()
+    if not reviewer:
+        raise ValueError("Reviewer name is required.")
+    comment = str(comment or "").strip()[:2000] or None
+    with connect() as connection:
+        asset = connection.execute("SELECT * FROM generated_assets WHERE id=?", (asset_id,)).fetchone()
+        if asset is None:
+            raise KeyError(asset_id)
+        qa_ids = [row["id"] for row in connection.execute(
+            "SELECT m.id FROM media_qa_runs m JOIN (SELECT qa_kind,MAX(run_number) AS n FROM media_qa_runs "
+            "WHERE generated_asset_id=? GROUP BY qa_kind) latest ON latest.qa_kind=m.qa_kind AND latest.n=m.run_number "
+            "WHERE m.generated_asset_id=? ORDER BY m.qa_kind", (asset_id, asset_id),
+        )]
+        review_id = "MR-" + uuid.uuid4().hex[:12].upper()
+        connection.execute(
+            "INSERT INTO media_reviews(id,generated_asset_id,asset_version,content_package_id,content_package_version,"
+            "action,reviewer,comment,qa_run_ids_json,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (review_id, asset_id, asset["version_number"], asset["content_package_id"], asset["content_package_version"],
+             action, reviewer, comment, json.dumps(qa_ids), now()),
+        )
+        row = connection.execute("SELECT * FROM media_reviews WHERE id=?", (review_id,)).fetchone()
+    result = dict(row)
+    result["qa_run_ids"] = json.loads(result.pop("qa_run_ids_json"))
+    return result
+
+
+def rerun_media_qa(asset_id, qa_kind="ALL", *, ocr_provider=None, frame_extractor=None, visual_qa_provider=None,
+                   storage=None):
+    """Create immutable manual OCR/visual QA versions for an existing asset."""
+    qa_kind = str(qa_kind or "ALL").upper()
+    if qa_kind not in ("ALL", "OCR", "VISUAL"):
+        raise ValueError("qa_kind must be ALL, OCR, or VISUAL.")
+    storage = storage or LocalMediaStorage(RENDER_STORAGE_ROOT)
+    ocr_provider = ocr_provider or ocr_provider_for()
+    frame_extractor = frame_extractor or frame_extractor_for()
+    visual_qa_provider = visual_qa_provider or visual_qa_provider_for()
+    with connect() as connection:
+        asset_row = connection.execute("SELECT * FROM generated_assets WHERE id=?", (asset_id,)).fetchone()
+        if asset_row is None:
+            raise KeyError(asset_id)
+        asset = dict(asset_row)
+        job = dict(connection.execute("SELECT * FROM render_jobs WHERE id=?", (asset["render_job_id"],)).fetchone())
+        prompt = connection.execute("SELECT request_json FROM render_prompt_snapshots WHERE render_job_id=?", (job["id"],)).fetchone()
+    request = json.loads(prompt["request_json"])
+    if job.get("source_derivative_id"):
+        request = _prepare_video_source_derivative(job, request, storage)
+    gate = _render_eligibility(job["content_package_id"], job["media_type"], job.get("source_asset_id"))
+    asset_bytes = storage.get(asset["storage_uri"])
+    technical = (json.loads(asset.get("validation_result_json") or "{}").get("technical") or {
+        "valid": asset["technical_validation_status"] == "PASSED",
+        "decoded_duration_seconds": asset.get("duration_seconds"),
+    })
+    result = RenderResult(
+        asset_bytes=asset_bytes, mime_type=asset["mime_type"], width=asset.get("width"), height=asset.get("height"),
+        duration_seconds=asset.get("duration_seconds"), frame_rate=asset.get("frame_rate"),
+    )
+    ocr_result, images, frames = _run_ocr_and_prepare_visual_inputs(
+        result, request, gate, technical, ocr_provider, frame_extractor, storage,
+    )
+    visual_result = None
+    if qa_kind in ("ALL", "VISUAL"):
+        with connect() as connection:
+            claims = [dict(row) for row in connection.execute(
+                "SELECT id,text,claim_type,assertion_scope,attribution FROM claim_versions WHERE id IN ("
+                + ",".join("?" for _ in gate["claim_version_ids"]) + ") ORDER BY id"
+                if gate["claim_version_ids"] else "SELECT id,text,claim_type,assertion_scope,attribution FROM claim_versions WHERE 0",
+                gate["claim_version_ids"],
+            )]
+        try:
+            visual_result = visual_qa_provider.qa(
+                generated_asset={**asset, "source_asset": request.get("source_asset")},
+                content_package=gate["package_payload"], approved_claims=claims,
+                expected_entities=_expected_render_entities(gate["package_payload"], claims),
+                expected_visual_description=request.get("visual_prompts") or request.get("storyboard") or (), images=images,
+            )
+        except Exception as error:
+            visual_result = MediaQAResult(
+                status="NOT_PERFORMED", flags=("SEMANTIC_QA_PROVIDER_ERROR",),
+                details={"reason": _safe_render_error(error), "run_status": "UNKNOWN"},
+                provider=getattr(visual_qa_provider, "name", None), model=getattr(visual_qa_provider, "model", None),
+            )
+    with connect() as connection:
+        frame_rows = _persist_qa_frame_artifacts(connection, asset_id, frames, storage) if frames else []
+        created = []
+        candidates = []
+        if qa_kind in ("ALL", "OCR"):
+            candidates.append(("OCR", ocr_result, (ocr_result.details or {}).get("checks") or []))
+        if visual_result is not None:
+            candidates.append(("VISUAL", visual_result, (visual_result.details or {}).get("checks") or []))
+        for kind, result_item, checks in candidates:
+            evidence = dict(result_item.details or {})
+            if frame_rows:
+                evidence["frame_artifact_ids"] = [item["id"] for item in frame_rows]
+            status = (
+                "PASS" if result_item.status == "PASSED" else
+                "FLAG" if result_item.status in ("FAILED", "FLAGGED") else "UNKNOWN"
+            )
+            number = connection.execute(
+                "SELECT COALESCE(MAX(run_number),0)+1 FROM media_qa_runs WHERE generated_asset_id=? AND qa_kind=?",
+                (asset_id, kind),
+            ).fetchone()[0]
+            run_id = "QR-" + uuid.uuid4().hex[:12].upper()
+            cost = evidence.get("cost_usd")
+            connection.execute(
+                "INSERT INTO media_qa_runs(id,generated_asset_id,render_job_id,qa_kind,run_number,trigger,status,provider,model,"
+                "prompt_version,content_package_id,content_package_version,checks_json,evidence_json,explanation,"
+                "provider_request_id,usage_json,cost_status,cost_usd,created_at) VALUES(?,?,?,?,?,'MANUAL',?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (run_id, asset_id, job["id"], kind, number, status, result_item.provider, result_item.model,
+                 evidence.get("prompt_version"), job["content_package_id"], job["content_package_version"],
+                 json.dumps(checks, ensure_ascii=False, sort_keys=True),
+                 json.dumps(_scrub_provider_metadata(evidence), ensure_ascii=False, sort_keys=True),
+                 evidence.get("reason") or evidence.get("summary"), evidence.get("provider_request_id"),
+                 json.dumps(evidence.get("usage") or {}, sort_keys=True),
+                 "known" if cost is not None else (
+                     "not_billed" if kind == "OCR" or result_item.provider is None else "unknown"
+                 ), cost, now()),
+            )
+            created.append(dict(connection.execute("SELECT * FROM media_qa_runs WHERE id=?", (run_id,)).fetchone()))
+    return created
 
 
 def verification_run(run_id):
@@ -4235,8 +5551,25 @@ def event_room(event_id):
             "SELECT * FROM verification_runs WHERE event_id=? ORDER BY requested_at DESC", (event_id,)
         )]
         for verification in verification_runs:
+            verification["attempts"] = [dict(row) for row in connection.execute(
+                "SELECT * FROM verification_attempts WHERE verification_run_id=? ORDER BY attempt_number",
+                (verification["id"],),
+            )]
+            verification["checkpoints"] = [dict(row) for row in connection.execute(
+                "SELECT id,phase,status,payload_hash,created_at FROM verification_checkpoints "
+                "WHERE verification_run_id=? ORDER BY created_at,id", (verification["id"],),
+            )]
+            verification["source_family_assessments"] = [dict(row) for row in connection.execute(
+                "SELECT * FROM verification_source_family_assessments WHERE verification_run_id=? "
+                "ORDER BY relationship,left_snapshot_id,right_snapshot_id", (verification["id"],),
+            )]
             verification["leads"] = [dict(row) for row in connection.execute(
                 "SELECT * FROM verification_leads WHERE verification_run_id=? ORDER BY discovered_at,id",
+                (verification["id"],),
+            )]
+            verification["decision_revisions"] = [dict(row) for row in connection.execute(
+                "SELECT id,claim_version_id,superseded_decision_id,snapshot_hash,reason,created_at "
+                "FROM verification_decision_revisions WHERE verification_run_id=? ORDER BY created_at,id",
                 (verification["id"],),
             )]
             verification["snapshots"] = [dict(row) for row in connection.execute(
@@ -4299,6 +5632,7 @@ def event_room(event_id):
             "SELECT * FROM production_jobs WHERE event_id=? ORDER BY requested_at DESC,id DESC", (event_id,)
         )]
         for job in production_jobs:
+            job.pop("request_snapshot_json", None)  # large; the hash identifies the exact stored request
             job["validation_result"] = json.loads(job.pop("validation_result_json") or "null")
             job["history"] = [dict(item) for item in connection.execute(
                 "SELECT * FROM production_job_status_history WHERE job_id=? ORDER BY changed_at,id", (job["id"],)
@@ -4314,7 +5648,7 @@ def event_room(event_id):
             "SELECT id FROM content_decisions WHERE event_id=? ORDER BY decided_at DESC,id DESC LIMIT 1", (event_id,)
         ).fetchone()
         latest_package = connection.execute(
-            "SELECT id,requested_format FROM content_packages WHERE event_id=? ORDER BY version_number DESC LIMIT 1",
+            "SELECT id,requested_format,version_number FROM content_packages WHERE event_id=? ORDER BY version_number DESC LIMIT 1",
             (event_id,),
         ).fetchone()
         render_jobs = [dict(row) for row in connection.execute(
@@ -4335,6 +5669,7 @@ def event_room(event_id):
             )]
             for provider_event in render["provider_events"]:
                 provider_event["safe_metadata"] = json.loads(provider_event.pop("safe_metadata_json") or "{}")
+            render["render_phase"] = _render_phase(render)
             render["qa_results"] = [dict(item) for item in connection.execute(
                 "SELECT * FROM media_qa_results WHERE render_job_id=? ORDER BY qa_type", (render["id"],)
             )]
@@ -4361,9 +5696,30 @@ def event_room(event_id):
                 asset["provider_metadata"] = json.loads(asset.pop("provider_metadata_json") or "{}")
                 asset["detected_text"] = json.loads(asset.pop("detected_text_json") or "[]")
                 asset["validation_result"] = json.loads(asset.pop("validation_result_json") or "null")
+                asset["qa_runs"] = [dict(run) for run in connection.execute(
+                    "SELECT * FROM media_qa_runs WHERE generated_asset_id=? ORDER BY qa_kind,run_number DESC",
+                    (asset["id"],),
+                )]
+                for qa_run in asset["qa_runs"]:
+                    qa_run["checks"] = json.loads(qa_run.pop("checks_json") or "[]")
+                    qa_run["evidence"] = json.loads(qa_run.pop("evidence_json") or "{}")
+                    qa_run["usage"] = json.loads(qa_run.pop("usage_json") or "{}")
+                asset["reviews"] = [dict(review) for review in connection.execute(
+                    "SELECT * FROM media_reviews WHERE generated_asset_id=? ORDER BY created_at DESC,id DESC",
+                    (asset["id"],),
+                )]
+                for review in asset["reviews"]:
+                    review["qa_run_ids"] = json.loads(review.pop("qa_run_ids_json") or "[]")
+                asset["latest_review"] = asset["reviews"][0] if asset["reviews"] else None
+                asset["derived_assets"] = [dict(item) for item in connection.execute(
+                    "SELECT * FROM derived_assets WHERE source_asset_id=? ORDER BY created_at,id", (asset["id"],),
+                )]
+                for derived in asset["derived_assets"]:
+                    derived["transform"] = json.loads(derived.pop("transform_json") or "{}")
         cost_ledger = [dict(row) for row in connection.execute(
             "SELECT * FROM cost_ledger WHERE event_id=? ORDER BY recorded_at,id", (event_id,)
         )]
+        cost_summary = production_cost_summary(connection, event_id)
     for run in runs:
         run["summary"] = json.loads(run.pop("summary_json")) if run.get("summary_json") else None
     for verification in verification_runs:
@@ -4375,6 +5731,7 @@ def event_room(event_id):
             "eligible": gate["eligible"], "blockers": gate["blockers"],
             "content_decision_id": latest_decision["id"], "input_version": gate["input_version"],
         }
+    production_gate["provider"] = production_configuration()
     render_gate = {
         "eligible": False, "blockers": ["No ContentPackage exists."], "content_package_id": None,
         "media_type": None, "configured_provider": None, "live_renderer_configured": False,
@@ -4384,21 +5741,71 @@ def event_room(event_id):
         requested_type = _default_render_media_type(latest_package["requested_format"])
         gate = _render_eligibility(latest_package["id"], requested_type)
         configuration = renderer_configuration(requested_type)
+        lineage_blockers = list(gate["blockers"])
+        blockers = list(lineage_blockers)
+        configured_renderer = renderer_for(configuration["provider"], requested_type) if configuration["live"] else None
+        if configuration["live"]:
+            check = getattr(configured_renderer, "unsupported_reason", None)
+            capability = check(
+                requested_type, (gate["package_payload"].get("platform_metadata") or {}).get("aspect_ratio")
+            ) if check else None
+            if capability:
+                blockers.append("RENDERER_CAPABILITY_MISMATCH: " + capability)
         render_gate = {
-            "eligible": gate["eligible"], "blockers": gate["blockers"],
+            "eligible": not blockers, "blockers": blockers, "lineage_blockers": lineage_blockers,
             "content_package_id": latest_package["id"], "media_type": requested_type,
+            "content_package_version": latest_package["version_number"],
+            "aspect_ratio": (gate["package_payload"].get("platform_metadata") or {}).get("aspect_ratio"),
+            "duration_seconds": (gate["package_payload"].get("platform_metadata") or {}).get("duration_seconds"),
+            "model": getattr(configured_renderer, "model", None),
+            "resolution": getattr(configured_renderer, "resolution", None),
             "input_version": gate["input_version"], "configured_provider": configuration["provider"],
             "live_renderer_configured": configuration["live"],
             "renderer_configuration_status": configuration["status"],
         }
+    # Physical existence never implies usability: only an asset rendered from the
+    # latest package under the current lineage is current for human review.
+    current_input = render_gate.get("input_version")
+    for render in render_jobs:
+        for asset in render["assets"]:
+            reasons = []
+            if asset["stale"]:
+                reasons.append(asset.get("stale_reason") or "Lineage changed during rendering.")
+            if latest_package and asset["content_package_id"] != latest_package["id"]:
+                reasons.append("A newer ContentPackage version exists.")
+            elif render_gate.get("lineage_blockers"):
+                reasons.append("Package lineage is no longer eligible: " + render_gate["lineage_blockers"][0])
+            elif current_input and render["input_version"] != current_input:
+                reasons.append("Package lineage changed after rendering.")
+            asset["current_for_review"] = bool(asset["usable_for_review"] and not reasons)
+            asset["currency_reasons"] = reasons
+    video_configuration = renderer_configuration("VIDEO")
+    video_renderer = renderer_for(video_configuration["provider"], "VIDEO") if video_configuration["live"] else None
+    video_gate = {
+        "configured_provider": video_configuration["provider"], "live_renderer_configured": video_configuration["live"],
+        "renderer_configuration_status": video_configuration["status"],
+        "capabilities": provider_capabilities(video_configuration["provider"], "VIDEO") if video_configuration["provider"] else None,
+        "model": getattr(video_renderer, "model", None), "resolution": getattr(video_renderer, "resolution", None),
+        "content_package_id": latest_package["id"] if latest_package else None,
+        "content_package_version": latest_package["version_number"] if latest_package else None,
+        "text_to_video_available": bool(latest_package and _default_render_media_type(latest_package["requested_format"]) == "VIDEO"),
+    }
+    for render in render_jobs:
+        for asset in render["assets"]:
+            if asset["media_type"] != "IMAGE" or not latest_package or asset["fixture_only"]:
+                asset["video_source"] = {"eligible": False, "blockers": ["Only live generated images can become a video source."]}
+                continue
+            source_gate = _render_eligibility(latest_package["id"], "VIDEO", asset["id"])
+            source_blockers = list(source_gate["blockers"]) + ([] if asset["current_for_review"] else ["This image is not current for review."])
+            asset["video_source"] = {"eligible": not source_blockers, "blockers": list(dict.fromkeys(source_blockers))}
     return {
         "event": dict(event), "signals": signals, "claims": claims, "runs": runs,
         "verification_runs": verification_runs, "approved_claim_sets": approved_sets,
         "content_decision_runs": content_runs, "media_assets": media_assets,
         "publishing_history": publishing,
         "production_jobs": production_jobs, "production_gate": production_gate,
-        "render_jobs": render_jobs, "render_gate": render_gate,
-        "cost_ledger": cost_ledger,
+        "render_jobs": render_jobs, "render_gate": render_gate, "video_gate": video_gate,
+        "cost_ledger": cost_ledger, "cost_summary": cost_summary,
         "transitions": transitions,
     }
 
@@ -4470,6 +5877,7 @@ def overview():
             "policy_version": PRODUCTION_POLICY_VERSION,
             "prompt_schema_version": PROMPT_SCHEMA_VERSION,
             "anthropic_configured": bool(os.environ.get("ANTHROPIC_API_KEY")),
+            "configuration": production_configuration(),
         },
         "media_rendering": {
             "policy_version": RENDER_POLICY_VERSION,
@@ -4563,6 +5971,19 @@ class Handler(SimpleHTTPRequestHandler):
                 return
             self.send_binary(storage.get(asset["storage_uri"]), asset["mime_type"])
             return
+        match = re.fullmatch(r"/api/derived-assets/([^/]+)/content", path)
+        if match:
+            with connect() as connection:
+                row = connection.execute("SELECT storage_uri,mime_type FROM derived_assets WHERE id=?", (match.group(1),)).fetchone()
+            if row is None:
+                self.send_json({"error": "derived asset not found"}, 404)
+                return
+            storage = LocalMediaStorage(RENDER_STORAGE_ROOT)
+            if not storage.exists(row["storage_uri"]):
+                self.send_json({"error": "stored derivative is unavailable"}, 404)
+                return
+            self.send_binary(storage.get(row["storage_uri"]), row["mime_type"])
+            return
         match = re.fullmatch(r"/api/events/([^/]+)/signals", path)
         if match:
             with connect() as connection:
@@ -4600,6 +6021,11 @@ class Handler(SimpleHTTPRequestHandler):
                 result = enqueue_verification(match.group(1), body.get("provider", "grok"), background=True)
                 self.send_json(result, 200 if result["duplicate"] or result["cached"] else 202)
                 return
+            match = re.fullmatch(r"/api/verification/([^/]+)/resume", path)
+            if match:
+                result = resume_verification(match.group(1), background=True)
+                self.send_json(result, 202)
+                return
             match = re.fullmatch(r"/api/events/([^/]+)/content-decision", path)
             if match:
                 result = enqueue_content_decision(match.group(1), body.get("provider", "test"), background=True)
@@ -4607,19 +6033,47 @@ class Handler(SimpleHTTPRequestHandler):
                 return
             match = re.fullmatch(r"/api/content-decisions/([^/]+)/production", path)
             if match:
+                requested_provider = body.get("provider", "anthropic")
+                if requested_provider == "anthropic" and production_configuration()["live"] and body.get("confirmed_paid_action") is not True:
+                    raise ValueError("Explicit confirmation is required before a paid Claude generation.")
+                if requested_provider != "anthropic" and not production_configuration()["fixture_allowed"]:
+                    raise ProductionProviderUnavailable(
+                        "Fixture packages are available only in explicit demo mode (REACHOUT_DEMO_MODE=1)."
+                    )
                 result = enqueue_production(
-                    match.group(1), body.get("provider", "anthropic"), background=True,
-                    regenerate=bool(body.get("regenerate")),
+                    match.group(1), requested_provider, background=True,
+                    regenerate=bool(body.get("regenerate")), client_request_id=body.get("client_request_id"),
                 )
                 self.send_json(result, 200 if result["duplicate"] or result["cached"] else 202)
                 return
             match = re.fullmatch(r"/api/content-packages/([^/]+)/render", path)
             if match:
+                requested_media_type = body.get("media_type") or "IMAGE"
+                if renderer_configuration(requested_media_type)["live"] and body.get("confirmed_paid_action") is not True:
+                    raise ValueError("Explicit confirmation is required before a paid media generation.")
                 result = enqueue_render(
                     match.group(1), body.get("media_type"), body.get("provider"), background=True,
-                    regenerate=bool(body.get("regenerate")),
+                    regenerate=bool(body.get("regenerate")), source_asset_id=body.get("source_asset_id"),
+                    generation_mode=body.get("generation_mode"), client_request_id=body.get("client_request_id"),
                 )
                 self.send_json(result, 200 if result["duplicate"] or result["cached"] else 202)
+                return
+            match = re.fullmatch(r"/api/render-jobs/([^/]+)/resume", path)
+            if match:
+                job = resume_render_job(match.group(1))
+                self.send_json({"job": job, "resubmitted": False})
+                return
+            match = re.fullmatch(r"/api/generated-assets/([^/]+)/qa", path)
+            if match:
+                runs = rerun_media_qa(match.group(1), body.get("qa_kind", "ALL"))
+                self.send_json({"runs": runs}, 201)
+                return
+            match = re.fullmatch(r"/api/generated-assets/([^/]+)/review", path)
+            if match:
+                review = review_media_asset(
+                    match.group(1), body.get("action"), body.get("reviewer"), body.get("comment"),
+                )
+                self.send_json({"review": review}, 201)
                 return
             match = re.fullmatch(r"/api/events/([^/]+)/transition", path)
             if match:
