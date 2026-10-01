@@ -14,7 +14,7 @@ const state = {
   busy: {},
 };
 
-const TABS = ['overview', 'evidence', 'verification', 'decision', 'package', 'media', 'activity'];
+const TABS = ['overview', 'evidence', 'verification', 'decision', 'package', 'media', 'distribution', 'activity'];
 const LEGACY_TABS = {sources: 'evidence', claims: 'evidence', content: 'decision', production: 'media', history: 'activity'};
 const ACTIVE_STATUSES = ['QUEUED', 'RUNNING', 'GENERATING', 'PREPARING', 'RENDERING', 'VALIDATING'];
 
@@ -876,7 +876,135 @@ function renderActivity(data, root) {
   root.append(card('', cardHead(`Activity (${items.length})`), timeline(items)));
 }
 
-const RENDERERS = {overview: renderOverview, evidence: renderEvidence, verification: renderVerification, decision: renderDecision, package: renderPackage, media: renderMedia, activity: renderActivity};
+
+/* ---------- distribution (Meta Reels) ---------- */
+
+const PLATFORM_LABELS = {INSTAGRAM_REELS: 'Instagram Reels', FACEBOOK_REELS: 'Facebook Reels'};
+const PUBLISH_ACTIVE = ['SCHEDULED', 'QUEUED', 'UPLOADING', 'PROCESSING', 'PUBLISHING', 'NEEDS_INTERVENTION'];
+
+function switchBanner(distribution) {
+  const switches = distribution.switches || {};
+  const rows = Object.entries(distribution.platforms || {}).map(([platform, config]) =>
+    `${PLATFORM_LABELS[platform]}: ${config.enabled ? 'ON' : 'OFF'}${config.missing?.length ? ` · missing ${config.missing.join(', ')}` : ''}`);
+  if (!switches.SOCIAL_PUBLISHING_ENABLED) {
+    return callout('warn', 'Publishing is OFF', el('p', '', 'SOCIAL_PUBLISHING_ENABLED=0 — no post can reach Meta. Approving packages never publishes by itself.'), bullets(rows));
+  }
+  return callout('info', 'Publishing switches', bullets(rows), el('p', '', 'Scheduling is local: the switches are re-checked at the scheduled time.'));
+}
+
+function publishJobCard(job) {
+  const body = card('', cardHead(`${PLATFORM_LABELS[job.platform]} · ${job.mode === 'SCHEDULED' ? 'Scheduled' : 'Publish now'}`, pill(job.status)));
+  body.append(facts([
+    ['Scheduled for', job.scheduled_for ? fmt(job.scheduled_for) : '—'], ['Container / video', job.provider_container_id || '—'],
+    ['Post ID', job.provider_post_id || '—'], ['Attempts', `${job.attempt_count}/${job.max_attempts}`],
+    ['Published', job.published_at ? fmt(job.published_at) : '—'], ['API', job.api_version || '—'],
+  ]));
+  if (job.permalink) body.append(el('p', '', externalLink('Open published post', job.permalink)));
+  if (job.last_error_message) body.append(callout(job.status === 'PUBLISHED' ? 'info' : 'warn', label(job.last_error_code || 'Note'), job.last_error_message));
+  const actions = el('div', 'review-actions');
+  if (job.status === 'SCHEDULED') {
+    actions.append(actionButton('Cancel schedule', `cancel-${job.id}`, () => {
+      if (!window.confirm('Cancel this scheduled post?')) return;
+      post(`/api/publish-jobs/${encodeURIComponent(job.id)}/cancel`, {reason: 'Cancelled in dashboard'}, `cancel-${job.id}`,
+        'Cancelling…', () => 'Schedule cancelled', 'distribution');
+    }, {primary: false, allowDuringActive: true}));
+  }
+  if (['NEEDS_INTERVENTION', 'PROCESSING'].includes(job.status) && job.provider_container_id) {
+    actions.append(actionButton('Check status', `check-${job.id}`, () => post(`/api/publish-jobs/${encodeURIComponent(job.id)}/check-status`, {},
+      `check-${job.id}`, 'Checking Meta (free, never reposts)…', result => `Status: ${label(result.job.status)}`, 'distribution'),
+    {primary: false, allowDuringActive: true}));
+  }
+  if (actions.childNodes.length) body.append(actions, progressFor(`cancel-${job.id}`, null), progressFor(`check-${job.id}`, null));
+  if (job.events?.length) body.append(disclosure('Publish audit', timeline(job.events.map(item => ({at: item.occurred_at, title: label(item.event_type), detail: item.status ? label(item.status) : '', tone: tone(item.status)})))));
+  return body;
+}
+
+function platformCard(asset, platform, distribution) {
+  const packages = (distribution.packages || []).filter(item => item.generated_asset_id === asset.id && item.platform === platform);
+  const pkg = packages[0];
+  const container = card('', cardHead(PLATFORM_LABELS[platform], pkg ? pill(pkg.latest_review?.action || 'REQUIRED', pkg.latest_review ? label(pkg.latest_review.action) : 'Platform approval required') : plainPill('No package yet')));
+  const createKey = `dist-create-${asset.id}-${platform}`;
+  container.append(actionButton(pkg ? 'Rebuild platform package' : `Create ${PLATFORM_LABELS[platform]} package`, createKey, () =>
+    post(`/api/generated-assets/${encodeURIComponent(asset.id)}/distribution-packages`, {platform}, createKey,
+      'Building copy from the approved package…', result => `Package v${result.distribution_package.version_number} created`, 'distribution'),
+  {primary: !pkg, allowDuringActive: true}), progressFor(createKey, null));
+  if (!pkg) return container;
+  const compliance = pkg.compliance || {};
+  if (compliance.errors?.length) container.append(callout('bad', 'Not compliant with platform specs', bullets(compliance.errors)));
+  if (compliance.warnings?.length) container.append(callout('warn', 'Platform warnings', bullets(compliance.warnings)));
+  if (pkg.copy_validation && !pkg.copy_validation.valid) container.append(callout('bad', 'Copy validation failed', bullets(pkg.copy_validation.errors)));
+  container.append(el('div', 'doc',
+    pkg.title ? el('div', '', el('div', 'doc-label', 'Title'), el('div', 'doc-headline', pkg.title)) : null,
+    el('div', '', el('div', 'doc-label', 'Caption'), el('p', 'body-text pre-wrap', pkg.caption)),
+    el('div', '', el('div', 'doc-label', 'Hashtags (verbatim from approved claims)'), el('p', '', pkg.hashtags?.join(' ') || 'None')),
+    el('div', '', el('div', 'doc-label', 'Accessibility description'), el('p', 'secondary-text', pkg.accessibility_text || '—'),
+      el('p', 'secondary-text', pkg.platform_metadata?.accessibility_note || '')),
+    el('div', '', el('div', 'doc-label', 'Cover'), el('p', 'secondary-text', pkg.cover?.strategy === 'thumb_offset' ? `Frame at ${pkg.cover.time_ms} ms (thumb_offset)` : (pkg.platform_metadata?.cover_note || 'Provider default'))),
+  ));
+  container.append(facts([
+    ['Package', `${pkg.id} v${pkg.version_number}`], ['Media', `${pkg.generated_asset_id} v${pkg.asset_version} · ${pkg.asset_checksum_sha256.slice(0, 12)}…`],
+    ['Media approval', pkg.media_review_id], ['Content package', `${pkg.content_package_id} v${pkg.content_package_version}`],
+    ['Claim set', `${pkg.approved_claim_set_id} v${pkg.approved_claim_set_version}`], ['Copy policy', pkg.copy_policy_version],
+  ]));
+  const reviewActions = el('div', 'review-actions');
+  for (const action of ['APPROVED', 'CHANGES_REQUIRED', 'REJECTED']) {
+    const key = `dist-review-${pkg.id}-${action}`;
+    reviewActions.append(actionButton(label(action), key, () => {
+      const reviewer = window.prompt(`Reviewer name for the ${PLATFORM_LABELS[platform]} package`); if (!reviewer?.trim()) return;
+      const comment = window.prompt('Optional comment') || '';
+      post(`/api/distribution-packages/${encodeURIComponent(pkg.id)}/review`, {action, reviewer, comment}, key,
+        'Recording platform review…', () => `${label(action)} recorded`, 'distribution');
+    }, {primary: action === 'APPROVED', allowDuringActive: true, disabled: action === 'APPROVED' && !pkg.compliant}));
+  }
+  container.append(el('div', 'review-workflow', el('strong', '', 'Platform package review'), reviewActions,
+    el('span', 'secondary-text', 'Each platform needs its own approval. Approval alone never publishes.')));
+  const jobs = (distribution.publish_jobs || []).filter(job => job.distribution_package_id === pkg.id || (job.generated_asset_id === asset.id && job.platform === platform));
+  const active = jobs.find(job => PUBLISH_ACTIVE.includes(job.status));
+  const published = jobs.find(job => job.status === 'PUBLISHED');
+  const gate = pkg.publish_gate || {allowed: false, blockers: []};
+  const publishKey = `publish-${pkg.id}`;
+  const scheduleKey = `schedule-${pkg.id}`;
+  const controls = el('div', 'publish-controls');
+  const publishButton = actionButton('Publish now', publishKey, () => {
+    if (!window.confirm(`Publish this approved video publicly to ${PLATFORM_LABELS[platform]} now? This cannot be undone from here.`)) return;
+    post(`/api/distribution-packages/${encodeURIComponent(pkg.id)}/publish`, {client_request_id: clientRequestId(), requested_by: 'dashboard'},
+      publishKey, 'Submitting…', result => result.duplicate ? 'A post for this video is already in progress' : 'Publishing started', 'distribution');
+  }, {allowDuringActive: true, disabled: !gate.allowed || Boolean(active) || Boolean(published)});
+  const when = el('input'); when.type = 'datetime-local'; when.className = 'schedule-input';
+  const scheduleButton = actionButton('Schedule', scheduleKey, () => {
+    if (!when.value) { state.messages[scheduleKey] = 'Choose a date and time first.'; renderRoom(); return; }
+    const iso = new Date(when.value).toISOString();
+    if (!window.confirm(`Schedule this video for ${PLATFORM_LABELS[platform]} at ${new Date(when.value).toLocaleString()}? Switches are re-checked at that time.`)) return;
+    post(`/api/distribution-packages/${encodeURIComponent(pkg.id)}/schedule`, {scheduled_for: iso, client_request_id: clientRequestId(), requested_by: 'dashboard'},
+      scheduleKey, 'Submitting…', result => result.duplicate ? 'A post for this video is already scheduled or running' : 'Scheduled', 'distribution');
+  }, {primary: false, allowDuringActive: true, disabled: !pkg.compliant || pkg.latest_review?.action !== 'APPROVED' || Boolean(active) || Boolean(published)});
+  controls.append(publishButton, when, scheduleButton);
+  container.append(el('div', 'review-workflow', el('strong', '', 'Publishing'), controls,
+    published ? el('span', 'secondary-text', 'Already published — duplicate posts of this video are blocked.')
+      : active ? el('span', 'secondary-text', 'A post for this video is already scheduled or in progress.')
+      : !gate.allowed ? bullets(gate.blockers) : el('span', 'secondary-text', 'All gates pass: media APPROVED, platform package APPROVED, switches ON.'),
+    progressFor(publishKey, null), progressFor(scheduleKey, null)));
+  jobs.forEach(job => container.append(publishJobCard(job)));
+  return container;
+}
+
+function renderDistribution(data, root) {
+  const distribution = data.distribution || {};
+  root.append(switchBanner(distribution));
+  const approved = (data.render_jobs || []).flatMap(job => (job.assets || []).map(asset => ({asset, job})))
+    .filter(({asset}) => isVideo(asset.media_type) && !asset.fixture_only && asset.latest_review?.action === 'APPROVED');
+  if (!approved.length) {
+    root.append(empty('No approved video yet', 'Distribution starts from a live video whose latest human review is APPROVED.'));
+    return;
+  }
+  for (const {asset} of approved) {
+    root.append(card('', cardHead(`Approved video ${asset.id} · v${asset.version_number}`, plainPill('Media APPROVED', 'good')),
+      el('p', 'secondary-text', `${asset.width}×${asset.height} · ${asset.duration_seconds}s · checksum ${asset.checksum_sha256.slice(0, 16)}…`)));
+    root.append(el('div', 'split', platformCard(asset, 'INSTAGRAM_REELS', distribution), platformCard(asset, 'FACEBOOK_REELS', distribution)));
+  }
+}
+
+const RENDERERS = {overview: renderOverview, evidence: renderEvidence, verification: renderVerification, decision: renderDecision, package: renderPackage, media: renderMedia, distribution: renderDistribution, activity: renderActivity};
 
 /* ---------- event view ---------- */
 

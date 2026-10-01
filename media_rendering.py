@@ -915,7 +915,13 @@ class XAIVideoRenderer(AsyncMediaRenderer):
                 # aspect_ratio is omitted on purpose: xAI stretches the source image when it is supplied.
                 payload["image"], snapshot["image"] = image, described
             else:
+                # Reference images guide content without pinning a frame, so a native aspect ratio never stretches them.
                 payload["reference_images"], snapshot["reference_images"] = [image], [described]
+                payload["aspect_ratio"] = snapshot["aspect_ratio"] = params["aspect_ratio"]
+                payload["prompt"] = snapshot["prompt"] = (
+                    "Use <IMAGE_0> only as the visual reference for subject, palette, and lighting; compose a new frame "
+                    "natively for the requested aspect ratio without stretching or adding anything.\n" + payload["prompt"]
+                )[:4000]
         return payload, snapshot
 
     def _load_source(self, request):

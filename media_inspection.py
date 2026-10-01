@@ -223,11 +223,13 @@ def inspect_video(data):
             movie_timescale, movie_duration = _full_box_times(data, start)
         elif kind == b"trak":
             track = {"handler": None, "width": None, "height": None, "timescale": None, "duration": None,
-                     "codec": None, "samples": None}
+                     "codec": None, "samples": None, "edit_list": False}
             stack = [(start, end)]
             while stack:
                 box_start, box_end = stack.pop()
                 for inner, payload, inner_end in _mp4_boxes(data, box_start, box_end):
+                    if inner == b"edts":
+                        track["edit_list"] = True
                     if inner in _MP4_CONTAINERS:
                         stack.append((payload, inner_end))
                     elif inner == b"tkhd":
@@ -261,5 +263,8 @@ def inspect_video(data):
         "format": "MP4", "mime_type": "video/mp4", "major_brand": major_brand, "width": video["width"],
         "height": video["height"], "duration_seconds": round(duration, 3), "frame_rate": frame_rate,
         "codec": video["codec"], "has_audio": any(track["handler"] == b"soun" for track in tracks),
+        "audio_codec": next((track["codec"] for track in tracks if track["handler"] == b"soun"), None),
+        "edit_lists": any(track["edit_list"] for track in tracks),
+        "moov_before_mdat": kinds.index(b"moov") < kinds.index(b"mdat") if b"mdat" in kinds else None,
         "media_bytes": media_bytes, "decoder": "iso-bmff-structural",
     }

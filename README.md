@@ -196,6 +196,19 @@ Migration `014_production_safe_media.sql` is additive and forward-only. It adds 
 
 **Human review.** Every generated asset version can be marked `APPROVED`, `CHANGES_REQUIRED`, or `REJECTED` with reviewer, timestamp, and optional comment. Reviews reference the latest QA run IDs and never inherit across regenerated versions. `APPROVED` means approved media asset only—not approval to publish. No publishing, scheduling, or social-platform route exists.
 
+## Architecture 07 — Meta distribution (Instagram Reels, Facebook Reels)
+
+Verified against Meta's official docs (Graph API v25.0, configurable via `META_GRAPH_API_VERSION`). Instagram: resumable container (`POST /{ig-user-id}/media`, `media_type=REELS`, `upload_type=resumable`), byte upload to `rupload.facebook.com/ig-api-upload/{v}/{container}`, `status_code` polling, `media_publish`, `permalink`. 100 API posts per 24 h. Facebook: `POST /{page-id}/video_reels` start, upload to `rupload.facebook.com/video-upload/{v}/{video}`, `fields=status` polling, finish with `video_state=PUBLISHED`. 30 API Reels per Page per 24 h; Reels must be 9:16, at least 540×960, 3–90 s.
+
+- **Binding:** each platform package is an immutable version tied to one approved video (ID, version, checksum), its APPROVED media review, the exact ContentPackage (ID, version, hash), and the approved claim set.
+- **Copy:** assembled deterministically from approved package fields; no model is called. A validator rejects any number, line, or hashtag that is not verbatim approved text. Instagram limits (2,200 characters, 30 hashtags, 20 @ tags) are enforced.
+- **Compliance:** checked from the decoded file, never altered: codec, audio, fps, duration, ratio, size, moov placement, and edit lists.
+- **Approval:** a separate human approval per platform package. Approval never publishes.
+- **Publish gate,** re-evaluated at execution time: latest media review APPROVED, platform package APPROVED, lineage current (claims, evidence, rights, latest package and decision), `SOCIAL_PUBLISHING_ENABLED` and the platform switch ON, and credentials present.
+- **Scheduling:** local only, so the switches apply at the due time. Meta-native scheduling is never used.
+- **Duplicate protection:** client request keys; one in-flight job and one successful post per platform and video, enforced by unique indexes.
+- **Retries:** transient failures retry within `PUBLISH_MAX_ATTEMPTS`. An ambiguous publish moves to `NEEDS_INTERVENTION` and is never re-sent; "Check status" is free and never reposts. On restart, in-flight jobs are never re-run automatically.
+
 ## Structured errors
 
 Application and ingestion errors are emitted to stderr as one JSON object per line. Records include UTC time, level, event name, message, request/source context, and never include fetched page bodies. Configure verbosity with `LOG_LEVEL`.

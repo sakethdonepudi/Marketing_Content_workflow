@@ -1,4 +1,5 @@
 import tempfile
+from datetime import datetime, timedelta, timezone
 import unittest
 import sqlite3
 import json
@@ -11,11 +12,13 @@ from verification import VerificationProviderResult
 from content_ceo import ContentProviderResult
 from content_production import DeterministicProductionFixtureAdapter, ProductionProviderResult
 import content_production
+import meta_distribution
 import media_rendering
 import media_qa
 import visual_qa
 import socket
 import threading
+import urllib.parse
 from http.client import HTTPConnection
 from http.server import ThreadingHTTPServer
 from media_inspection import ImageDecodeError, inspect_image, inspect_video
@@ -476,6 +479,69 @@ class FakeXAIVideoTransport:
         return value
 
 
+META_IG_TOKEN = "IGAAcontrolled-instagram-token-000"
+META_FB_TOKEN = "EAAcontrolled-facebook-page-token-000"
+
+
+class FakeMetaTransport:
+    """Scripted Meta Graph + rupload endpoints for Instagram and Facebook Reels. Never touches the network."""
+
+    def __init__(self, *, statuses=None, publish=None, poll_errors=0):
+        self.statuses = list(statuses or [])
+        self.publish_response = publish
+        self.poll_errors = poll_errors
+        self.calls = []
+
+    def kinds(self):
+        return [call["kind"] for call in self.calls]
+
+    def __call__(self, method, url, *, headers=None, body=None, timeout_seconds=60):
+        form = dict(urllib.parse.parse_qsl(body.decode())) if isinstance(body, bytes) and headers and \
+            headers.get("Content-Type") == "application/x-www-form-urlencoded" else {}
+        if "rupload.facebook.com" in url:
+            kind = "upload"
+        elif url.split("?")[0].endswith("/media") and method == "POST":
+            kind = "ig_container"
+        elif url.split("?")[0].endswith("/media_publish"):
+            kind = "ig_publish"
+        elif url.split("?")[0].endswith("/video_reels"):
+            kind = "fb_start" if form.get("upload_phase") == "start" else "fb_finish"
+        elif "fields=status" in url:
+            kind = "status"
+        elif "fields=permalink" in url:
+            kind = "permalink"
+        elif url.split("?")[0].endswith("/media"):
+            kind = "ig_media_list"
+        else:
+            kind = "other"
+        self.calls.append({"kind": kind, "method": method, "url": url, "headers": dict(headers or {}), "form": form,
+                           "body_size": len(body) if isinstance(body, bytes) and kind == "upload" else None})
+        ok = lambda data: (200, {}, json.dumps(data).encode())
+        if kind == "upload":
+            return ok({"success": True})
+        if kind == "ig_container":
+            return ok({"id": "IGC-1"})
+        if kind == "fb_start":
+            return ok({"video_id": "FBV-1", "upload_url": "https://rupload.facebook.com/video-upload/v25.0/FBV-1"})
+        if kind == "status":
+            if self.poll_errors:
+                self.poll_errors -= 1
+                return 500, {}, json.dumps({"error": {"code": 2, "message": "temporary"}}).encode()
+            value = self.statuses.pop(0) if self.statuses else None
+            if "FBV-1" in url:
+                return ok({"status": value or {"video_status": "ready", "uploading_phase": {"status": "complete"},
+                                               "publishing_phase": {"publish_status": "draft"}}})
+            return ok({"status_code": value or "FINISHED"})
+        if kind in ("ig_publish", "fb_finish"):
+            response = self.publish_response
+            if isinstance(response, Exception):
+                raise response
+            return ok(response or ({"id": "IGM-1"} if kind == "ig_publish" else {"success": True}))
+        if kind == "permalink":
+            return ok({"permalink": "https://www.instagram.com/reel/CONTROLLED/"} if "IGM-1" in url else {"permalink_url": "/reel/FBV-1"})
+        return ok({"data": []})
+
+
 class FakeClaudeConnection:
     """Stands in for Anthropic's HTTPS endpoint; builds a grounded package from the locked context it receives."""
 
@@ -713,10 +779,13 @@ class WorkflowTests(unittest.TestCase):
             "RENDERER_PROVIDER_IMAGE": "", "RENDERER_PROVIDER_VIDEO": "", "RENDERER_PROVIDER_AUDIO": "",
             "LIVE_RENDERER_API_KEY": "", "XAI_API_KEY": "", "ANTHROPIC_API_KEY": "", "REACHOUT_DEMO_MODE": "",
             "OCR_PROVIDER": "none", "VISUAL_QA_PROVIDER": "none", "VIDEO_FRAME_EXTRACTOR": "none",
+            "SOCIAL_PUBLISHING_ENABLED": "0", "INSTAGRAM_PUBLISHING_ENABLED": "0", "FACEBOOK_PUBLISHING_ENABLED": "0",
+            "INSTAGRAM_USER_ID": "", "INSTAGRAM_ACCESS_TOKEN": "", "FACEBOOK_PAGE_ID": "", "FACEBOOK_PAGE_ACCESS_TOKEN": "",
+            "DISTRIBUTION_STATIC_HASHTAGS": "",
         })
         environment.start()
         self.addCleanup(environment.stop)
-        for module in (media_rendering, content_production, visual_qa):
+        for module in (media_rendering, content_production, visual_qa, meta_distribution):
             network = patch.object(module, "HTTPSConnection", BlockedConnection)
             network.start()
             self.addCleanup(network.stop)
@@ -2665,7 +2734,6 @@ class WorkflowTests(unittest.TestCase):
         self.assertNotIn("Authorization", download["headers"])
         payload = json.loads(post["body"])
         self.assertEqual((payload["aspect_ratio"], payload["n"], payload["response_format"]), ("3:4", 1, "url"))
-        self.assertIn("render no text", payload["prompt"])
         with app.connect() as connection:
             prompt = json.loads(connection.execute(
                 "SELECT request_json FROM render_prompt_snapshots WHERE render_job_id=?", (job["id"],)
@@ -2678,7 +2746,10 @@ class WorkflowTests(unittest.TestCase):
             ledger = dict(connection.execute("SELECT * FROM cost_ledger").fetchone())
             publishing = connection.execute("SELECT COUNT(*) FROM publishing_history").fetchone()[0]
             database_text = "\n".join(connection.iterdump())
-        self.assertIn(" ".join(prompt["visual_prompts"]), payload["prompt"])
+        # Commit 8bb08f7: the approved, grounding-validated package prompt is sent verbatim; no ad-hoc additions.
+        self.assertEqual(payload["prompt"], prompt["media_brief"]["generation_prompt"].strip())
+        self.assertTrue({"No text or numbers", "No people or faces", "No flags, logos, or party symbols"}
+                        <= set(prompt["media_brief"]["negative_constraints"]))
         self.assertEqual(submitted["provider_request"], payload)
         self.assertEqual(events, ["SUBMITTED", "COMPLETED", "DOWNLOADED"])
         self.assertEqual((asset["mime_type"], asset["width"], asset["height"]), ("image/jpeg", 1536, 2048))
@@ -2894,11 +2965,12 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(metadata["provider_request"]["aspect_ratio"], "3:4")
         self.assertEqual((after[0]["provider"], after[0]["provider_request_id"]), ("xai", "xai-request-123"))
 
-    def test_no_publishing_or_approval_path_exists(self):
+    def test_publish_routes_exist_only_behind_review_and_switch_gates(self):
         import inspect
         handler = inspect.getsource(app.Handler)
-        for forbidden in ("/publish", "/approve", "/schedule"):
-            self.assertNotIn(forbidden, handler)
+        self.assertIn("/publish", handler)
+        self.assertIn("schedule", handler)
+        self.assertNotIn("/approve", handler)
         job = self.xai_render(FakeXAITransport())
         self.assertEqual((job["status"], job["human_review_status"]), ("READY_FOR_REVIEW", "REQUIRED"))
         with app.connect() as connection:
@@ -3154,6 +3226,26 @@ class WorkflowTests(unittest.TestCase):
                                          package, source_asset_id=new_source)
         self.assertNotEqual(second_video["id"], video["id"])
         self.assertEqual(app.render_job(video["id"])["source_asset_id"], source["id"])
+
+    def test_reference_to_video_produces_native_ratio_without_stretching(self):
+        package = self.xai_renderable_package()
+        image_job = self.xai_render(FakeXAITransport(download=(200, {}, jpeg_bytes(1536, 2048))), package)
+        with app.connect() as connection:
+            source = dict(connection.execute("SELECT * FROM generated_assets WHERE render_job_id=?", (image_job["id"],)).fetchone())
+        with self.assertRaisesRegex(ValueError, "would stretch"):
+            self.video_render(FakeXAIVideoTransport(), package, source_asset_id=source["id"], aspect_ratio="9:16")
+        transport = FakeXAIVideoTransport(polls=[FakeXAIVideoTransport.done(duration=15)],
+                                          download=(200, {}, mp4_bytes(720, 1280, 15.0)))
+        video = self.video_render(transport, package, source_asset_id=source["id"], generation_mode="REFERENCE_TO_VIDEO",
+                                  aspect_ratio="9:16")
+        self.assertEqual((video["status"], video["generation_mode"], video["requested_aspect_ratio"], video["source_asset_id"]),
+                         ("READY_FOR_REVIEW", "REFERENCE_TO_VIDEO", "9:16", source["id"]))
+        payload = json.loads(transport.calls[1]["body"])
+        self.assertEqual(payload["aspect_ratio"], "9:16")
+        self.assertNotIn("image", payload)
+        self.assertTrue(payload["reference_images"][0]["url"].startswith("data:image/"))
+        self.assertIn("render no text", payload["prompt"])
+        self.assertEqual(transport.count("submit"), 1)
 
     def test_fixture_images_can_never_become_video_sources(self):
         _, _, _, package = self.renderable_package()
@@ -3431,6 +3523,308 @@ class WorkflowTests(unittest.TestCase):
         for label in ("Claude · live", "Fixture · demo", "Fixture placeholder · not AI generated", "AI generated",
                       "Claude production provider unavailable", "Generate video from image"):
             self.assertIn(label, source)
+
+    # ---------- Architecture 07: Meta distribution (Meta fully mocked) ----------
+
+    def approved_meta_video(self, review=True):
+        package = self.reel_renderable_package()
+        job = self.video_render(FakeXAIVideoTransport(), package)
+        self.assertEqual(job["status"], "READY_FOR_REVIEW")
+        with app.connect() as connection:
+            asset_id = connection.execute("SELECT id FROM generated_assets WHERE render_job_id=?", (job["id"],)).fetchone()[0]
+        if review:
+            app.review_media_asset(asset_id, "APPROVED", "Media Reviewer", "Approved for distribution")
+        return job, asset_id
+
+    def approved_platform_package(self, platform="INSTAGRAM_REELS"):
+        job, asset_id = self.approved_meta_video()
+        package = app.create_distribution_package(asset_id, platform)
+        app.review_distribution_package(package["id"], "APPROVED", "Distribution Reviewer")
+        return job, asset_id, package
+
+    def meta_live(self, **extra):
+        values = {
+            "SOCIAL_PUBLISHING_ENABLED": "1", "INSTAGRAM_PUBLISHING_ENABLED": "1", "FACEBOOK_PUBLISHING_ENABLED": "1",
+            "INSTAGRAM_USER_ID": "17841400000000000", "INSTAGRAM_ACCESS_TOKEN": META_IG_TOKEN,
+            "FACEBOOK_PAGE_ID": "100000000000000", "FACEBOOK_PAGE_ACCESS_TOKEN": META_FB_TOKEN, **extra,
+        }
+        return patch.dict("os.environ", values)
+
+    def meta_publisher(self, platform, transport):
+        cls = meta_distribution.InstagramReelsPublisher if platform == "INSTAGRAM_REELS" else meta_distribution.FacebookReelsPublisher
+        token = META_IG_TOKEN if platform == "INSTAGRAM_REELS" else META_FB_TOKEN
+        account = "17841400000000000" if platform == "INSTAGRAM_REELS" else "100000000000000"
+        return cls(token=token, account_id=account, transport=transport, poll_interval_seconds=0, max_polls=3, sleep=lambda _: None)
+
+    def test_distribution_requires_human_approved_media(self):
+        _, asset_id = self.approved_meta_video(review=False)
+        with self.assertRaisesRegex(ValueError, "latest human review is not APPROVED"):
+            app.create_distribution_package(asset_id, "INSTAGRAM_REELS")
+        app.review_media_asset(asset_id, "APPROVED", "Reviewer")
+        app.review_media_asset(asset_id, "CHANGES_REQUIRED", "Reviewer", "Recheck")
+        with self.assertRaisesRegex(ValueError, "latest human review is not APPROVED"):
+            app.create_distribution_package(asset_id, "FACEBOOK_REELS")
+        review = app.review_media_asset(asset_id, "APPROVED", "Reviewer")
+        packages = [app.create_distribution_package(asset_id, platform) for platform in ("INSTAGRAM_REELS", "FACEBOOK_REELS")]
+        for package in packages:
+            self.assertEqual((package["media_review_id"], package["generated_asset_id"], package["compliant"]), (review["id"], asset_id, 1))
+            with app.connect() as connection, self.assertRaises(sqlite3.IntegrityError):
+                connection.execute("UPDATE distribution_packages SET caption='edited' WHERE id=?", (package["id"],))
+        with app.connect() as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM publish_jobs").fetchone()[0], 0)
+
+    def test_platform_copy_only_reformats_approved_package_text(self):
+        _, asset_id = self.approved_meta_video()
+        instagram = app.create_distribution_package(asset_id, "INSTAGRAM_REELS")
+        facebook = app.create_distribution_package(asset_id, "FACEBOOK_REELS")
+        with app.connect() as connection:
+            package = json.loads(connection.execute("SELECT package_json FROM content_packages WHERE id=?", (instagram["content_package_id"],)).fetchone()[0])
+            claims = [dict(row) for row in connection.execute("SELECT text FROM claim_versions")]
+        self.assertTrue(instagram["copy_validation"]["valid"], instagram["copy_validation"])
+        self.assertIn(package["headline"]["text"], instagram["caption"])
+        self.assertIn(package["caption"]["text"], instagram["caption"])
+        self.assertIsNone(instagram["title"])
+        self.assertEqual(facebook["title"], package["headline"]["text"][:255])
+        self.assertEqual(instagram["accessibility_text"], package["platform_metadata"]["accessibility_text"])
+        self.assertEqual(instagram["platform_metadata"]["media_type"], "REELS")
+        self.assertIn("thumb_offset", json.dumps(instagram["cover"]) + "thumb_offset")
+        self.assertEqual(instagram["cover"]["time_ms"], 1000)
+        for tag in instagram["hashtags"]:
+            self.assertIn(tag.lstrip("#").lower(), " ".join(claim["text"] for claim in claims).replace(" ", "").replace("-", "").lower())
+        tampered = {**meta_distribution.build_platform_copy("INSTAGRAM_REELS", package, claims, cover_time_ms=0)}
+        tampered["caption"] += "\n\nOver 5,000 farmers benefited."
+        result = meta_distribution.validate_copy(tampered, package, claims, "INSTAGRAM_REELS")
+        self.assertFalse(result["valid"])
+        self.assertTrue(any("number" in error for error in result["errors"]))
+        self.assertTrue(any("not verbatim" in error for error in result["errors"]))
+
+    def test_platform_compliance_never_alters_media(self):
+        base = {"mime_type": "video/mp4", "codec": "avc1", "has_audio": True, "audio_codec": "mp4a", "frame_rate": 24.0,
+                "duration_seconds": 8.042, "moov_before_mdat": True, "file_size": 9915400}
+        approved_like = {**base, "width": 816, "height": 1104, "edit_lists": True}
+        instagram = meta_distribution.check_compliance("INSTAGRAM_REELS", approved_like)
+        facebook = meta_distribution.check_compliance("FACEBOOK_REELS", approved_like)
+        self.assertFalse(instagram["compliant"])
+        self.assertTrue(any("edit lists" in error for error in instagram["errors"]))
+        self.assertTrue(any("9:16" in warning for warning in instagram["warnings"]))
+        self.assertFalse(facebook["compliant"])
+        self.assertTrue(any("9:16" in error for error in facebook["errors"]))
+        clean = {**base, "width": 1080, "height": 1920, "edit_lists": False}
+        self.assertTrue(meta_distribution.check_compliance("INSTAGRAM_REELS", clean)["compliant"])
+        self.assertTrue(meta_distribution.check_compliance("FACEBOOK_REELS", clean)["compliant"])
+        _, asset_id = self.approved_meta_video()
+        with patch.object(app, "check_platform_compliance", lambda platform, video: {"compliant": False, "errors": ["Facebook Reels require 9:16."], "warnings": []}):
+            package = app.create_distribution_package(asset_id, "FACEBOOK_REELS")
+        with self.assertRaisesRegex(ValueError, "cannot be approved.*9:16"):
+            app.review_distribution_package(package["id"], "APPROVED", "Distribution Reviewer")
+
+    def test_each_platform_package_needs_its_own_approval(self):
+        _, asset_id = self.approved_meta_video()
+        instagram = app.create_distribution_package(asset_id, "INSTAGRAM_REELS")
+        facebook = app.create_distribution_package(asset_id, "FACEBOOK_REELS")
+        app.review_distribution_package(instagram["id"], "APPROVED", "Distribution Reviewer")
+        with self.meta_live():
+            self.assertTrue(app._publish_gate(app.distribution_package(instagram["id"]))["allowed"])
+            gate = app._publish_gate(app.distribution_package(facebook["id"]))
+        self.assertFalse(gate["allowed"])
+        self.assertIn("The platform package's latest human review is not APPROVED.", gate["blockers"])
+
+    def test_kill_switches_block_publishing_without_network(self):
+        _, _, package = self.approved_platform_package()
+        transport = FakeMetaTransport()
+        for overrides, expected in (
+            ({"SOCIAL_PUBLISHING_ENABLED": "0"}, "SOCIAL_PUBLISHING_ENABLED is off"),
+            ({"INSTAGRAM_PUBLISHING_ENABLED": "0"}, "INSTAGRAM_PUBLISHING_ENABLED is off"),
+            ({"INSTAGRAM_ACCESS_TOKEN": ""}, "Missing platform configuration"),
+        ):
+            with self.subTest(expected=expected), self.meta_live(**overrides):
+                with self.assertRaisesRegex(ValueError, expected):
+                    app.request_publish(package["id"], publisher=self.meta_publisher("INSTAGRAM_REELS", transport), background=False)
+        with self.assertRaisesRegex(ValueError, "SOCIAL_PUBLISHING_ENABLED is off"):
+            app.request_publish(package["id"], background=False)
+        self.assertEqual(transport.calls, [])
+        with app.connect() as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM publish_jobs").fetchone()[0], 0)
+
+    def test_instagram_reel_publish_flow_with_meta_mocked(self):
+        job, asset_id, package = self.approved_platform_package("INSTAGRAM_REELS")
+        transport = FakeMetaTransport(statuses=["IN_PROGRESS", "FINISHED"])
+        with self.meta_live():
+            result = app.request_publish(package["id"], publisher=self.meta_publisher("INSTAGRAM_REELS", transport),
+                                         background=False, client_request_id="click-1", requested_by="Publisher")
+        published = result["job"]
+        self.assertEqual((published["status"], published["provider_container_id"], published["provider_post_id"], published["permalink"]),
+                         ("PUBLISHED", "IGC-1", "IGM-1", "https://www.instagram.com/reel/CONTROLLED/"))
+        self.assertEqual(transport.kinds(), ["ig_container", "upload", "status", "status", "ig_publish", "permalink"])
+        container = transport.calls[0]
+        self.assertEqual((container["form"]["media_type"], container["form"]["upload_type"], container["form"]["thumb_offset"]),
+                         ("REELS", "resumable", "1000"))
+        self.assertEqual(container["form"]["caption"], package["caption"])
+        upload = transport.calls[1]
+        self.assertTrue(upload["url"].startswith("https://rupload.facebook.com/ig-api-upload/v25.0/IGC-1"))
+        self.assertEqual((upload["headers"]["Authorization"], upload["headers"]["offset"]), ("OAuth " + META_IG_TOKEN, "0"))
+        self.assertEqual(int(upload["headers"]["file_size"]), upload["body_size"])
+        self.assertEqual(transport.calls[4]["form"]["creation_id"], "IGC-1")
+        with app.connect() as connection:
+            history = connection.execute("SELECT format,status,claim_set_id FROM publishing_history").fetchone()
+            database_text = "\n".join(connection.iterdump())
+        self.assertEqual(tuple(history), ("REEL", "PUBLISHED", package["approved_claim_set_id"]))
+        room = json.dumps(app.event_room(job["event_id"]))
+        for secret in (META_IG_TOKEN, META_FB_TOKEN):
+            self.assertNotIn(secret, database_text)
+            self.assertNotIn(secret, room)
+
+    def test_facebook_reel_publish_flow_with_meta_mocked(self):
+        _, _, package = self.approved_platform_package("FACEBOOK_REELS")
+        transport = FakeMetaTransport(statuses=[{"video_status": "processing"}, None])
+        with self.meta_live():
+            published = app.request_publish(package["id"], publisher=self.meta_publisher("FACEBOOK_REELS", transport),
+                                            background=False)["job"]
+        self.assertEqual((published["status"], published["provider_post_id"], published["permalink"]),
+                         ("PUBLISHED", "FBV-1", "https://www.facebook.com/reel/FBV-1"))
+        self.assertEqual(transport.kinds(), ["fb_start", "upload", "status", "status", "fb_finish", "permalink"])
+        finish = transport.calls[4]["form"]
+        self.assertEqual((finish["upload_phase"], finish["video_id"], finish["video_state"]), ("finish", "FBV-1", "PUBLISHED"))
+        self.assertEqual((finish["title"], finish["description"]), (package["title"], package["caption"]))
+        self.assertTrue(transport.calls[1]["url"].startswith("https://rupload.facebook.com/video-upload/v25.0/FBV-1"))
+
+    def test_duplicate_post_protection(self):
+        _, _, package = self.approved_platform_package()
+        future = (datetime.now(timezone.utc) + timedelta(hours=2)).isoformat()
+        scheduled = app.request_publish(package["id"], mode="SCHEDULED", scheduled_for=future, client_request_id="tab-a")
+        replay = app.request_publish(package["id"], mode="SCHEDULED", scheduled_for=future, client_request_id="tab-a")
+        self.assertEqual((replay["duplicate"], replay["job"]["id"]), (True, scheduled["job"]["id"]))
+        transport = FakeMetaTransport()
+        with self.meta_live():
+            second_tab = app.request_publish(package["id"], publisher=self.meta_publisher("INSTAGRAM_REELS", transport), background=False)
+        self.assertEqual((second_tab["duplicate"], second_tab["job"]["id"]), (True, scheduled["job"]["id"]))
+        self.assertEqual(transport.calls, [])
+        app.cancel_publish_job(scheduled["job"]["id"])
+        results = []
+        def click():
+            results.append(app.request_publish(package["id"], mode="SCHEDULED", scheduled_for=future)["job"]["id"])
+        threads = [threading.Thread(target=click) for _ in range(6)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(len(set(results)), 1)
+        app.cancel_publish_job(results[0])
+        with self.meta_live():
+            first = app.request_publish(package["id"], publisher=self.meta_publisher("INSTAGRAM_REELS", transport), background=False)
+            self.assertEqual(first["job"]["status"], "PUBLISHED")
+            with self.assertRaisesRegex(ValueError, "Duplicate post blocked"):
+                app.request_publish(package["id"], publisher=self.meta_publisher("INSTAGRAM_REELS", transport), background=False)
+        self.assertEqual(transport.kinds().count("ig_publish"), 1)
+
+    def test_transient_retries_and_ambiguous_publish_never_reposts(self):
+        _, _, package = self.approved_platform_package()
+        app.PUBLISH_RETRY_BACKOFF_SECONDS = 0
+        transport = FakeMetaTransport(poll_errors=1)
+        with self.meta_live():
+            job = app.request_publish(package["id"], publisher=self.meta_publisher("INSTAGRAM_REELS", transport), background=False)["job"]
+        self.assertEqual(job["status"], "PUBLISHED")
+        self.assertIn("ATTEMPT_FAILED", [event["event_type"] for event in job["events"]])
+        self.reset_database()
+        app.PUBLISH_RETRY_BACKOFF_SECONDS = 0
+        _, _, package = self.approved_platform_package()
+        transport = FakeMetaTransport(publish=meta_distribution.MetaAmbiguousError("timeout after send"))
+        with self.meta_live():
+            job = app.request_publish(package["id"], publisher=self.meta_publisher("INSTAGRAM_REELS", transport), background=False)["job"]
+            self.assertEqual((job["status"], job["last_error_code"]), ("NEEDS_INTERVENTION", "META_OUTCOME_UNKNOWN"))
+            self.assertEqual(transport.kinds().count("ig_publish"), 1)
+            transport.statuses = ["PUBLISHED"]
+            checked = app.check_publish_status(job["id"], publisher=self.meta_publisher("INSTAGRAM_REELS", transport))
+        self.assertEqual(checked["status"], "PUBLISHED")
+        self.assertIsNone(checked["provider_post_id"])
+        self.assertIn("Confirm", checked["last_error_message"])
+        self.assertEqual(transport.kinds().count("ig_publish"), 1)
+        self.reset_database()
+        _, _, package = self.approved_platform_package()
+        transport = FakeMetaTransport(statuses=["ERROR"])
+        with self.meta_live():
+            failed = app.request_publish(package["id"], publisher=self.meta_publisher("INSTAGRAM_REELS", transport), background=False)["job"]
+        self.assertEqual((failed["status"], failed["last_error_code"]), ("FAILED", "META_PROCESSING_FAILED"))
+        self.assertEqual(transport.kinds().count("ig_publish"), 0)
+
+    def test_schedule_runs_locally_and_respects_kill_switch_at_due_time(self):
+        _, _, package = self.approved_platform_package()
+        due = (datetime.now(timezone.utc) + timedelta(minutes=30)).isoformat()
+        job = app.request_publish(package["id"], mode="SCHEDULED", scheduled_for=due)["job"]
+        self.assertEqual(job["status"], "SCHEDULED")
+        transport = FakeMetaTransport()
+        factory = lambda platform: self.meta_publisher(platform, transport)
+        self.assertEqual(app.run_due_publish_jobs(now_at=datetime.now(timezone.utc).isoformat(), publisher_factory=factory), [])
+        later = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+        blocked = app.run_due_publish_jobs(now_at=later, publisher_factory=factory)[0]
+        self.assertEqual(blocked["status"], "BLOCKED")
+        self.assertIn("SOCIAL_PUBLISHING_ENABLED is off", blocked["last_error_message"])
+        self.assertEqual(transport.calls, [])
+        cancelled_job = app.request_publish(package["id"], mode="SCHEDULED", scheduled_for=due)["job"]
+        self.assertEqual(app.cancel_publish_job(cancelled_job["id"], "Editor changed plan")["status"], "CANCELLED")
+        self.assertEqual(app.run_due_publish_jobs(now_at=later, publisher_factory=factory), [])
+        with self.assertRaisesRegex(ValueError, "Only scheduled posts can be cancelled"):
+            app.cancel_publish_job(cancelled_job["id"])
+        with self.assertRaisesRegex(ValueError, "future"):
+            app.request_publish(package["id"], mode="SCHEDULED", scheduled_for="2020-01-01T00:00:00+00:00")
+        app.request_publish(package["id"], mode="SCHEDULED", scheduled_for=due)
+        with self.meta_live():
+            executed = app.run_due_publish_jobs(now_at=later, publisher_factory=factory)[0]
+        self.assertEqual(executed["status"], "PUBLISHED")
+
+    def test_revoked_lineage_after_approval_blocks_publish(self):
+        _, _, package = self.approved_platform_package()
+        with app.connect() as connection:
+            claim_id = json.loads(connection.execute(
+                "SELECT approved_claim_version_ids_json FROM content_packages WHERE id=?", (package["content_package_id"],)
+            ).fetchone()[0])[0]
+            connection.execute("UPDATE claim_versions SET revoked_at=?,revocation_reason='test' WHERE id=?", (app.now(), claim_id))
+        with self.meta_live(), self.assertRaisesRegex(ValueError, "revoked or superseded"):
+            app.request_publish(package["id"], background=False, publisher=self.meta_publisher("INSTAGRAM_REELS", FakeMetaTransport()))
+
+    def test_startup_recovery_never_reposts(self):
+        _, _, package = self.approved_platform_package()
+        future = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+        job = app.request_publish(package["id"], mode="SCHEDULED", scheduled_for=future)["job"]
+        with app.connect() as connection:
+            connection.execute("UPDATE publish_jobs SET status='PUBLISHING',provider_container_id='IGC-1' WHERE id=?", (job["id"],))
+        self.assertEqual(app.recover_interrupted_publish_jobs(), 1)
+        recovered = app.publish_job(job["id"])
+        self.assertEqual((recovered["status"], recovered["last_error_code"]), ("NEEDS_INTERVENTION", "INTERRUPTED"))
+
+    def test_publish_http_route_is_gated(self):
+        _, _, package = self.approved_platform_package()
+        server = ThreadingHTTPServer(("127.0.0.1", 0), app.Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.shutdown)
+        connection = HTTPConnection("127.0.0.1", server.server_address[1], timeout=5)
+        connection.request("POST", f"/api/distribution-packages/{package['id']}/publish", body=json.dumps({"client_request_id": "x"}),
+                           headers={"Content-Type": "application/json"})
+        response = connection.getresponse()
+        body = json.loads(response.read())
+        self.assertEqual(response.status, 400)
+        self.assertIn("SOCIAL_PUBLISHING_ENABLED is off", body["error"])
+
+    def test_second_platform_can_publish_after_first_post_is_recorded(self):
+        _, asset_id = self.approved_meta_video()
+        packages = {}
+        for platform in ("INSTAGRAM_REELS", "FACEBOOK_REELS"):
+            packages[platform] = app.create_distribution_package(asset_id, platform)
+            app.review_distribution_package(packages[platform]["id"], "APPROVED", "Distribution Reviewer")
+        with self.meta_live():
+            first = app.request_publish(packages["INSTAGRAM_REELS"]["id"], background=False,
+                                        publisher=self.meta_publisher("INSTAGRAM_REELS", FakeMetaTransport()))["job"]
+            second = app.request_publish(packages["FACEBOOK_REELS"]["id"], background=False,
+                                         publisher=self.meta_publisher("FACEBOOK_REELS", FakeMetaTransport()))["job"]
+        self.assertEqual((first["status"], second["status"]), ("PUBLISHED", "PUBLISHED"))
+        with app.connect() as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM publishing_history WHERE status='PUBLISHED'").fetchone()[0], 2)
+
+    def test_distribution_ui_controls_and_kill_switch_copy(self):
+        source = Path(app.__file__).with_name("app.js").read_text(encoding="utf-8")
+        for phrase in ("Publish now", "Cancel schedule", "Schedule", "Publishing is OFF", "Check status",
+                       "Instagram Reels", "Facebook Reels", "client_request_id"):
+            self.assertIn(phrase, source)
 
     def test_https_transport_marks_post_send_timeouts_non_retryable(self):
         class TimeoutConnection:

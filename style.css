@@ -297,3 +297,6 @@ blockquote { margin: 6px 0; padding-left: 12px; border-left: 2px solid var(--bor
 .confirmation-source { overflow: hidden; max-height: 240px; border-radius: 12px; background: var(--surface-2); }
 .confirmation-source img { width: 100%; height: 240px; object-fit: contain; display: block; }
 .dialog-actions { display: flex; justify-content: flex-end; gap: 10px; }
+.pre-wrap { white-space: pre-wrap; }
+.publish-controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 6px 0; }
+.schedule-input { background: var(--surface); border: 1px solid var(--border-strong); border-radius: var(--radius-sm); padding: 7px 9px; color: var(--text); }

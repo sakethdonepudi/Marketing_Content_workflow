@@ -8,6 +8,7 @@ import re
 import socket
 import sqlite3
 import sys
+import threading
 import time
 import uuid
 import xml.etree.ElementTree as ET
@@ -68,6 +69,23 @@ from media_tools import (
     prepare_video_source, sample_times, warm_media_probe,
 )
 from visual_qa import visual_qa_provider_for
+from meta_distribution import (
+    COPY_POLICY_VERSION as DISTRIBUTION_COPY_POLICY_VERSION,
+    PLATFORMS as META_PLATFORMS,
+    PLATFORM_SWITCH as META_PLATFORM_SWITCH,
+    MetaAmbiguousError,
+    MetaError,
+    MetaPending,
+    MetaRejectedError,
+    api_version as meta_api_version,
+    build_platform_copy,
+    check_compliance as check_platform_compliance,
+    content_hash as meta_content_hash,
+    platform_configuration as meta_platform_configuration,
+    publisher_for as meta_publisher_for,
+    publishing_switches as meta_publishing_switches,
+    validate_copy as validate_platform_copy,
+)
 from source_acquisition import (
     OfficialSourceRegistry, RetrievedResponse, SourceRetriever, build_discovery_plan,
     build_evidence_packet, classify_source, family_for_candidate, match_claims,
@@ -4787,7 +4805,7 @@ def _source_asset_blockers(connection, source_asset_id, content_package_id):
     return asset, blockers
 
 
-def _render_eligibility(content_package_id, media_type=None, source_asset_id=None):
+def _render_eligibility(content_package_id, media_type=None, source_asset_id=None, *, check_production_freshness=True):
     blockers = []
     source_asset = None
     with connect() as connection:
@@ -4871,17 +4889,28 @@ def _render_eligibility(content_package_id, media_type=None, source_asset_id=Non
         if any(item["invalidated_at"] for item in snapshots):
             blockers.append("An evidence snapshot referenced by the package has been invalidated.")
     try:
-        production = _production_eligibility(package["content_decision_id"])
+        production = _production_eligibility(package["content_decision_id"]) if check_production_freshness else {"skipped": True}
     except Exception as error:
         production = None
         blockers.append(f"Could not revalidate package lineage: {error}")
-    if not production or not production["eligible"]:
+    if production and production.get("skipped"):
+        # Distribution: claims, evidence, rights, and package currency are checked above; the decision-input hash
+        # (which includes this story's own publishing history) is intentionally not re-applied.
+        production = None
+        with connect() as connection:
+            latest_decision = connection.execute(
+                "SELECT id,decision,executable,test_only FROM content_decisions WHERE event_id=? ORDER BY decided_at DESC,rowid DESC LIMIT 1",
+                (package["event_id"],),
+            ).fetchone()
+        if not latest_decision or latest_decision["id"] != package["content_decision_id"]:
+            blockers.append("A newer Content CEO decision exists for this story.")
+    elif not production or not production["eligible"]:
         blockers.extend(production["blockers"] if production else [])
     elif production["input_version"] != package["production_input_version"]:
         blockers.append("The ProductionJob input version is no longer current.")
-    if production and package["evidence_version"] != production["evidence_version"]:
+    if production and package["evidence_version"] != production.get("evidence_version"):
         blockers.append("The package evidence version is stale.")
-    if production and package["media_version"] != production["media_version"]:
+    if production and package["media_version"] != production.get("media_version"):
         blockers.append("The package media-rights version is stale.")
     lineage = {
         "content_package": (package["id"], package["version_number"], package["content_hash"]),
@@ -4908,6 +4937,9 @@ def _requested_render_shape(gate, generation_mode, renderer=None):
     """Aspect ratio and duration the renderer must produce natively (image-to-video inherits the source ratio)."""
     package = gate["package_payload"]
     metadata = package.get("platform_metadata") or {}
+    if generation_mode == "REFERENCE_TO_VIDEO" and gate.get("requested_aspect_override"):
+        # Reference-to-video composes a new frame, so an explicit supported ratio involves no stretching.
+        return gate["requested_aspect_override"], metadata.get("duration_seconds")
     if generation_mode in ("IMAGE_TO_VIDEO", "REFERENCE_TO_VIDEO") and gate.get("source_asset"):
         source = gate["source_asset"]
         capabilities = provider_capabilities(getattr(renderer, "name", "xai"), "VIDEO") or {}
@@ -5101,7 +5133,7 @@ def _transition_render_job(connection, job_id, to_status, message, metadata=None
 def enqueue_render(
     content_package_id, media_type=None, provider_name=None, *, background=True, regenerate=False,
     renderer=None, visual_qa_provider=None, source_asset_id=None, generation_mode=None, client_request_id=None,
-    ocr_provider=None, frame_extractor=None,
+    ocr_provider=None, frame_extractor=None, aspect_ratio=None,
 ):
     gate = _render_eligibility(content_package_id, media_type, source_asset_id)
     if not gate["eligible"]:
@@ -5130,6 +5162,10 @@ def enqueue_render(
         if generation_mode in ("IMAGE_TO_VIDEO", "REFERENCE_TO_VIDEO"):
             raise ValueError(f"{generation_mode} requires an explicitly selected approved source image.")
         generation_mode = "TEXT_TO_VIDEO"
+    if aspect_ratio:
+        if generation_mode != "REFERENCE_TO_VIDEO":
+            raise ValueError("An explicit aspect ratio is only allowed for reference-to-video; image-to-video would stretch the source.")
+        gate["requested_aspect_override"] = aspect_ratio
     requested_aspect, requested_duration = _requested_render_shape(gate, generation_mode, renderer)
     unsupported = getattr(renderer, "unsupported_reason", None)
     if unsupported and gate["media_type"] == "IMAGE":
@@ -5189,6 +5225,7 @@ def enqueue_render(
             "qa_policy": MEDIA_QA_POLICY_VERSION, "regeneration": regeneration_number,
             **({"mode": generation_mode, "source": [source["id"], source["checksum_sha256"]] if source else None}
                if gate["media_type"] != "IMAGE" else {}),
+            **({"aspect": aspect_ratio} if aspect_ratio else {}),
         })
         job_id = "RJ-" + uuid.uuid4().hex[:12].upper()
         connection.execute(
@@ -5666,6 +5703,21 @@ PRODUCTION_COST_STAGES = (
     ("VIDEO_RENDERING", "render_jobs", "COALESCE(provider_cost_usd,calculated_cost_usd)",
      "provider_mode='live' AND provider_called=1 AND media_type IN ('VIDEO','SHORT_FORM_VIDEO','LONG_FORM_VIDEO')"),
 )
+
+
+def _job_lineage_state(render, render_gate, cache=None):
+    """(lineage blockers, current input version) for a render job's own target."""
+    if render["media_type"] == render_gate.get("media_type") and not render.get("source_asset_id") \
+            and render["content_package_id"] == render_gate.get("content_package_id"):
+        return render_gate.get("lineage_blockers") or [], render_gate.get("input_version")
+    key = (render["content_package_id"], render["media_type"], render.get("source_asset_id"))
+    if cache is not None and key in cache:
+        return cache[key]
+    gate = _render_eligibility(*key)
+    state = (list(gate["blockers"]), gate["input_version"])
+    if cache is not None:
+        cache[key] = state
+    return state
 
 
 def _render_phase(render):
@@ -6369,6 +6421,547 @@ def rerun_media_qa(asset_id, qa_kind="ALL", *, ocr_provider=None, frame_extracto
     return created
 
 
+# ---------- Architecture 07: Meta distribution ----------
+
+PUBLISH_MAX_ATTEMPTS = max(1, min(5, int(os.environ.get("PUBLISH_MAX_ATTEMPTS", "3"))))
+PUBLISH_RETRY_BACKOFF_SECONDS = max(0.0, float(os.environ.get("PUBLISH_RETRY_BACKOFF_SECONDS", "5")))
+PUBLISH_SCHEDULER_INTERVAL_SECONDS = max(5.0, float(os.environ.get("PUBLISH_SCHEDULER_INTERVAL_SECONDS", "30")))
+PUBLISH_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="meta-publish")
+PUBLISH_ACTIVE_STATUSES = ("SCHEDULED", "QUEUED", "UPLOADING", "PROCESSING", "PUBLISHING", "NEEDS_INTERVENTION")
+
+
+def _latest_media_review(connection, asset_id):
+    row = connection.execute(
+        "SELECT * FROM media_reviews WHERE generated_asset_id=? ORDER BY created_at DESC,id DESC LIMIT 1", (asset_id,)
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def _latest_distribution_review(connection, package_id):
+    row = connection.execute(
+        "SELECT * FROM distribution_reviews WHERE distribution_package_id=? ORDER BY created_at DESC,id DESC LIMIT 1",
+        (package_id,),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def _distribution_media_blockers(connection, asset_id):
+    """Media must be a live, validated, current video whose latest human review is APPROVED."""
+    asset = connection.execute("SELECT * FROM generated_assets WHERE id=?", (asset_id,)).fetchone()
+    if asset is None:
+        raise KeyError(asset_id)
+    asset = dict(asset)
+    job = dict(connection.execute("SELECT * FROM render_jobs WHERE id=?", (asset["render_job_id"],)).fetchone())
+    blockers = []
+    if asset["media_type"] not in ("VIDEO", "SHORT_FORM_VIDEO", "LONG_FORM_VIDEO"):
+        blockers.append("Only approved VIDEO assets can be distributed as Reels.")
+    if asset["fixture_only"] or not asset["executable"]:
+        blockers.append("Fixture or non-executable media can never be distributed.")
+    if asset["status"] != "VALIDATED" or asset["stale"] or not asset["usable_for_review"]:
+        blockers.append("The media asset is not a validated, current, usable asset.")
+    review = _latest_media_review(connection, asset_id)
+    if not review or review["action"] != "APPROVED":
+        blockers.append("The media asset's latest human review is not APPROVED.")
+    elif review["asset_version"] != asset["version_number"]:
+        blockers.append("The media approval belongs to a different asset version.")
+    return asset, job, review, blockers
+
+
+def _distribution_lineage_blockers(job):
+    gate = _render_eligibility(job["content_package_id"], job["media_type"], job.get("source_asset_id"),
+                               check_production_freshness=False)
+    blockers = list(gate["blockers"])
+    if not blockers and gate["input_version"] != job["input_version"]:
+        blockers.append("Package, claim, or evidence lineage changed after this media was rendered.")
+    return gate, blockers
+
+
+def create_distribution_package(asset_id, platform, cover_time_ms=None, *, storage=None):
+    """Build an immutable platform package from approved content only. Requires APPROVED media."""
+    if platform not in META_PLATFORMS:
+        raise ValueError("Platform must be INSTAGRAM_REELS or FACEBOOK_REELS.")
+    storage = storage or LocalMediaStorage(RENDER_STORAGE_ROOT)
+    with connect() as connection:
+        asset, job, review, blockers = _distribution_media_blockers(connection, asset_id)
+    if blockers:
+        raise ValueError("Distribution blocked: " + " ".join(blockers))
+    gate, lineage_blockers = _distribution_lineage_blockers(job)
+    if lineage_blockers:
+        raise ValueError("Distribution blocked: " + " ".join(lineage_blockers))
+    data = storage.get(asset["storage_uri"])
+    if hashlib.sha256(data).hexdigest() != asset["checksum_sha256"]:
+        raise ValueError("Distribution blocked: stored media bytes do not match the approved checksum.")
+    video = {**inspect_video(data), "file_size": len(data)}
+    compliance = check_platform_compliance(platform, video)
+    duration_ms = int((video.get("duration_seconds") or 0) * 1000)
+    if cover_time_ms is None:
+        cover_time_ms = min(1000, max(0, duration_ms - 100))
+    cover_time_ms = int(cover_time_ms)
+    if not 0 <= cover_time_ms <= max(0, duration_ms):
+        raise ValueError("Cover time must fall within the video duration.")
+    package = gate["package_payload"]
+    with connect() as connection:
+        claims = [dict(row) for row in connection.execute(
+            "SELECT id,text,claim_type,attribution FROM claim_versions WHERE id IN ("
+            + ",".join("?" for _ in gate["claim_version_ids"]) + ") ORDER BY id", gate["claim_version_ids"],
+        )] if gate["claim_version_ids"] else []
+    copy = build_platform_copy(platform, package, claims, cover_time_ms=cover_time_ms)
+    validation = validate_platform_copy(copy, package, claims, platform)
+    record = {
+        "platform": platform, "asset": [asset["id"], asset["version_number"], asset["checksum_sha256"]],
+        "review": review["id"], "package": [gate["package"]["id"], gate["package"]["version_number"], gate["package"]["content_hash"]],
+        "copy": {key: copy[key] for key in ("caption", "title", "hashtags", "accessibility_text", "cover", "platform_metadata")},
+    }
+    timestamp = now()
+    with connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        version = connection.execute(
+            "SELECT COALESCE(MAX(version_number),0)+1 FROM distribution_packages WHERE platform=? AND generated_asset_id=?",
+            (platform, asset_id),
+        ).fetchone()[0]
+        package_id = "DP-" + uuid.uuid4().hex[:12].upper()
+        connection.execute(
+            "INSERT INTO distribution_packages(id,event_id,platform,version_number,generated_asset_id,asset_version,"
+            "asset_checksum_sha256,media_review_id,content_package_id,content_package_version,content_package_hash,"
+            "approved_claim_set_id,approved_claim_set_version,caption,title,hashtags_json,accessibility_text,cover_json,"
+            "platform_metadata_json,copy_provenance_json,copy_validation_json,compliance_json,compliant,copy_policy_version,"
+            "content_hash,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                package_id, asset["event_id"], platform, version, asset_id, asset["version_number"], asset["checksum_sha256"],
+                review["id"], gate["package"]["id"], gate["package"]["version_number"], gate["package"]["content_hash"],
+                gate["package"]["approved_claim_set_id"], gate["package"]["approved_claim_set_version"],
+                copy["caption"], copy["title"], json.dumps(copy["hashtags"]), copy["accessibility_text"],
+                json.dumps(copy["cover"]), json.dumps(copy["platform_metadata"]), json.dumps(copy["provenance"]),
+                json.dumps(validation), json.dumps({**compliance, "decoded": {k: v for k, v in video.items() if k != "decoder"}}),
+                int(compliance["compliant"] and validation["valid"]), DISTRIBUTION_COPY_POLICY_VERSION,
+                meta_content_hash(record), timestamp,
+            ),
+        )
+        connection.commit()
+    return distribution_package(package_id)
+
+
+def distribution_package(package_id):
+    with connect() as connection:
+        row = connection.execute("SELECT * FROM distribution_packages WHERE id=?", (package_id,)).fetchone()
+        if row is None:
+            raise KeyError(package_id)
+        result = dict(row)
+        result["reviews"] = [dict(item) for item in connection.execute(
+            "SELECT * FROM distribution_reviews WHERE distribution_package_id=? ORDER BY created_at DESC,id DESC", (package_id,)
+        )]
+    for key in ("hashtags", "cover", "platform_metadata", "copy_provenance", "copy_validation", "compliance"):
+        result[key] = json.loads(result.pop(key + "_json") or "null")
+    result["latest_review"] = result["reviews"][0] if result["reviews"] else None
+    return result
+
+
+def review_distribution_package(package_id, action, reviewer, comment=None):
+    """Separate human approval per platform package; APPROVED never publishes by itself."""
+    if action not in ("APPROVED", "CHANGES_REQUIRED", "REJECTED"):
+        raise ValueError("Review action must be APPROVED, CHANGES_REQUIRED, or REJECTED.")
+    reviewer = str(reviewer or "").strip()
+    if not reviewer:
+        raise ValueError("Reviewer name is required.")
+    package = distribution_package(package_id)
+    if action == "APPROVED":
+        problems = []
+        if not package["compliant"]:
+            problems.extend(package["compliance"].get("errors") or [])
+            problems.extend(package["copy_validation"].get("errors") or [])
+        with connect() as connection:
+            _, _, _, media_blockers = _distribution_media_blockers(connection, package["generated_asset_id"])
+            media_review = _latest_media_review(connection, package["generated_asset_id"])
+        problems.extend(media_blockers)
+        if media_review and media_review["id"] != package["media_review_id"] and media_review["action"] != "APPROVED":
+            problems.append("The media review this package was built on is no longer the current approval.")
+        if problems:
+            raise ValueError("Platform package cannot be approved: " + " ".join(dict.fromkeys(problems)))
+    review_id = "DR-" + uuid.uuid4().hex[:12].upper()
+    with connect() as connection:
+        connection.execute(
+            "INSERT INTO distribution_reviews(id,distribution_package_id,action,reviewer,comment,created_at) VALUES(?,?,?,?,?,?)",
+            (review_id, package_id, action, reviewer, str(comment or "").strip()[:2000] or None, now()),
+        )
+    return distribution_package(package_id)
+
+
+def _publish_gate(package, *, require_live=True):
+    """Every condition required to post. Re-evaluated at execution time, never cached."""
+    blockers = []
+    with connect() as connection:
+        _, job, media_review, media_blockers = _distribution_media_blockers(connection, package["generated_asset_id"])
+        distribution_review = _latest_distribution_review(connection, package["id"])
+        asset = connection.execute("SELECT checksum_sha256 FROM generated_assets WHERE id=?", (package["generated_asset_id"],)).fetchone()
+    blockers.extend(media_blockers)
+    if asset["checksum_sha256"] != package["asset_checksum_sha256"]:
+        blockers.append("The media checksum no longer matches the platform package.")
+    _, lineage_blockers = _distribution_lineage_blockers(job)
+    blockers.extend(lineage_blockers)
+    if not package["compliant"]:
+        blockers.append("The platform package failed platform compliance or copy validation.")
+    if not distribution_review or distribution_review["action"] != "APPROVED":
+        blockers.append("The platform package's latest human review is not APPROVED.")
+    configuration = meta_platform_configuration(package["platform"])
+    if require_live:
+        switches = meta_publishing_switches()
+        if not switches["SOCIAL_PUBLISHING_ENABLED"]:
+            blockers.append("SOCIAL_PUBLISHING_ENABLED is off.")
+        if not switches[META_PLATFORM_SWITCH[package["platform"]]]:
+            blockers.append(f"{META_PLATFORM_SWITCH[package['platform']]} is off.")
+        if configuration["missing"]:
+            blockers.append("Missing platform configuration: " + ", ".join(configuration["missing"]))
+    return {
+        "allowed": not blockers, "blockers": list(dict.fromkeys(blockers)),
+        "media_review_id": media_review["id"] if media_review else None,
+        "distribution_review_id": distribution_review["id"] if distribution_review else None,
+        "switches": meta_publishing_switches(), "checked_at": now(),
+    }
+
+
+def publish_job(job_id):
+    with connect() as connection:
+        row = connection.execute("SELECT * FROM publish_jobs WHERE id=?", (job_id,)).fetchone()
+        if row is None:
+            raise KeyError(job_id)
+        result = dict(row)
+        result["events"] = [dict(item) for item in connection.execute(
+            "SELECT * FROM publish_job_events WHERE publish_job_id=? ORDER BY id", (job_id,)
+        )]
+    result["gate_snapshot"] = json.loads(result.pop("gate_snapshot_json") or "{}")
+    for event in result["events"]:
+        event["safe_metadata"] = json.loads(event.pop("safe_metadata_json") or "{}")
+    return result
+
+
+def _publish_event(connection, job_id, event_type, status=None, **metadata):
+    connection.execute(
+        "INSERT INTO publish_job_events(publish_job_id,event_type,status,safe_metadata_json,occurred_at) VALUES(?,?,?,?,?)",
+        (job_id, event_type, status, json.dumps(_scrub_provider_metadata(metadata), ensure_ascii=False, sort_keys=True), now()),
+    )
+
+
+def _set_publish_status(job_id, status, event_type=None, **fields):
+    columns = ["status=?", "updated_at=?"]
+    values = [status, now()]
+    for key, value in fields.items():
+        columns.append(f"{key}=?")
+        values.append(value)
+    with connect() as connection:
+        connection.execute(f"UPDATE publish_jobs SET {','.join(columns)} WHERE id=?", (*values, job_id))
+        _publish_event(connection, job_id, event_type or status, status,
+                       **{k: v for k, v in fields.items() if k in ("last_error_code", "last_error_message", "provider_post_id", "permalink")})
+
+
+def request_publish(package_id, *, mode="NOW", scheduled_for=None, client_request_id=None, requested_by=None,
+                    background=True, publisher=None, video_loader=None):
+    """Publish now or schedule. Replays and concurrent clicks return the existing job; one post per platform+asset."""
+    if mode not in ("NOW", "SCHEDULED"):
+        raise ValueError("mode must be NOW or SCHEDULED.")
+    if client_request_id:
+        with connect() as connection:
+            known = connection.execute("SELECT publish_job_id FROM publish_request_keys WHERE request_key=?", (client_request_id,)).fetchone()
+        if known:
+            return {"job": publish_job(known["publish_job_id"]), "duplicate": True}
+    package = distribution_package(package_id)
+    gate = _publish_gate(package, require_live=(mode == "NOW"))
+    if not gate["allowed"]:
+        raise ValueError("Publishing blocked: " + " ".join(gate["blockers"]))
+    if mode == "SCHEDULED":
+        try:
+            when = datetime.fromisoformat(str(scheduled_for).replace("Z", "+00:00"))
+        except (TypeError, ValueError) as error:
+            raise ValueError("scheduled_for must be an ISO-8601 timestamp.") from error
+        if when.tzinfo is None:
+            raise ValueError("scheduled_for must include a timezone.")
+        if when <= datetime.now(timezone.utc):
+            raise ValueError("scheduled_for must be in the future.")
+        scheduled_for = when.astimezone(timezone.utc).isoformat()
+    timestamp = now()
+    job_id = "PB-" + uuid.uuid4().hex[:12].upper()
+    with connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        published = connection.execute(
+            "SELECT id FROM publish_jobs WHERE platform=? AND asset_checksum_sha256=? AND status='PUBLISHED'",
+            (package["platform"], package["asset_checksum_sha256"]),
+        ).fetchone()
+        if published:
+            connection.commit()
+            raise ValueError(f"Duplicate post blocked: this approved video is already published on {package['platform']} ({published['id']}).")
+        active = connection.execute(
+            "SELECT id FROM publish_jobs WHERE platform=? AND asset_checksum_sha256=? AND status IN ("
+            + ",".join("?" for _ in PUBLISH_ACTIVE_STATUSES) + ")",
+            (package["platform"], package["asset_checksum_sha256"], *PUBLISH_ACTIVE_STATUSES),
+        ).fetchone()
+        if active:
+            connection.commit()
+            return {"job": publish_job(active["id"]), "duplicate": True}
+        attempts = connection.execute(
+            "SELECT COUNT(*) FROM publish_jobs WHERE platform=? AND asset_checksum_sha256=?",
+            (package["platform"], package["asset_checksum_sha256"]),
+        ).fetchone()[0]
+        idempotency_key = meta_content_hash({
+            "platform": package["platform"], "package": package["id"], "asset": package["asset_checksum_sha256"],
+            "sequence": attempts + 1,
+        })
+        connection.execute(
+            "INSERT INTO publish_jobs(id,distribution_package_id,event_id,platform,generated_asset_id,asset_checksum_sha256,mode,"
+            "status,scheduled_for,idempotency_key,client_request_id,requested_by,api_version,max_attempts,gate_snapshot_json,"
+            "created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                job_id, package["id"], package["event_id"], package["platform"], package["generated_asset_id"],
+                package["asset_checksum_sha256"], mode, "QUEUED" if mode == "NOW" else "SCHEDULED", scheduled_for,
+                idempotency_key, client_request_id, str(requested_by or "")[:120] or None, meta_api_version(),
+                PUBLISH_MAX_ATTEMPTS, json.dumps(gate), timestamp, timestamp,
+            ),
+        )
+        if client_request_id:
+            connection.execute(
+                "INSERT INTO publish_request_keys(request_key,publish_job_id,created_at) VALUES(?,?,?)",
+                (client_request_id, job_id, timestamp),
+            )
+        _publish_event(connection, job_id, "REQUESTED", "QUEUED" if mode == "NOW" else "SCHEDULED",
+                       scheduled_for=scheduled_for, requested_by=requested_by)
+        connection.commit()
+    if mode == "NOW":
+        if background:
+            PUBLISH_EXECUTOR.submit(execute_publish_job, job_id, publisher, video_loader)
+        else:
+            execute_publish_job(job_id, publisher, video_loader)
+    return {"job": publish_job(job_id), "duplicate": False}
+
+
+def cancel_publish_job(job_id, reason=None):
+    with connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        row = connection.execute("SELECT status FROM publish_jobs WHERE id=?", (job_id,)).fetchone()
+        if row is None:
+            raise KeyError(job_id)
+        if row["status"] != "SCHEDULED":
+            connection.commit()
+            raise ValueError(f"Only scheduled posts can be cancelled (current status: {row['status']}).")
+        timestamp = now()
+        connection.execute(
+            "UPDATE publish_jobs SET status='CANCELLED',cancelled_at=?,cancel_reason=?,updated_at=? WHERE id=? AND status='SCHEDULED'",
+            (timestamp, str(reason or "Cancelled by reviewer")[:500], timestamp, job_id),
+        )
+        _publish_event(connection, job_id, "CANCELLED", "CANCELLED", reason=reason)
+        connection.commit()
+    return publish_job(job_id)
+
+
+def _with_retries(job, step, operation):
+    """Retry transient Meta failures within the job's bounded attempt budget; record each attempt."""
+    for attempt in range(1, job["max_attempts"] + 1):
+        try:
+            return operation()
+        except MetaError as error:
+            with connect() as connection:
+                _publish_event(connection, job["id"], "ATTEMPT_FAILED", error.code, step=step, attempt=attempt,
+                               message=str(error)[:300], retryable=error.retryable)
+            if not error.retryable or attempt >= job["max_attempts"]:
+                raise
+            time.sleep(min(60.0, PUBLISH_RETRY_BACKOFF_SECONDS * 2 ** (attempt - 1)))
+
+
+def _finish_published(job, package, post_id, permalink, note=None):
+    _set_publish_status(job["id"], "PUBLISHED", provider_post_id=post_id, permalink=permalink, published_at=now(),
+                        last_error_message=note)
+    record_publishing_history(
+        event_id=package["event_id"], content_format="REEL", language="English", status="PUBLISHED", mode="live",
+        claim_set_id=package["approved_claim_set_id"], content_fingerprint=package["content_hash"],
+        title=package["title"] or package["caption"][:120], published_at=now(),
+    )
+
+
+def execute_publish_job(job_id, publisher=None, video_loader=None):
+    job = publish_job(job_id)
+    if job["status"] != "QUEUED":
+        return job
+    package = distribution_package(job["distribution_package_id"])
+    gate = _publish_gate(package, require_live=True)
+    if not gate["allowed"]:
+        _set_publish_status(job_id, "BLOCKED", "BLOCKED_AT_EXECUTION", last_error_code="PUBLISH_GATE",
+                            last_error_message=" ".join(gate["blockers"])[:500], gate_snapshot_json=json.dumps(gate))
+        return publish_job(job_id)
+    try:
+        publisher = publisher or meta_publisher_for(package["platform"])
+    except MetaError as error:
+        _set_publish_status(job_id, "BLOCKED", last_error_code=error.code, last_error_message=str(error)[:500])
+        return publish_job(job_id)
+    with connect() as connection:
+        updated = connection.execute(
+            "UPDATE publish_jobs SET status='UPLOADING',started_at=?,attempt_count=attempt_count+1,gate_snapshot_json=?,updated_at=? "
+            "WHERE id=? AND status='QUEUED'", (now(), json.dumps(gate), now(), job_id),
+        ).rowcount
+        if updated:
+            _publish_event(connection, job_id, "UPLOADING", "UPLOADING")
+    if not updated:
+        return publish_job(job_id)
+    copy = {"caption": package["caption"], "title": package["title"], "hashtags": package["hashtags"],
+            "cover": package["cover"], "platform_metadata": package["platform_metadata"]}
+    stage = "container"
+    try:
+        with connect() as connection:
+            asset = dict(connection.execute("SELECT * FROM generated_assets WHERE id=?", (package["generated_asset_id"],)).fetchone())
+        data = (video_loader or LocalMediaStorage(RENDER_STORAGE_ROOT).get)(asset["storage_uri"])
+        if hashlib.sha256(data).hexdigest() != package["asset_checksum_sha256"]:
+            raise MetaRejectedError("Video bytes do not match the approved checksum.")
+        container = job.get("provider_container_id") or _with_retries(job, "container", lambda: publisher.create_container(copy))
+        with connect() as connection:
+            connection.execute("UPDATE publish_jobs SET provider_container_id=?,updated_at=? WHERE id=?", (container, now(), job_id))
+        stage = "upload"
+        _with_retries(job, "upload", lambda: publisher.upload(container, data))
+        _set_publish_status(job_id, "PROCESSING")
+        stage = "processing"
+        state = _with_retries(job, "processing", lambda: publisher.wait_until_ready(container))
+        if state == "PUBLISHED":
+            post_id = container if package["platform"] == "FACEBOOK_REELS" else None
+            _finish_published(job, package, post_id, publisher.permalink(post_id) if post_id else None,
+                              note=None if post_id else "Container already published; confirm the post ID in Instagram.")
+            return publish_job(job_id)
+        stage = "publish"
+        _set_publish_status(job_id, "PUBLISHING", "PUBLISH_ATTEMPTED")
+        if package["platform"] == "FACEBOOK_REELS":
+            post_id = publisher.publish(container, copy)
+        else:
+            post_id = publisher.publish(container)
+        _finish_published(job, package, post_id, publisher.permalink(post_id))
+    except MetaPending:
+        _set_publish_status(job_id, "NEEDS_INTERVENTION", last_error_code="META_STILL_PROCESSING",
+                            last_error_message="Meta is still processing the upload; use Check status (free, never reposts).")
+    except MetaAmbiguousError as error:
+        _set_publish_status(job_id, "NEEDS_INTERVENTION", last_error_code=error.code,
+                            last_error_message=f"{stage}: outcome unknown; never retried automatically. Use Check status.")
+    except MetaError as error:
+        _set_publish_status(job_id, "FAILED", last_error_code=error.code, last_error_message=f"{stage}: {str(error)[:400]}")
+    except Exception as error:
+        _set_publish_status(job_id, "FAILED", last_error_code="PUBLISH_INTERNAL_ERROR", last_error_message=f"{stage}: {str(error)[:400]}")
+    finally:
+        with connect() as connection:
+            for event in getattr(publisher, "events", []):
+                _publish_event(connection, job_id, "PROVIDER_" + event["event_type"], event.get("status"), **event.get("metadata", {}))
+            if hasattr(publisher, "events"):
+                publisher.events = []
+    return publish_job(job_id)
+
+
+def check_publish_status(job_id, publisher=None):
+    """Free status check for interrupted/ambiguous jobs. Never creates a second post."""
+    job = publish_job(job_id)
+    if job["status"] not in ("NEEDS_INTERVENTION", "PROCESSING") or not job.get("provider_container_id"):
+        raise ValueError("Only interrupted jobs with a Meta container/video ID can be checked.")
+    package = distribution_package(job["distribution_package_id"])
+    publisher = publisher or meta_publisher_for(package["platform"])
+    container = job["provider_container_id"]
+    publish_attempted = any(event["event_type"] == "PUBLISH_ATTEMPTED" for event in job["events"])
+    try:
+        published, post_id = publisher.find_published_media(container)
+        if published:
+            _finish_published(job, package, post_id, publisher.permalink(post_id) if post_id else None,
+                              note=None if post_id else "Published; Meta does not expose the media ID for this container. Confirm in the app.")
+            return publish_job(job_id)
+        if publish_attempted:
+            _set_publish_status(job_id, "NEEDS_INTERVENTION", "STATUS_CHECKED", last_error_code="META_OUTCOME_UNKNOWN",
+                                last_error_message="Publish was attempted but is not visible yet; check again or confirm manually. Never auto-reposted.")
+            return publish_job(job_id)
+        state = publisher.wait_until_ready(container)
+    except MetaPending:
+        _set_publish_status(job_id, "NEEDS_INTERVENTION", "STATUS_CHECKED", last_error_code="META_STILL_PROCESSING",
+                            last_error_message="Meta is still processing; check again later.")
+        return publish_job(job_id)
+    except MetaError as error:
+        _set_publish_status(job_id, "FAILED", "STATUS_CHECKED", last_error_code=error.code, last_error_message=str(error)[:400])
+        return publish_job(job_id)
+    gate = _publish_gate(package, require_live=True)
+    if not gate["allowed"]:
+        _set_publish_status(job_id, "BLOCKED", "BLOCKED_AT_EXECUTION", last_error_code="PUBLISH_GATE",
+                            last_error_message=" ".join(gate["blockers"])[:500])
+        return publish_job(job_id)
+    _set_publish_status(job_id, "PUBLISHING", "PUBLISH_ATTEMPTED")
+    copy = {"caption": package["caption"], "title": package["title"]}
+    try:
+        post_id = publisher.publish(container, copy) if package["platform"] == "FACEBOOK_REELS" else publisher.publish(container)
+        _finish_published(job, package, post_id, publisher.permalink(post_id))
+    except MetaAmbiguousError as error:
+        _set_publish_status(job_id, "NEEDS_INTERVENTION", last_error_code=error.code,
+                            last_error_message="publish: outcome unknown; never retried automatically.")
+    except MetaError as error:
+        _set_publish_status(job_id, "FAILED", last_error_code=error.code, last_error_message=str(error)[:400])
+    return publish_job(job_id)
+
+
+def run_due_publish_jobs(now_at=None, publisher_factory=None, video_loader=None):
+    """Local scheduler tick: claim due SCHEDULED jobs atomically and execute them (gates re-checked)."""
+    now_at = now_at or datetime.now(timezone.utc).isoformat()
+    with connect() as connection:
+        due = [row["id"] for row in connection.execute(
+            "SELECT id FROM publish_jobs WHERE status='SCHEDULED' AND scheduled_for<=? ORDER BY scheduled_for", (now_at,)
+        )]
+    results = []
+    for job_id in due:
+        with connect() as connection:
+            claimed = connection.execute(
+                "UPDATE publish_jobs SET status='QUEUED',updated_at=? WHERE id=? AND status='SCHEDULED'", (now(), job_id)
+            ).rowcount
+            if claimed:
+                _publish_event(connection, job_id, "SCHEDULE_DUE", "QUEUED")
+        if claimed:
+            platform = publish_job(job_id)["platform"]
+            results.append(execute_publish_job(job_id, publisher_factory(platform) if publisher_factory else None, video_loader))
+    return results
+
+
+def recover_interrupted_publish_jobs():
+    """At startup: never re-run a post automatically. In-flight jobs need a free status check."""
+    with connect() as connection:
+        rows = [dict(row) for row in connection.execute(
+            "SELECT id,status,provider_container_id FROM publish_jobs WHERE status IN ('QUEUED','UPLOADING','PROCESSING','PUBLISHING')"
+        )]
+    for row in rows:
+        if row["status"] == "QUEUED" or not row["provider_container_id"]:
+            _set_publish_status(row["id"], "BLOCKED", "RECOVERED_AT_STARTUP", last_error_code="INTERRUPTED",
+                                last_error_message="Interrupted by restart before Meta received the post; request publishing again.")
+        else:
+            _set_publish_status(row["id"], "NEEDS_INTERVENTION", "RECOVERED_AT_STARTUP", last_error_code="INTERRUPTED",
+                                last_error_message="Interrupted by restart after upload began; use Check status (never reposts).")
+    return len(rows)
+
+
+def start_publish_scheduler():
+    def loop():
+        while True:
+            try:
+                run_due_publish_jobs()
+            except Exception as error:
+                log_error("publish_scheduler_failed", error)
+            time.sleep(PUBLISH_SCHEDULER_INTERVAL_SECONDS)
+    threading.Thread(target=loop, name="meta-publish-scheduler", daemon=True).start()
+
+
+def _event_distribution(event_id):
+    with connect() as connection:
+        package_ids = [row["id"] for row in connection.execute(
+            "SELECT id FROM distribution_packages WHERE event_id=? ORDER BY created_at DESC,id DESC", (event_id,)
+        )]
+        job_ids = [row["id"] for row in connection.execute(
+            "SELECT id FROM publish_jobs WHERE event_id=? ORDER BY created_at DESC,id DESC", (event_id,)
+        )]
+    packages = [distribution_package(package_id) for package_id in package_ids]
+    for package in packages:
+        package["publish_gate"] = _publish_gate(package, require_live=True)
+    return {**distribution_overview(), "packages": packages, "publish_jobs": [publish_job(job_id) for job_id in job_ids]}
+
+
+def distribution_overview():
+    return {
+        "switches": meta_publishing_switches(),
+        "platforms": {platform: meta_platform_configuration(platform) for platform in META_PLATFORMS},
+        "scheduling": "local scheduler (Meta-native scheduling is never used so kill switches apply at publish time)",
+        "api_version": meta_api_version(),
+    }
+
+
 def verification_run(run_id):
     with connect() as connection:
         row = connection.execute("SELECT * FROM verification_runs WHERE id=?", (run_id,)).fetchone()
@@ -6665,7 +7258,7 @@ def event_room(event_id):
         }
     # Physical existence never implies usability: only an asset rendered from the
     # latest package under the current lineage is current for human review.
-    current_input = render_gate.get("input_version")
+    lineage_cache = {}
     for render in render_jobs:
         for asset in render["assets"]:
             reasons = []
@@ -6673,10 +7266,14 @@ def event_room(event_id):
                 reasons.append(asset.get("stale_reason") or "Lineage changed during rendering.")
             if latest_package and asset["content_package_id"] != latest_package["id"]:
                 reasons.append("A newer ContentPackage version exists.")
-            elif render_gate.get("lineage_blockers"):
-                reasons.append("Package lineage is no longer eligible: " + render_gate["lineage_blockers"][0])
-            elif current_input and render["input_version"] != current_input:
-                reasons.append("Package lineage changed after rendering.")
+            else:
+                # Compare each job with the lineage of its own target (media type and bound source),
+                # not the package's default render target.
+                lineage_blockers, job_input = _job_lineage_state(render, render_gate, lineage_cache)
+                if lineage_blockers:
+                    reasons.append("Package lineage is no longer eligible: " + lineage_blockers[0])
+                elif job_input and render["input_version"] != job_input:
+                    reasons.append("Package lineage changed after rendering.")
             asset["current_for_review"] = bool(asset["usable_for_review"] and not reasons)
             asset["currency_reasons"] = reasons
     video_configuration = renderer_configuration("VIDEO")
@@ -6707,6 +7304,7 @@ def event_room(event_id):
         "production_jobs": production_jobs, "production_gate": production_gate,
         "render_jobs": render_jobs, "render_gate": render_gate, "video_gate": video_gate,
         "cost_ledger": cost_ledger, "cost_summary": cost_summary,
+        "distribution": _event_distribution(event_id),
         "transitions": transitions,
     }
 
@@ -6780,6 +7378,7 @@ def overview():
             "anthropic_configured": bool(os.environ.get("ANTHROPIC_API_KEY")),
             "configuration": production_configuration(),
         },
+        "distribution": distribution_overview(),
         "media_rendering": {
             "policy_version": RENDER_POLICY_VERSION,
             "prompt_version": RENDER_PROMPT_VERSION,
@@ -6960,7 +7559,7 @@ class Handler(SimpleHTTPRequestHandler):
                 result = enqueue_render(
                     match.group(1), body.get("media_type"), body.get("provider"), background=True,
                     regenerate=bool(body.get("regenerate")), source_asset_id=body.get("source_asset_id"),
-                    generation_mode=body.get("generation_mode"), client_request_id=body.get("client_request_id"),
+                    generation_mode=body.get("generation_mode"), aspect_ratio=body.get("aspect_ratio"), client_request_id=body.get("client_request_id"),
                 )
                 self.send_json(result, 200 if result["duplicate"] or result["cached"] else 202)
                 return
@@ -6981,6 +7580,33 @@ class Handler(SimpleHTTPRequestHandler):
                 )
                 self.send_json({"review": review}, 201)
                 return
+            match = re.fullmatch(r"/api/generated-assets/([^/]+)/distribution-packages", path)
+            if match:
+                package = create_distribution_package(match.group(1), body.get("platform"), body.get("cover_time_ms"))
+                self.send_json({"distribution_package": package}, 201)
+                return
+            match = re.fullmatch(r"/api/distribution-packages/([^/]+)/review", path)
+            if match:
+                package = review_distribution_package(match.group(1), body.get("action"), body.get("reviewer"), body.get("comment"))
+                self.send_json({"distribution_package": package}, 201)
+                return
+            match = re.fullmatch(r"/api/distribution-packages/([^/]+)/(publish|schedule)", path)
+            if match:
+                result = request_publish(
+                    match.group(1), mode="NOW" if match.group(2) == "publish" else "SCHEDULED",
+                    scheduled_for=body.get("scheduled_for"), client_request_id=body.get("client_request_id"),
+                    requested_by=body.get("requested_by"),
+                )
+                self.send_json(result, 200 if result["duplicate"] else 202)
+                return
+            match = re.fullmatch(r"/api/publish-jobs/([^/]+)/cancel", path)
+            if match:
+                self.send_json({"job": cancel_publish_job(match.group(1), body.get("reason"))})
+                return
+            match = re.fullmatch(r"/api/publish-jobs/([^/]+)/check-status", path)
+            if match:
+                self.send_json({"job": check_publish_status(match.group(1))})
+                return
             match = re.fullmatch(r"/api/events/([^/]+)/transition", path)
             if match:
                 transition(match.group(1), body["state"])
@@ -6997,6 +7623,8 @@ class Handler(SimpleHTTPRequestHandler):
 
 if __name__ == "__main__":
     init()
+    recover_interrupted_publish_jobs()
+    start_publish_scheduler()
     port = int(os.environ.get("PORT", "8000"))
     host = os.environ.get("HOST", "127.0.0.1")
     print(f"ReachOut dashboard: http://{host}:{port}", flush=True)
