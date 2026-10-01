@@ -1,0 +1,50 @@
+{
+  "registry_version": "06F-S-v1",
+  "authorities": [
+    {
+      "id": "department-commerce-india",
+      "name": "Department of Commerce, Government of India",
+      "domain": "commerce.gov.in",
+      "authority_type": "UNION_DEPARTMENT",
+      "priority": 1,
+      "document_types": ["HTML", "PDF", "NOTIFICATION", "PRESS_RELEASE", "OFFICE_MEMORANDUM"],
+      "enabled": true
+    },
+    {
+      "id": "tobacco-board-india",
+      "name": "Tobacco Board, Ministry of Commerce and Industry",
+      "domain": "tobaccoboard.commerce.gov.in",
+      "authority_type": "STATUTORY_BOARD",
+      "priority": 1,
+      "document_types": ["HTML", "PDF", "CIRCULAR", "BOARD_NOTICE", "AUCTION_NOTICE"],
+      "enabled": true
+    },
+    {
+      "id": "press-information-bureau",
+      "name": "Press Information Bureau, Government of India",
+      "domain": "pib.gov.in",
+      "authority_type": "UNION_INFORMATION_AGENCY",
+      "priority": 2,
+      "document_types": ["HTML", "PDF", "PRESS_RELEASE"],
+      "enabled": true
+    },
+    {
+      "id": "egazette-india",
+      "name": "eGazette of India",
+      "domain": "egazette.gov.in",
+      "authority_type": "OFFICIAL_GAZETTE",
+      "priority": 2,
+      "document_types": ["PDF", "GAZETTE", "NOTIFICATION"],
+      "enabled": true
+    },
+    {
+      "id": "andhra-pradesh-government",
+      "name": "Government of Andhra Pradesh",
+      "domain": "ap.gov.in",
+      "authority_type": "STATE_GOVERNMENT",
+      "priority": 3,
+      "document_types": ["HTML", "PDF", "ORDER", "CIRCULAR", "PRESS_RELEASE"],
+      "enabled": true
+    }
+  ]
+}

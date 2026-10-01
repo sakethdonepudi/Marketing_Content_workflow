@@ -348,6 +348,8 @@ function renderActionBar(data) {
   } else if (state.tab === 'verification') {
     const run = (data.runs || []).find(item => item.status === 'COMPLETED' && item.mode === 'live') || (data.runs || []).find(item => item.status === 'COMPLETED');
     const paused = (data.verification_runs || []).find(item => item.recoverable && item.resume_state === 'PAUSED_TRANSIENT');
+    const verification = (data.verification_runs || [])[0];
+    const evidenceUrl = el('input'); evidenceUrl.type = 'url'; evidenceUrl.placeholder = 'Add evidence URL…'; evidenceUrl.setAttribute('aria-label', 'Evidence URL');
     bar.append(
       actionCopy('Corroboration', paused ? 'Verification paused because the evidence provider timed out. Resume preserves prior evidence and records a new provider attempt.' : run ? (run.mode === 'live' ? 'Paid Grok search for independent corroboration of each claim.' : 'Test-data corroboration using the latest completed research.') : 'Complete research first.'),
       paused ? actionButton('Resume verification', 'verify-resume', () => post(
@@ -358,7 +360,15 @@ function renderActionBar(data) {
         run.mode === 'live' ? 'Starting explicit paid corroboration search…' : 'Starting test corroboration…',
         result => result.resume_required ? 'Use Resume verification for the paused run' : result.cached ? 'Evidence and claims unchanged · cached decision reused' : result.duplicate ? 'Verification already in progress' : 'Corroboration queued',
       ), {disabled: !run}),
+      el('label', 'evidence-url-control', 'Reviewer evidence', evidenceUrl),
+      actionButton('Add evidence URL', 'add-evidence', () => {
+        if (!evidenceUrl.value.trim()) { state.messages['add-evidence'] = 'Enter a public evidence URL.'; renderRoom(); return; }
+        post(`/api/verification/${encodeURIComponent(verification.id)}/evidence-url`, {url: evidenceUrl.value.trim()},
+          'add-evidence', 'Retrieving, classifying, deduplicating, and matching…',
+          result => `${result.candidates.filter(item => item.state === 'RETRIEVED').length} candidate(s) staged · no decision changed`, 'verification');
+      }, {primary: false, disabled: !verification}),
       progressFor('verify', (data.verification_runs || []).find(isActive)),
+      progressFor('add-evidence', null),
     );
   } else if (state.tab === 'decision') {
     const select = el('select', '', el('option', '', 'Deterministic preview'), el('option', '', state.overview?.content_ceo?.grok_configured ? 'Grok · live paid call' : 'Grok · API key missing'));
@@ -504,6 +514,47 @@ function renderVerification(data, root) {
   if (!runs.length) { root.append(empty('No verification yet', 'Complete research, then find corroboration for each claim.')); return; }
   const [current, ...older] = runs;
   root.append(verificationCard(current));
+  const acquisitionRuns = data.source_acquisition_runs || [];
+  const attempts = acquisitionRuns.flatMap(run => run.attempts || []);
+  const candidates = acquisitionRuns.flatMap(run => run.candidates || []);
+  const packets = acquisitionRuns.flatMap(run => run.packets || []);
+  const requiredDecisions = (current.decisions || []).filter(item => item.required_for_event);
+  const unresolved = requiredDecisions.filter(item => item.decision !== 'SUPPORTED');
+  const discovery = card('', cardHead('Evidence discovery', plainPill(`${(data.official_source_registry || []).filter(item => item.enabled).length} official authorities`, 'info')));
+  if (!requiredDecisions.length) {
+    discovery.append(callout('warn', 'Evidence still insufficient', 'No final claim decisions exist for this run yet. Discovery candidates and checkpoints remain available for review.'));
+  } else if (!unresolved.length) {
+    discovery.append(callout('good', 'Evidence sufficient', 'No required claim in this run remains unresolved.'));
+  } else {
+    unresolved.forEach(decision => {
+      const claimCandidates = candidates.filter(candidate => (candidate.claim_matches || []).some(match => match.claim_version_id === decision.claim_version_id));
+      const matched = claimCandidates.filter(candidate => candidate.state === 'RETRIEVED' && (candidate.claim_matches || []).some(match => match.claim_version_id === decision.claim_version_id && match.relationship === 'CANDIDATE'));
+      const official = matched.filter(item => item.source_class === 'OFFICIAL_PRIMARY');
+      const independent = new Set(matched.filter(item => item.source_class === 'INDEPENDENT_REPORTING').map(item => item.evidence_family_id));
+      const unavailable = claimCandidates.filter(item => item.state === 'UNAVAILABLE');
+      const duplicates = matched.filter(item => /same|syndicat|copied/i.test(item.family_reason || ''));
+      const claimAttempts = attempts.filter(item => (item.target_claim_ids || []).includes(decision.claim_version_id));
+      const completedStrategies = [...new Set(claimAttempts.filter(item => item.status === 'COMPLETED').map(item => item.strategy))];
+      const plannedStrategies = [...new Set(claimAttempts.filter(item => item.status === 'PLANNED').map(item => item.strategy))];
+      const packet = packets.find(item => item.claim_version_id === decision.claim_version_id);
+      const stateCode = packet?.deterministically_sufficient ? 'SUPPORTED' : matched.length ? 'RUNNING' : completedStrategies.length ? 'INSUFFICIENT_EVIDENCE' : 'REVIEW_REQUIRED';
+      const stateText = packet?.deterministically_sufficient ? 'Evidence sufficient' : matched.length ? 'Candidates found' : completedStrategies.length ? 'No additional candidates' : 'Evidence still insufficient';
+      discovery.append(el('div', 'evidence-item discovery-claim',
+        el('div', 'chip-row', pill(stateCode, stateText), el('span', 'ref', decision.claim_id)),
+        el('p', 'body-text', decision.claim_text),
+        facts([
+          ['Required condition', packet?.packet?.required_condition || 'Explicit official primary support or two independent reporting families.'],
+          ['Current supporting families', String(decision.independent_family_count || 0)],
+          ['Official sources found', String(official.length)], ['Independent families found', String(independent.size)],
+          ['Rejected duplicates', String(duplicates.length)], ['Unavailable pages', String(unavailable.length)],
+          ['Strategies attempted', completedStrategies.length ? completedStrategies.map(label).join(' · ') : 'None'],
+          ['Strategies planned', plannedStrategies.length ? plannedStrategies.map(label).join(' · ') : 'None'],
+        ]),
+      ));
+    });
+  }
+  discovery.append(el('p', 'secondary-text', 'Candidate classification and packet sufficiency never approve a claim. A fresh verification run applies the unchanged evidence policy.'));
+  root.append(discovery);
   (current.decisions || []).forEach(decision => {
     const decisionCard = card('', el('div', 'card-head', el('div', 'chip-row', pill(decision.decision), el('span', 'chip', decision.required_for_event ? 'Required claim' : 'Optional claim'), el('span', 'chip', `v${decision.claim_version}`))));
     decisionCard.append(el('p', 'body-text', decision.claim_text), el('p', 'secondary-text', decision.rationale));

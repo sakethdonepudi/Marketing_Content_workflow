@@ -153,6 +153,9 @@ select:focus, input:focus, .btn:focus-visible, .tabs button:focus-visible { bord
 .action-bar .action-copy strong { font-size: 13px; }
 .action-bar .action-copy span { font-size: 12px; color: var(--muted); }
 .action-bar label { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--text-2); }
+.action-bar .evidence-url-control { min-width: min(320px, 100%); }
+.action-bar .evidence-url-control input { min-width: 190px; width: min(260px, 42vw); padding: 8px 10px; }
+.discovery-claim .facts { margin-top: 10px; }
 .action-progress { font-size: 12px; color: var(--info); flex-basis: 100%; }
 .action-progress:empty { display: none; }
 

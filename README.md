@@ -1,6 +1,6 @@
-# ReachOut OS — Architecture 06C
+# ReachOut OS — Architecture 06F-S
 
-Local event intelligence desk for **N. Chandrababu Naidu, Chief Minister of Andhra Pradesh, India**, with factual ingestion, claim-specific verification, evidence-gated content decisions, approval-ready structured content packages, explicit media rendering, and separate media QA. The explicit workspace key is `n-chandrababu-naidu-andhra-pradesh`; the ambiguous abbreviation “CBN” is not used as workspace identity. Architecture 06C stops at generated assets in `READY_FOR_REVIEW`, with human review still required. It does not publish posts, connect to social platforms, auto-approve assets, or perform demographic or political targeting.
+Local event intelligence desk for **N. Chandrababu Naidu, Chief Minister of Andhra Pradesh, India**, with factual ingestion, claim-specific source acquisition and verification, evidence-gated content decisions, approval-ready structured content packages, explicit media rendering, and separate media QA. The explicit workspace key is `n-chandrababu-naidu-andhra-pradesh`; the ambiguous abbreviation “CBN” is not used as workspace identity. The system stops at generated assets in `READY_FOR_REVIEW`, with human review still required. It does not publish posts, connect to social platforms, auto-approve evidence or assets, or perform demographic or political targeting.
 
 ## Run
 
@@ -102,6 +102,16 @@ Live discovery uses a 180-second search timeout, a 30-second source-retrieval ph
 
 Source families are conservatively merged for the same normalized host, the same registered publisher, identical normalized text, or syndication-level text overlap. Every pair is stored as `SAME_FAMILY` or `INDEPENDENT_FAMILY` with its hosts, similarity, and reason. Concrete references to notifications, orders, ministries, regulators, filings, courts, or other first-party records are passed to discovery as official-source hints; they remain leads until fetched, source-validated, and matched to a claim.
 
+### Architecture 06F-S — source acquisition hardening
+
+Migration `016_source_acquisition.sql` adds a configurable official-authority registry, provider-neutral discovery plans, candidate documents, page-addressable PDF text, source-family assessments, claim/candidate matching, and structured evidence packets. It is additive and forward-only. The registry lives in `config/official_sources.json`; matching a government domain identifies an authoritative candidate but never makes a claim true.
+
+Every verification run receives an offline discovery plan covering authoritative-domain search, exact phrases, document-title fragments, entity/date terms, independent corroboration, and direct-document links. The provider boundary works with deterministic, composite, or future search adapters, so a zero-result provider does not disable direct retrieval or another provider. No provider search runs merely because a plan was created.
+
+The Verification tab includes **Add evidence URL**. The backend applies the same public-network and redirect restrictions, retrieves HTML or PDF bytes, stores the final URL/status/type/checksum/text/metadata, classifies source quality, groups syndicated families, matches passages to individual claims, and builds evidence packets. PDF text is extracted locally with macOS PDFKit and retains page numbers; unreadable PDFs cannot support a claim. A supplied URL never changes a decision by itself. A later explicit verification run re-applies the unchanged policy, and can skip paid discovery when staged evidence already satisfies the deterministic routing condition.
+
+Acquisition accounting keeps search-provider calls, direct HTTP retrievals, and LLM adjudication calls separate. Missing provider billing remains null/`unknown`, never zero. The offline fixtures cover an official document, a second independent family, a syndicated copy, an official page with absent claim text, page-specific PDF support, and exhausted discovery that remains `REVIEW_REQUIRED` with no downstream production.
+
 ## Content CEO
 
 Migration `009_content_ceo.sql` adds a media inventory, publishing history, Content CEO runs and audit history, and immutable structured decisions. A decision records `CREATE`, `HOLD`, `MONITOR`, `SKIP`, or `HUMAN_REVIEW`; the recommended format; language; duration; priority; factual rationale; exact claim-set/evidence versions; blockers; timestamp; policy version; and whether it is executable.
@@ -202,7 +212,7 @@ Example:
 python3 -m unittest -v
 ```
 
-Tests cover fresh and upgrade migrations, ingestion and clustering, research and verification safeguards, Content CEO policy, production entry gates, strict structured-output validation, claim locking, duplicate jobs, race invalidation, immutable packages, renderer entry gates, provider configuration, checksums and persistence, idempotency, regeneration, bounded transient retries, malformed/corrupt media, rights/evidence invalidation, immutable asset versions, usage/cost handling, fixture isolation, the xAI adapter (configuration, capability gating, request derivation, download without credentials, error normalization, Retry-After, post-send timeout safety, MIME/dimension checks, secret scrubbing), PNG/JPEG/WebP decoding, asset currency after package supersession, and per-story cost aggregation.
+Tests cover fresh and upgrade migrations, ingestion and clustering, research and verification safeguards, official registry/query planning, provider-neutral discovery, safe HTML/PDF retrieval, page references, source classification and family deduplication, claim/candidate packets, manual evidence isolation, no-search sufficiency, exhausted-discovery fail-closed behavior, Content CEO policy, production entry gates, strict structured-output validation, claim locking, duplicate jobs, race invalidation, immutable packages, renderer entry gates, provider configuration, checksums and persistence, idempotency, regeneration, bounded transient retries, malformed/corrupt media, rights/evidence invalidation, immutable asset versions, usage/cost handling, fixture isolation, the xAI adapter (configuration, capability gating, request derivation, download without credentials, error normalization, Retry-After, post-send timeout safety, MIME/dimension checks, secret scrubbing), PNG/JPEG/WebP decoding, asset currency after package supersession, and per-story cost aggregation.
 
 ## API
 
@@ -223,6 +233,7 @@ Tests cover fresh and upgrade migrations, ingestion and clustering, research and
 - `POST /api/events` — disabled; events must originate from qualified source signals
 - `POST /api/events/{id}/research` — `{ "provider": "test" }` or explicit `{ "provider": "grok" }`
 - `POST /api/research/{run_id}/verify` — explicit `{ "provider": "test" }` or paid `{ "provider": "grok" }`
+- `POST /api/verification/{run_id}/evidence-url` — safely stages `{ "url": "https://public.example/document" }`; optional `claim_ids`; never auto-approves
 - `POST /api/events/{id}/content-decision` — deterministic preview `{ "provider": "test" }` or explicit live `{ "provider": "grok" }`
 - `POST /api/content-decisions/{decision_id}/production` — explicit confirmed live Claude call with `client_request_id`; optional `{ "regenerate": true }`
 - `POST /api/content-packages/{package_id}/render` — explicit confirmed configured renderer call with `client_request_id`; optional `{ "regenerate": true }`

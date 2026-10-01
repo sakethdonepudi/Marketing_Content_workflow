@@ -68,6 +68,10 @@ from media_tools import (
     prepare_video_source, sample_times, warm_media_probe,
 )
 from visual_qa import visual_qa_provider_for
+from source_acquisition import (
+    OfficialSourceRegistry, RetrievedResponse, SourceRetriever, build_discovery_plan,
+    build_evidence_packet, classify_source, family_for_candidate, match_claims,
+)
 
 ROOT = Path(__file__).parent
 
@@ -92,8 +96,12 @@ DB = Path(os.environ.get("REACHOUT_DB", ROOT / "reachout.sqlite3"))
 MIGRATIONS = ROOT / "migrations"
 SOURCES_CONFIG = Path(os.environ.get("REACHOUT_SOURCES_CONFIG", ROOT / "config" / "sources.json"))
 WORKSPACE_CONFIG = Path(os.environ.get("REACHOUT_WORKSPACE_CONFIG", ROOT / "config" / "workspace.json"))
+OFFICIAL_SOURCES_CONFIG = Path(os.environ.get(
+    "REACHOUT_OFFICIAL_SOURCES_CONFIG", ROOT / "config" / "official_sources.json"
+))
 USER_AGENT = "ReachOut-OS/0.2 (+local factual source monitor)"
 MAX_RESPONSE_BYTES = 2_000_000
+MAX_EVIDENCE_DOCUMENT_BYTES = 12_000_000
 CLUSTER_WINDOW_HOURS = 72
 EVENT_MAX_AGE_DAYS = int(os.environ.get("REACHOUT_EVENT_MAX_AGE_DAYS", "30"))
 RESEARCH_SEARCH_LIMIT = max(0, int(os.environ.get("RESEARCH_SEARCH_LIMIT", "1")))
@@ -256,6 +264,8 @@ def init():
     apply_reference_material_correction()
     if SOURCES_CONFIG.exists():
         sync_sources(load_source_config())
+    if OFFICIAL_SOURCES_CONFIG.exists():
+        sync_official_source_registry(load_official_source_registry())
     recover_unfinished_media_jobs()
     if os.environ.get("OCR_PROVIDER", "auto").strip().lower() not in ("", "none", "off"):
         warm_media_probe()
@@ -323,6 +333,31 @@ def load_source_config(path=None):
     if not isinstance(data.get("sources"), list):
         raise ValueError("source configuration must contain a sources array")
     return data
+
+
+def load_official_source_registry(path=None):
+    return OfficialSourceRegistry.from_file(path or OFFICIAL_SOURCES_CONFIG)
+
+
+def sync_official_source_registry(registry):
+    timestamp = now()
+    registry_version = json.loads(OFFICIAL_SOURCES_CONFIG.read_text(encoding="utf-8")).get(
+        "registry_version", "unversioned"
+    ) if OFFICIAL_SOURCES_CONFIG.exists() else "unversioned"
+    with connect() as connection:
+        for authority in registry.authorities:
+            connection.execute(
+                "INSERT INTO official_source_authorities(id,name,domain,authority_type,priority,document_types_json,"
+                "enabled,registry_version,synced_at) VALUES(?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(id) DO UPDATE SET name=excluded.name,domain=excluded.domain,"
+                "authority_type=excluded.authority_type,priority=excluded.priority,"
+                "document_types_json=excluded.document_types_json,enabled=excluded.enabled,"
+                "registry_version=excluded.registry_version,synced_at=excluded.synced_at",
+                (
+                    authority.id, authority.name, authority.domain, authority.authority_type, authority.priority,
+                    json.dumps(authority.document_types), int(authority.enabled), registry_version, timestamp,
+                ),
+            )
 
 
 def workspace_identity():
@@ -955,6 +990,37 @@ def fetch_public_url(url):
                 content_type = response.headers.get_content_type()
                 charset = response.headers.get_content_charset() or "utf-8"
             return body.decode(charset, errors="replace"), content_type, final_url
+        except (URLError, TimeoutError):
+            if attempt:
+                raise
+
+
+def fetch_public_resource(url):
+    """Fetch an evidence document as bytes with the same SSRF and redirect policy."""
+    _validate_public_url(url)
+    request = Request(
+        url,
+        headers={
+            "User-Agent": USER_AGENT,
+            "Accept": "text/html, application/xhtml+xml, application/pdf;q=0.95",
+        },
+    )
+    for attempt in range(2):
+        try:
+            with build_opener(SafeRedirectHandler).open(request, timeout=15) as response:
+                final_url = response.geturl()
+                _validate_public_url(final_url)
+                length = response.headers.get("Content-Length")
+                if length and int(length) > MAX_EVIDENCE_DOCUMENT_BYTES:
+                    raise ValueError("evidence document is too large")
+                body = response.read(MAX_EVIDENCE_DOCUMENT_BYTES + 1)
+                if len(body) > MAX_EVIDENCE_DOCUMENT_BYTES:
+                    raise ValueError("evidence document is too large")
+                return RetrievedResponse(
+                    requested_url=url, final_url=final_url, status=getattr(response, "status", 200),
+                    content_type=response.headers.get("Content-Type") or "application/octet-stream",
+                    body=body, headers={key: value for key, value in response.headers.items()},
+                )
         except (URLError, TimeoutError):
             if attempt:
                 raise
@@ -1969,7 +2035,15 @@ def verification_evidence_version(event_id, research_run_id):
             (row["canonical_url"], row["content_hash"])
             for row in connection.execute("SELECT canonical_url,content_hash FROM signals WHERE event_id=?", (event_id,))
         ]
-    material = sorted(set(research + later + signals))
+        acquired = [
+            (row["canonical_url"] or row["final_url"], row["checksum_sha256"])
+            for row in connection.execute(
+                "SELECT sc.canonical_url,sc.final_url,sc.checksum_sha256 FROM source_candidates sc "
+                "JOIN source_acquisition_runs sa ON sa.id=sc.acquisition_run_id "
+                "WHERE sa.event_id=? AND sc.state='RETRIEVED'", (event_id,),
+            )
+        ]
+    material = sorted(set(research + later + signals + acquired))
     return hashlib.sha256(json.dumps(material).encode()).hexdigest()
 
 
@@ -2077,6 +2151,7 @@ def enqueue_verification(research_run_id, provider_name="grok", *, background=Tr
         )
         row = connection.execute("SELECT * FROM verification_runs WHERE id=?", (run_id,)).fetchone()
         connection.commit()
+    plan_source_acquisition(run_id)
     if background:
         VERIFICATION_EXECUTOR.submit(run_verification_job, run_id, provider)
     else:
@@ -2188,6 +2263,297 @@ def _verification_gap_bundle(connection, run, versions):
         "official_source_hints": official_hints,
         "test_leads": test_payload.get("test_leads") or [],
     }
+
+
+def plan_source_acquisition(verification_run_id):
+    """Persist a provider-neutral discovery plan without performing any search."""
+    registry = load_official_source_registry()
+    timestamp = now()
+    acquisition_id = "SA-" + uuid.uuid4().hex[:12].upper()
+    with connect() as connection:
+        run = connection.execute(
+            "SELECT * FROM verification_runs WHERE id=?", (verification_run_id,)
+        ).fetchone()
+        if run is None:
+            raise KeyError(verification_run_id)
+        existing = connection.execute(
+            "SELECT * FROM source_acquisition_runs WHERE verification_run_id=? "
+            "AND trigger_kind='PLANNED_DISCOVERY' ORDER BY started_at DESC LIMIT 1",
+            (verification_run_id,),
+        ).fetchone()
+        if existing:
+            return dict(existing)
+        versions = _ensure_claim_versions(connection, run["research_run_id"])
+        evidence_text = "\n".join(
+            row["text"] for row in connection.execute(
+                "SELECT text FROM evidence_snapshots WHERE run_id=? ORDER BY id", (run["research_run_id"],)
+            )
+        )
+        event = connection.execute("SELECT title FROM events WHERE id=?", (run["event_id"],)).fetchone()
+        plan = build_discovery_plan(
+            event["title"],
+            [{"claim_id": item["id"], "text": item["text"]} for item in versions],
+            evidence_text,
+            registry,
+        )
+        connection.execute(
+            "INSERT INTO source_acquisition_runs(id,event_id,verification_run_id,trigger_kind,status,provider,"
+            "started_at,search_cost_status,retrieval_cost_status,llm_cost_status) "
+            "VALUES(?,?,?,'PLANNED_DISCOVERY','PLANNED','provider-neutral',?,'unknown','not_billed','not_billed')",
+            (acquisition_id, run["event_id"], verification_run_id, timestamp),
+        )
+        for query in plan:
+            connection.execute(
+                "INSERT INTO source_discovery_attempts(id,acquisition_run_id,strategy,query_text,domains_json,"
+                "target_claim_ids_json,provider,status,cost_status,attempted_at) VALUES(?,?,?,?,?,?,?,'PLANNED','unknown',?)",
+                (
+                    "SD-" + uuid.uuid4().hex[:12].upper(), acquisition_id, query.strategy, query.query,
+                    json.dumps(query.domains), json.dumps(query.target_claim_ids), "unassigned", timestamp,
+                ),
+            )
+        return dict(connection.execute("SELECT * FROM source_acquisition_runs WHERE id=?", (acquisition_id,)).fetchone())
+
+
+def _acquisition_claim_versions(connection, verification_run_id, requested_claim_ids=None):
+    requested = set(requested_claim_ids or [])
+    rows = [dict(row) for row in connection.execute(
+        "SELECT cv.*,vrc.required_for_event FROM verification_run_claims vrc "
+        "JOIN claim_versions cv ON cv.id=vrc.claim_version_id WHERE vrc.verification_run_id=? "
+        "ORDER BY vrc.required_for_event DESC,cv.id", (verification_run_id,),
+    )]
+    if not rows:
+        run = connection.execute("SELECT research_run_id FROM verification_runs WHERE id=?", (verification_run_id,)).fetchone()
+        rows = _ensure_claim_versions(connection, run["research_run_id"])
+    if requested:
+        rows = [row for row in rows if row["id"] in requested or row["claim_id"] in requested]
+    if not rows:
+        raise ValueError("no claim in this verification run matches the requested claim IDs")
+    return rows
+
+
+def _independent_acquisition_domains():
+    return tuple(
+        _normalized_host(item["url"])
+        for item in _verification_source_entries()
+        if item.get("source_class") == "independent_reporting"
+    )
+
+
+def _persist_unavailable_candidate(connection, acquisition_id, attempt_id, url, error):
+    candidate_id = "SC-" + uuid.uuid4().hex[:12].upper()
+    reason = str(error)[:500]
+    connection.execute(
+        "INSERT INTO source_candidates(id,acquisition_run_id,discovery_attempt_id,original_url,source_class,"
+        "classification_reason,state,state_reason,created_at) VALUES(?,?,?,?,?,'Retrieval did not produce classifiable content.',"
+        "'UNAVAILABLE',?,?)",
+        (candidate_id, acquisition_id, attempt_id, url, "UNKNOWN", reason, now()),
+    )
+    return candidate_id
+
+
+def add_evidence_url(verification_run_id, url, claim_ids=None, *, transport=None, pdf_extractor=None):
+    """Retrieve and stage a human-supplied URL; never mutate adjudication state."""
+    _validate_public_url(url)
+    registry = load_official_source_registry()
+    timestamp = now()
+    acquisition_id = "SA-" + uuid.uuid4().hex[:12].upper()
+    attempt_id = "SD-" + uuid.uuid4().hex[:12].upper()
+    with connect() as connection:
+        run = connection.execute("SELECT * FROM verification_runs WHERE id=?", (verification_run_id,)).fetchone()
+        if run is None:
+            raise KeyError(verification_run_id)
+        versions = _acquisition_claim_versions(connection, verification_run_id, claim_ids)
+        connection.execute(
+            "INSERT INTO source_acquisition_runs(id,event_id,verification_run_id,trigger_kind,status,provider,"
+            "started_at,search_provider_calls,direct_http_retrievals,llm_adjudication_calls,search_cost_status,"
+            "retrieval_cost_status,llm_cost_status) VALUES(?,?,?,'MANUAL_URL','RUNNING','manual',?,0,0,0,"
+            "'not_billed','not_billed','not_billed')",
+            (acquisition_id, run["event_id"], verification_run_id, timestamp),
+        )
+        connection.execute(
+            "INSERT INTO source_discovery_attempts(id,acquisition_run_id,strategy,query_text,domains_json,"
+            "target_claim_ids_json,provider,status,cost_status,attempted_at) VALUES(?,?,? ,?,'[]',?,'manual',"
+            "'COMPLETED','not_billed',?)",
+            (attempt_id, acquisition_id, "MANUAL_URL", url, json.dumps([item["id"] for item in versions]), timestamp),
+        )
+
+    retriever = SourceRetriever(
+        transport or fetch_public_resource, pdf_extractor=pdf_extractor, url_validator=_validate_public_url,
+    )
+    queue = [(url, attempt_id)]
+    queued = {canonicalize_url(url)}
+    retrieved = []
+    direct_attempt_id = None
+    retrieval_count = 0
+    while queue and retrieval_count < 6:
+        candidate_url, candidate_attempt = queue.pop(0)
+        retrieval_count += 1
+        try:
+            document = retriever.retrieve(candidate_url)
+            source_class, classification_reason = classify_source(
+                document, registry, independent_domains=_independent_acquisition_domains(),
+            )
+            authority = registry.match(document.final_url)
+            candidate_id = "SC-" + uuid.uuid4().hex[:12].upper()
+            candidate = {
+                "id": candidate_id, "original_url": candidate_url, "final_url": document.final_url,
+                "canonical_url": document.metadata.get("canonical_url") or document.final_url,
+                "title": document.title, "publication_date": document.publication_date,
+                "publisher": document.publisher, "text": document.text, "pages": list(document.pages),
+                "document_type": document.document_type, "source_class": source_class,
+                "classification_reason": classification_reason, "authority": authority.name if authority else None,
+            }
+            with connect() as connection:
+                previous = [dict(row) for row in connection.execute(
+                    "SELECT sc.id,sc.final_url,sc.extracted_text AS text,sc.source_class,"
+                    "sc.evidence_family_id AS family_id "
+                    "FROM source_candidates sc JOIN source_acquisition_runs sa ON sa.id=sc.acquisition_run_id "
+                    "WHERE sa.event_id=(SELECT event_id FROM source_acquisition_runs WHERE id=?) "
+                    "AND sc.state='RETRIEVED' ORDER BY sc.created_at,sc.id", (acquisition_id,),
+                )]
+                family_id, family_reason, relationship, similarity_score = family_for_candidate(candidate, previous)
+                candidate["family_id"] = family_id
+                connection.execute(
+                    "INSERT INTO source_candidates(id,acquisition_run_id,discovery_attempt_id,original_url,final_url,"
+                    "canonical_url,http_status,content_type,title,publication_date,publisher,retrieved_at,checksum_sha256,"
+                    "extracted_text,document_type,metadata_json,source_class,classification_reason,authority_id,"
+                    "evidence_family_id,family_reason,state,state_reason,created_at) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'RETRIEVED','Retrieved and staged for adjudication.',?)",
+                    (
+                        candidate_id, acquisition_id, candidate_attempt, candidate_url, document.final_url,
+                        candidate["canonical_url"], document.status, document.content_type, document.title,
+                        document.publication_date, document.publisher, document.retrieved_at, document.checksum,
+                        document.text, document.document_type, json.dumps(document.metadata, ensure_ascii=False),
+                        source_class, classification_reason, authority.id if authority else None, family_id,
+                        family_reason, timestamp,
+                    ),
+                )
+                compared = next((item for item in previous if item["family_id"] == family_id), None)
+                connection.execute(
+                    "INSERT INTO source_candidate_family_assessments(id,acquisition_run_id,candidate_id,"
+                    "compared_candidate_id,relationship,reason,text_similarity,assessed_at) VALUES(?,?,?,?,?,?,?,?)",
+                    (
+                        "SF-" + uuid.uuid4().hex[:12].upper(), acquisition_id, candidate_id,
+                        compared["id"] if compared else None, relationship, family_reason, similarity_score, now(),
+                    ),
+                )
+                for page in document.pages:
+                    connection.execute(
+                        "INSERT INTO source_candidate_pages(candidate_id,page_number,text,text_checksum_sha256) "
+                        "VALUES(?,?,?,?)",
+                        (candidate_id, page["page"], page["text"], hashlib.sha256(page["text"].encode()).hexdigest()),
+                    )
+                for row in match_claims(
+                    [{"claim_id": item["id"], "text": item["text"]} for item in versions], candidate,
+                ):
+                    connection.execute(
+                        "INSERT INTO claim_source_candidates(claim_version_id,candidate_id,relationship,match_score,"
+                        "matched_passage,page_number,reason,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                        (
+                            row["claim_id"], candidate_id, row["relationship"], row["match_score"],
+                            row["matched_passage"], row["page_number"], row["reason"], now(),
+                        ),
+                    )
+            retrieved.append(candidate)
+            if document.direct_document_urls and direct_attempt_id is None:
+                direct_attempt_id = "SD-" + uuid.uuid4().hex[:12].upper()
+                with connect() as connection:
+                    connection.execute(
+                        "INSERT INTO source_discovery_attempts(id,acquisition_run_id,strategy,query_text,domains_json,"
+                        "target_claim_ids_json,provider,status,cost_status,attempted_at,completed_at) "
+                        "VALUES(?,?,?,'Direct document links extracted from retrieved HTML','[]',?,'deterministic-link-extractor',"
+                        "'COMPLETED','not_billed',?,?)",
+                        (direct_attempt_id, acquisition_id, "F_DIRECT_DOCUMENT_LINK",
+                         json.dumps([item["id"] for item in versions]), now(), now()),
+                    )
+            for direct_url in document.direct_document_urls[:5]:
+                try:
+                    canonical = canonicalize_url(direct_url)
+                    _validate_public_url(direct_url)
+                except ValueError:
+                    continue
+                if canonical not in queued:
+                    queued.add(canonical)
+                    queue.append((direct_url, direct_attempt_id))
+        except Exception as error:
+            if isinstance(error, (sqlite3.Error, KeyError, TypeError, AssertionError)):
+                raise
+            with connect() as connection:
+                _persist_unavailable_candidate(connection, acquisition_id, candidate_attempt, candidate_url, error)
+
+    with connect() as connection:
+        candidates = [dict(row) for row in connection.execute(
+            "SELECT *,extracted_text AS text,evidence_family_id AS family_id FROM source_candidates "
+            "WHERE acquisition_run_id=? AND state='RETRIEVED' ORDER BY created_at,id", (acquisition_id,),
+        )]
+        for candidate in candidates:
+            candidate["pages"] = [dict(row) for row in connection.execute(
+                "SELECT page_number AS page,text FROM source_candidate_pages WHERE candidate_id=? ORDER BY page_number",
+                (candidate["id"],),
+            )]
+        matrix = [dict(row) for row in connection.execute(
+            "SELECT claim_version_id AS claim_id,candidate_id,relationship,match_score,matched_passage,page_number,reason "
+            "FROM claim_source_candidates WHERE candidate_id IN "
+            "(SELECT id FROM source_candidates WHERE acquisition_run_id=?)", (acquisition_id,),
+        )]
+        packets = []
+        for version in versions:
+            packet = build_evidence_packet(
+                {"claim_id": version["id"], "text": version["text"]}, matrix, candidates,
+            )
+            packet_id = "EP-" + uuid.uuid4().hex[:12].upper()
+            payload = json.dumps(packet, ensure_ascii=False, sort_keys=True)
+            connection.execute(
+                "INSERT INTO acquisition_evidence_packets(id,acquisition_run_id,claim_version_id,packet_json,packet_hash,"
+                "official_primary_found,independent_family_count,deterministically_sufficient,created_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?)",
+                (
+                    packet_id, acquisition_id, version["id"], payload, hashlib.sha256(payload.encode()).hexdigest(),
+                    int(packet["official_primary_found"]), packet["independent_family_count"],
+                    int(packet["deterministically_sufficient"]), now(),
+                ),
+            )
+            packets.append({"id": packet_id, **packet})
+        unavailable = connection.execute(
+            "SELECT COUNT(*) FROM source_candidates WHERE acquisition_run_id=? AND state='UNAVAILABLE'",
+            (acquisition_id,),
+        ).fetchone()[0]
+        status = "COMPLETED" if candidates and not unavailable else "PARTIAL" if candidates else "FAILED"
+        connection.execute(
+            "UPDATE source_acquisition_runs SET status=?,completed_at=?,direct_http_retrievals=?,error_message=? WHERE id=?",
+            (status, now(), retrieval_count, "One or more pages were unavailable." if unavailable else None, acquisition_id),
+        )
+        return {
+            "run": dict(connection.execute("SELECT * FROM source_acquisition_runs WHERE id=?", (acquisition_id,)).fetchone()),
+            "candidates": [dict(row) for row in connection.execute(
+                "SELECT * FROM source_candidates WHERE acquisition_run_id=? ORDER BY created_at,id", (acquisition_id,),
+            )],
+            "packets": packets, "adjudication_changed": False,
+        }
+
+
+def _snapshot_acquired_candidates(connection, run):
+    rows = connection.execute(
+        "SELECT DISTINCT sc.* FROM source_candidates sc "
+        "JOIN source_acquisition_runs sa ON sa.id=sc.acquisition_run_id "
+        "JOIN claim_source_candidates csc ON csc.candidate_id=sc.id "
+        "JOIN verification_run_claims vrc ON vrc.claim_version_id=csc.claim_version_id "
+        "WHERE sa.event_id=? AND vrc.verification_run_id=? AND sc.state='RETRIEVED' "
+        "AND sc.source_class IN ('OFFICIAL_PRIMARY','INDEPENDENT_REPORTING') "
+        "AND csc.relationship='CANDIDATE' ORDER BY sc.retrieved_at,sc.id",
+        (run["event_id"], run["id"]),
+    ).fetchall()
+    snapshots = []
+    for row in rows:
+        snapshots.append(_insert_verification_snapshot(connection, run["id"], {
+            "signal_id": None, "source_name": row["publisher"] or _normalized_host(row["final_url"]),
+            "source_class": "official_primary" if row["source_class"] == "OFFICIAL_PRIMARY" else "independent_reporting",
+            "url": row["original_url"], "canonical_url": row["canonical_url"] or row["final_url"],
+            "title": row["title"] or row["final_url"], "text": row["extracted_text"],
+            "content_hash": row["checksum_sha256"], "publication_time": row["publication_date"],
+            "stated_event_time": None, "author": None,
+        }, "corroboration", row["id"]))
+    return snapshots
 
 
 def _regroup_evidence_families(connection, run_id):
@@ -2772,13 +3138,32 @@ def run_verification_job(run_id, provider=None):
                     "VALUES(?,?,?)", (run_id, version["id"], version["required_for_event"]),
                 )
             snapshots = _snapshot_research_evidence(connection, run)
+            acquired_snapshots = _snapshot_acquired_candidates(connection, run)
             gap_bundle = _verification_gap_bundle(connection, run, versions)
             _verification_checkpoint(connection, run_id, "PRIMARY_EVIDENCE_EXTRACTION", "COMPLETED", {
                 "snapshot_ids": [item["id"] for item in snapshots], "claim_version_ids": [item["id"] for item in versions],
                 "official_source_hints": gap_bundle["official_source_hints"],
+                "acquired_candidate_snapshot_ids": [item["id"] for item in acquired_snapshots],
             })
         else:
             gap_bundle = _verification_gap_bundle(connection, run, versions)
+        acquired_count = connection.execute(
+            "SELECT COUNT(DISTINCT sc.id) FROM source_candidates sc "
+            "JOIN source_acquisition_runs sa ON sa.id=sc.acquisition_run_id "
+            "JOIN claim_source_candidates csc ON csc.candidate_id=sc.id "
+            "JOIN verification_run_claims vrc ON vrc.claim_version_id=csc.claim_version_id "
+            "WHERE sa.event_id=? AND vrc.verification_run_id=? AND sc.state='RETRIEVED' "
+            "AND csc.relationship='CANDIDATE'", (run["event_id"], run_id),
+        ).fetchone()[0]
+        deterministic_evidence_sufficient = False
+        if acquired_count:
+            _regroup_evidence_families(connection, run_id)
+            pre_search_analysis = _claim_analysis_payload(connection, run, versions)
+            required_ids = {item["id"] for item in versions if item["required_for_event"]}
+            deterministic_evidence_sufficient = bool(required_ids) and all(
+                item["decision"] == "SUPPORTED"
+                for item in pre_search_analysis["claims"] if item["claim_version_id"] in required_ids
+            )
         connection.execute(
             "UPDATE verification_runs SET current_phase='CORROBORATION_DISCOVERY',progress=25,"
             "progress_message='Seeking targeted corroboration' WHERE id=?", (run_id,),
@@ -2791,6 +3176,16 @@ def run_verification_job(run_id, provider=None):
     provider_failure = None
     if discovery_checkpoint:
         result = VerificationProviderResult(result=discovery_checkpoint["payload"]["provider_result"])
+    elif deterministic_evidence_sufficient:
+        result = VerificationProviderResult(result={
+            "search_summary": "Paid provider search skipped: staged deterministic evidence already met the unchanged policy routing condition.",
+            "unresolved_gaps": [], "leads": [],
+        }, actual_search_calls=0, actual_open_calls=0, actual_sources_returned=0)
+        with connect() as connection:
+            _verification_checkpoint(connection, run_id, "CORROBORATION_DISCOVERY", "COMPLETED", {
+                "provider_result": result.result, "provider_search_skipped": True,
+                "reason": "DETERMINISTIC_EVIDENCE_SUFFICIENT",
+            })
     elif run["mode"] == "live" and not domains:
         provider_failure = ("verification_error", "no verified corroboration domains are registered")
         result = VerificationProviderResult(result={"search_summary": provider_failure[1], "unresolved_gaps": gap_bundle["gaps"], "leads": []})
@@ -5606,6 +6001,45 @@ def event_room(event_id):
                 "SELECT * FROM verification_run_status_history WHERE run_id=? ORDER BY changed_at,id",
                 (verification["id"],),
             )]
+        acquisition_runs = [dict(row) for row in connection.execute(
+            "SELECT * FROM source_acquisition_runs WHERE event_id=? ORDER BY started_at DESC,id DESC", (event_id,)
+        )]
+        for acquisition in acquisition_runs:
+            acquisition["attempts"] = [dict(row) for row in connection.execute(
+                "SELECT * FROM source_discovery_attempts WHERE acquisition_run_id=? ORDER BY attempted_at,id",
+                (acquisition["id"],),
+            )]
+            for attempt in acquisition["attempts"]:
+                attempt["domains"] = json.loads(attempt.pop("domains_json") or "[]")
+                attempt["target_claim_ids"] = json.loads(attempt.pop("target_claim_ids_json") or "[]")
+            acquisition["candidates"] = [dict(row) for row in connection.execute(
+                "SELECT * FROM source_candidates WHERE acquisition_run_id=? ORDER BY created_at,id",
+                (acquisition["id"],),
+            )]
+            for candidate in acquisition["candidates"]:
+                candidate["metadata"] = json.loads(candidate.pop("metadata_json") or "{}")
+                candidate.pop("extracted_text", None)
+                candidate["pages"] = [dict(row) for row in connection.execute(
+                    "SELECT page_number,text_checksum_sha256 FROM source_candidate_pages "
+                    "WHERE candidate_id=? ORDER BY page_number", (candidate["id"],),
+                )]
+                candidate["claim_matches"] = [dict(row) for row in connection.execute(
+                    "SELECT csc.*,cv.claim_id,cv.text AS claim_text FROM claim_source_candidates csc "
+                    "JOIN claim_versions cv ON cv.id=csc.claim_version_id WHERE csc.candidate_id=? "
+                    "ORDER BY cv.claim_id", (candidate["id"],),
+                )]
+            acquisition["packets"] = [dict(row) for row in connection.execute(
+                "SELECT aep.*,cv.claim_id,cv.text AS claim_text FROM acquisition_evidence_packets aep "
+                "JOIN claim_versions cv ON cv.id=aep.claim_version_id WHERE aep.acquisition_run_id=? "
+                "ORDER BY cv.claim_id", (acquisition["id"],),
+            )]
+            for packet in acquisition["packets"]:
+                packet["packet"] = json.loads(packet.pop("packet_json") or "{}")
+        official_source_registry = [dict(row) for row in connection.execute(
+            "SELECT * FROM official_source_authorities ORDER BY priority,name"
+        )]
+        for authority in official_source_registry:
+            authority["document_types"] = json.loads(authority.pop("document_types_json") or "[]")
         approved_sets = [dict(row) for row in connection.execute(
             "SELECT acs.*,COUNT(acsi.claim_version_id) AS approved_claim_count "
             "FROM approved_claim_sets acs LEFT JOIN approved_claim_set_items acsi ON acsi.claim_set_id=acs.id "
@@ -5807,6 +6241,7 @@ def event_room(event_id):
     return {
         "event": dict(event), "signals": signals, "claims": claims, "runs": runs,
         "verification_runs": verification_runs, "approved_claim_sets": approved_sets,
+        "source_acquisition_runs": acquisition_runs, "official_source_registry": official_source_registry,
         "content_decision_runs": content_runs, "media_assets": media_assets,
         "publishing_history": publishing,
         "production_jobs": production_jobs, "production_gate": production_gate,
@@ -6031,6 +6466,11 @@ class Handler(SimpleHTTPRequestHandler):
             if match:
                 result = resume_verification(match.group(1), background=True)
                 self.send_json(result, 202)
+                return
+            match = re.fullmatch(r"/api/verification/([^/]+)/evidence-url", path)
+            if match:
+                result = add_evidence_url(match.group(1), body["url"], body.get("claim_ids"))
+                self.send_json(result, 201)
                 return
             match = re.fullmatch(r"/api/events/([^/]+)/content-decision", path)
             if match:
