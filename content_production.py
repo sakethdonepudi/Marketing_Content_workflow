@@ -354,15 +354,58 @@ def production_provider_for(name):
 
 
 _BLOCK_KEYS = {"text", "claim_version_ids"}
+GROUNDING_VALIDATOR_VERSION = "production-grounding-v3"
 _FACTUAL_TERMS = re.compile(
-    r"\b(approved|announced|allocated|funded|launched|completed|delivered|inaugurated|said|reported|"
-    r"will|has|have|is|are|was|were|government|minister|project|scheme|crore|lakh|percent)\b", re.I
+    r"\b(approved|announced|allocated|funded|launched|completed|delivered|inaugurated|permitted|allowed|"
+    r"said|reported|will|has|have|is|are|was|were|government|minister|project|scheme|crore|lakh|percent)\b", re.I
 )
-_NUMERIC = re.compile(r"(?:₹|\$)?\b\d[\d,]*(?:\.\d+)?(?:%|\s*(?:crore|lakh|million|billion|km|MW))?\b", re.I)
+_NUMERIC = re.compile(
+    r"(?:₹|\$)?\b\d[\d,]*(?:\.\d+)?(?:\s*[-:x×]\s*\d[\d,]*(?:\.\d+)?)?"
+    r"(?:%|\s*(?:crore|lakh|million|billion|km|MW))?\b", re.I
+)
+_TECHNICAL_PARAMETER = re.compile(
+    r"^(?:\d+\s*:\s*\d+|\d+\s*[x×]\s*\d+|PNG|JPE?G|WEBP|MP4|IMAGE|VIDEO|REEL|STORY|CAROUSEL)$", re.I
+)
 _QUOTE = re.compile(r"[\"“]([^\"”]{2,})[\"”]")
 _ENTITY = re.compile(r"\b(?:[A-Z][A-Za-z.'-]+\s+){1,4}[A-Z][A-Za-z.'-]+\b")
-_WORDS = re.compile(r"[A-Za-z][A-Za-z'-]+")
-_STOP = {"the", "a", "an", "and", "or", "to", "of", "in", "on", "for", "with", "by", "as", "at", "from", "this", "that"}
+_WORDS = re.compile(r"[A-Za-z][A-Za-z'-]+|\d+(?:[-:]\d+)?")
+_STOP = {
+    "the", "a", "an", "and", "or", "to", "of", "in", "on", "for", "with", "by", "as", "at", "from",
+    "this", "that", "during", "all", "both", "now", "can", "has", "have", "is", "are", "was", "were",
+}
+_WORD_ALIASES = {
+    "allows": "permit", "allowed": "permit", "allowing": "permit", "allow": "permit",
+    "approves": "permit", "approved": "permit", "approval": "permit",
+    "permits": "permit", "permitted": "permit", "permission": "permit",
+    "produces": "produce", "produced": "produce", "production": "produce",
+    "selling": "sell", "sold": "sell", "sale": "sell",
+    "growers": "grower", "platforms": "platform", "seasons": "season",
+    "authorised": "authorize", "authorized": "authorize", "authorises": "authorize", "authorizes": "authorize",
+    "government's": "government", "governments": "government", "govt": "government",
+    "notifications": "notification", "leaves": "leaf",
+}
+_EDITORIAL_GENERIC = {
+    "source", "update", "news", "headline", "image", "visual", "illustration", "graphic", "photo", "photograph",
+    "wide", "close-up", "shot", "view", "depicting", "shows", "showing",
+}
+_VISUAL_STYLE = {
+    "neutral", "editorial", "clean", "minimalist", "soft", "natural", "lighting", "light", "warm", "cool", "tone",
+    "tones", "palette", "colour", "color", "golden", "amber", "brown", "earthy", "high-quality", "serene", "calm",
+    "restrained", "composition", "aesthetic", "style", "texture", "background", "foreground", "depth", "field",
+    "arranged", "neat", "bundle", "bundles", "featuring", "emphasising", "emphasizing", "related", "scene", "scenery",
+    "no", "without", "avoid", "must", "not", "suggest", "imply", "visible", "specific", "identifiable",
+}
+_VISUAL_NEUTRAL = {
+    "agricultural", "agriculture", "environment", "landscape", "warehouse", "building", "exterior", "document",
+    "diagram", "map", "process", "object", "rural", "infrastructure", "leaf", "crop", "auction", "platform",
+}
+_VISUAL_EVENT = re.compile(
+    r"\b(protest(?:ing|ers?)?|rally|riot|clash|celebrat(?:e|ing|ion)|addressing|meeting|handing|receiving|"
+    r"arrest(?:ed|ing)?|injur(?:ed|y)|killed|thousands|millions|crowd(?:ed|s)?|outside parliament)\b", re.I
+)
+_SENSATIONAL = re.compile(r"\b(huge win|shock decision|government caves in|bombshell|stunning victory)\b", re.I)
+_SOURCE_ATTRIBUTION = re.compile(r"(?:^|\n)\s*(?:source\s*:\s*|according to\s+)([^\n.!?]+)", re.I)
+_EDITORIAL_META = re.compile(r"\b(approved claim|based only on|without adding|without strengthening|public-information explanation)\b", re.I)
 
 
 def _schema_errors(package):
@@ -420,58 +463,252 @@ def _schema_errors(package):
     return errors
 
 
-def _text_blocks(package):
+def _tokens(text):
+    normalized = re.sub(r"\bAndhra[\s-]+Pradesh\b", "andhra_pradesh", str(text), flags=re.I)
+    normalized = re.sub(r"\bA\.?\s*P\.?\b", "andhra_pradesh", normalized, flags=re.I)
+    normalized = re.sub(r"\b(?:Union|Central)\s+(?:Government|Govt|Centre)\b", "union_government", normalized, flags=re.I)
+    values = set()
+    for word in _WORDS.findall(normalized):
+        value = word.lower().strip(".'-")
+        value = _WORD_ALIASES.get(value, value)
+        if value not in _STOP and (len(value) > 2 or any(character.isdigit() for character in value)):
+            values.add(value)
+    return values
+
+
+def _canonical_number(value):
+    return re.sub(r"[\s,]", "", value.lower())
+
+
+def _source_key(value):
+    key = re.sub(r"[^a-z0-9]", "", value.lower())
+    aliases = {
+        "thenewindianexpress": "newindianexpress", "newindianexpress": "newindianexpress",
+        "tnie": "newindianexpress", "unioncommerceministry": "commerceministry",
+        "ministryofcommerce": "commerceministry", "commerceministry": "commerceministry",
+        "officialnotification": "officialnotification", "anofficialnotification": "officialnotification",
+    }
+    return aliases.get(key, key)
+
+
+def _supported_sources(locked_context, refs, claims):
+    supported = set()
+    for ref in refs:
+        attribution = claims.get(ref, {}).get("attribution")
+        if attribution:
+            supported.add(_source_key(attribution))
+    for item in locked_context.get("evidence_provenance", []):
+        if item.get("claim_version_id") in refs:
+            if item.get("source_name"):
+                supported.add(_source_key(item["source_name"]))
+            if item.get("source_class") == "official_primary":
+                supported.add("officialnotification")
+    combined = " ".join(claims[ref]["text"] for ref in refs if ref in claims)
+    if "notification" in combined.lower():
+        supported.add("officialnotification")
+    if "commerce ministry" in combined.lower():
+        supported.add("commerceministry")
+    return supported
+
+
+def _field_result(field, content_type, *, status="PASS", assertions=None, matched=None, unsupported=None, reason=""):
+    return {
+        "field": field,
+        "content_type": content_type,
+        "status": status,
+        "detected_factual_assertions": assertions or [],
+        "matched_approved_claim_ids": sorted(set(matched or [])),
+        "unsupported_assertions": unsupported or [],
+        "reason": reason or "No unsupported factual content detected.",
+    }
+
+
+def _candidate_assertions(text):
+    without_sources = _SOURCE_ATTRIBUTION.sub(" ", text)
+    return [item.strip(" -\n\t") for item in re.split(r"(?<=[.!?])\s+|\n+", without_sources) if item.strip(" -\n\t")]
+
+
+def _factual_result(field, text, refs, claims, locked_context, *, content_type="FACTUAL_CLAIM", strict=True):
+    assertions = _candidate_assertions(text)
+    matched = []
+    unsupported = []
+    reasons = []
+    combined = " ".join(claims[ref]["text"] for ref in refs if ref in claims)
+    claim_tokens = _tokens(combined)
+    claim_numbers = {_canonical_number(value) for value in _NUMERIC.findall(combined)}
+    unknown_refs = [ref for ref in refs if ref not in claims]
+    if unknown_refs:
+        message = f"{field} references unapproved claim versions: {', '.join(unknown_refs)}"
+        return _field_result(field, content_type, status="FLAG", assertions=assertions, unsupported=[message], reason=message)
+    if len(refs) != len(set(refs)):
+        message = f"{field} has invalid or duplicate claim references."
+        return _field_result(field, content_type, status="FLAG", assertions=assertions, unsupported=[message], reason=message)
+    if not str(text).strip():
+        message = f"{field} is empty."
+        return _field_result(field, content_type, status="FLAG", unsupported=[message], reason=message)
+    text_tokens = _tokens(text) - _EDITORIAL_GENERIC
+    factual = bool(assertions and not (not strict and _EDITORIAL_META.search(text)) and (
+        strict or _FACTUAL_TERMS.search(text) or _NUMERIC.search(text) or len(text_tokens & claim_tokens) >= 2
+    ))
+    if factual and not refs:
+        message = f"{field} contains factual language without an approved claim reference."
+        return _field_result(field, content_type, status="FLAG", assertions=assertions, unsupported=[message], reason=message)
+    for value in _NUMERIC.findall(text):
+        if _canonical_number(value) not in claim_numbers:
+            unsupported.append(f"{field} introduces unsupported numerical value {value!r}.")
+    for quote in _QUOTE.findall(text):
+        quoted_claim = any(quote.lower() in claims[ref]["text"].lower() and claims[ref]["claim_type"] == "quotation" for ref in refs)
+        if not quoted_claim:
+            unsupported.append(f"{field} introduces an unsupported quotation.")
+    if _SENSATIONAL.search(text):
+        unsupported.append(f"{field} introduces unsupported sensational framing.")
+    lowered = text.lower()
+    scopes = {claims[ref]["assertion_scope"].lower() for ref in refs}
+    if any(word in lowered for word in ("completed", "delivered", "inaugurated")) and not (
+        any(word in combined.lower() for word in ("completed", "delivered", "inaugurated"))
+        or scopes & {"outcome", "completed_work"}
+    ):
+        unsupported.append(f"{field} upgrades the approved claim to a completed outcome.")
+    for entity in _ENTITY.findall(_SOURCE_ATTRIBUTION.sub(" ", text)):
+        entity_tokens = _tokens(entity) - _EDITORIAL_GENERIC
+        if entity_tokens and not entity_tokens <= claim_tokens:
+            unsupported.append(f"{field} introduces unsupported entity {entity!r}.")
+    for assertion in assertions:
+        assertion_tokens = _tokens(assertion) - _EDITORIAL_GENERIC
+        overlap = assertion_tokens & claim_tokens
+        if overlap:
+            matched.extend(ref for ref in refs if _tokens(claims[ref]["text"]) & assertion_tokens)
+        if factual and assertion_tokens and refs:
+            coverage = len(overlap) / len(assertion_tokens)
+            if not overlap or (coverage < 0.45 and len(assertion_tokens - claim_tokens) >= 3):
+                unsupported.append(f"{field} assertion is not semantically supported: {assertion!r}.")
+    attribution_values = [value.strip() for value in _SOURCE_ATTRIBUTION.findall(text)]
+    if attribution_values:
+        supported_sources = _supported_sources(locked_context, refs, claims)
+        for value in attribution_values:
+            if _source_key(value) not in supported_sources:
+                unsupported.append(f"{field} introduces unsupported source attribution {value!r}.")
+    if unsupported:
+        reasons.extend(dict.fromkeys(unsupported))
+        return _field_result(
+            field, content_type, status="FLAG", assertions=assertions, matched=matched,
+            unsupported=list(dict.fromkeys(unsupported)), reason=" ".join(reasons),
+        )
+    return _field_result(field, content_type, assertions=assertions, matched=matched or refs, reason="Factual meaning is supported by the cited approved claims.")
+
+
+def _visual_result(field, text, refs, claims):
+    unsupported = []
+    claim_tokens = set().union(*(_tokens(claims[ref]["text"]) for ref in refs if ref in claims)) if refs else set()
+    combined = " ".join(claims[ref]["text"] for ref in refs if ref in claims)
+    claim_numbers = {_canonical_number(value) for value in _NUMERIC.findall(combined)}
+    if not isinstance(text, str) or not text.strip():
+        unsupported.append(f"{field} is empty.")
+    for value in _NUMERIC.findall(text or ""):
+        if not _TECHNICAL_PARAMETER.fullmatch(value.strip()) and _canonical_number(value) not in claim_numbers:
+            unsupported.append(f"{field} introduces unsupported numerical value {value!r}.")
+    if _QUOTE.search(text or ""):
+        unsupported.append(f"{field} must not contain quotations.")
+    if _VISUAL_EVENT.search(text) and not (_tokens(text) & claim_tokens & {"protest", "rally", "crowd"}):
+        unsupported.append(f"{field} introduces an unsupported depicted event.")
+    for entity in _ENTITY.findall(text):
+        entity_tokens = _tokens(entity) - _VISUAL_STYLE - _VISUAL_NEUTRAL - _EDITORIAL_GENERIC
+        if entity_tokens and not entity_tokens <= claim_tokens:
+            unsupported.append(f"{field} introduces unsupported entity {entity!r} in a visual instruction.")
+    if unsupported:
+        return _field_result(
+            field, "VISUAL_INSTRUCTION", status="FLAG", matched=refs,
+            unsupported=list(dict.fromkeys(unsupported)), reason=" ".join(dict.fromkeys(unsupported)),
+        )
+    return _field_result(
+        field, "VISUAL_INSTRUCTION", matched=refs,
+        reason="Neutral production direction; it makes no unsupported factual assertion.",
+    )
+
+
+def _source_results(field, text, refs, claims, locked_context):
+    results = []
+    supported = _supported_sources(locked_context, refs, claims)
+    for index, value in enumerate(_SOURCE_ATTRIBUTION.findall(text)):
+        source = value.strip()
+        is_supported = _source_key(source) in supported
+        message = (
+            "Source attribution is supported by claim/evidence provenance."
+            if is_supported else f"{field} introduces unsupported source attribution {source!r}."
+        )
+        results.append(_field_result(
+            f"{field}.source_attribution[{index}]", "SOURCE_ATTRIBUTION",
+            status="PASS" if is_supported else "FLAG", matched=refs if is_supported else [],
+            unsupported=[] if is_supported else [message], reason=message,
+        ))
+    return results
+
+
+def _package_field_results(package, claims, locked_context):
+    results = []
+    all_refs = sorted(claims)
+    for field in ("story_angle", "content_objective"):
+        results.append(_factual_result(
+            field, package.get(field, ""), all_refs, claims, locked_context,
+            content_type="EDITORIAL_COPY", strict=False,
+        ))
+    results.append(_field_result("format", "FORMAT_METADATA", reason="Package format is production metadata."))
     for key in ("headline", "hook", "caption"):
         block = package.get(key) or {}
-        yield key, block.get("text", ""), block.get("claim_version_ids", [])
+        refs = block.get("claim_version_ids", []) if isinstance(block, dict) else []
+        text = block.get("text", "") if isinstance(block, dict) else ""
+        results.append(_factual_result(key, text, refs, claims, locked_context, content_type="EDITORIAL_COPY"))
+        results.extend(_source_results(key, text, refs, claims, locked_context))
     for index, block in enumerate(package.get("script") or []):
-        yield f"script[{index}]", block.get("text", ""), block.get("claim_version_ids", [])
+        results.append(_factual_result(
+            f"script[{index}]", block.get("text", ""), block.get("claim_version_ids", []), claims, locked_context,
+        ))
     for index, block in enumerate(package.get("storyboard") or []):
         refs = block.get("claim_version_ids", [])
-        for field in ("narration", "on_screen_text", "visual_prompt"):
-            yield f"storyboard[{index}].{field}", block.get(field, ""), refs
+        results.append(_field_result(f"storyboard[{index}].scene_number", "TECHNICAL_PARAMETER", reason="Scene ordering is a technical parameter."))
+        results.append(_field_result(f"storyboard[{index}].duration_seconds", "TECHNICAL_PARAMETER", reason="Scene duration is a technical parameter."))
+        results.append(_factual_result(f"storyboard[{index}].narration", block.get("narration", ""), refs, claims, locked_context))
+        results.append(_factual_result(
+            f"storyboard[{index}].on_screen_text", block.get("on_screen_text", ""), refs, claims, locked_context,
+            content_type="EDITORIAL_COPY",
+        ))
+        results.append(_visual_result(f"storyboard[{index}].visual_prompt", block.get("visual_prompt", ""), refs, claims))
     thumbnail = package.get("thumbnail") or {}
-    for field in ("headline", "visual_prompt"):
-        yield f"thumbnail.{field}", thumbnail.get(field, ""), thumbnail.get("claim_version_ids", [])
+    thumb_refs = thumbnail.get("claim_version_ids", [])
+    results.append(_factual_result(
+        "thumbnail.headline", thumbnail.get("headline", ""), thumb_refs, claims, locked_context,
+        content_type="EDITORIAL_COPY",
+    ))
+    results.append(_visual_result("thumbnail.visual_prompt", thumbnail.get("visual_prompt", ""), thumb_refs, claims))
     metadata = package.get("platform_metadata") or {}
-    yield "platform_metadata.accessibility_text", metadata.get("accessibility_text", ""), metadata.get("accessibility_claim_version_ids", [])
-
-
-def _tokens(text):
-    return {word.lower() for word in _WORDS.findall(text) if word.lower() not in _STOP and len(word) > 2}
-
-
-def _media_brief_errors(package, claims):
-    """Visual directions carry no facts: no numbers, quotations, or entities beyond the approved claims."""
-    brief = package.get("media_brief")
-    if not isinstance(brief, dict):
-        return []
-    errors = []
-    expected = FORMAT_MEDIA_TYPES.get(package.get("format"))
-    if expected and brief.get("media_type") != expected:
-        errors.append(f"media_brief.media_type must be {expected} for {package.get('format')} packages.")
-    approved_text = " ".join(item["text"] for item in claims.values())
-    for field in ("visual_brief", "generation_prompt"):
-        text = brief.get(field)
-        if not isinstance(text, str) or not text.strip():
-            errors.append(f"media_brief.{field} is empty.")
-            continue
-        for value in _NUMERIC.findall(text):
-            if value.lower().replace(" ", "") not in approved_text.lower().replace(" ", ""):
-                errors.append(f"media_brief.{field} introduces unsupported numerical value {value!r}.")
-        if _QUOTE.search(text):
-            errors.append(f"media_brief.{field} must not contain quotations.")
-        for entity in _ENTITY.findall(text):
-            if entity not in approved_text:
-                errors.append(f"media_brief.{field} introduces unsupported entity {entity!r}.")
-    constraints = brief.get("negative_constraints")
-    if not isinstance(constraints, list) or not [item for item in constraints if isinstance(item, str) and item.strip()]:
-        errors.append("media_brief.negative_constraints must list at least one constraint.")
-    return errors
+    results.extend([
+        _field_result("platform_metadata.language", "FORMAT_METADATA", reason="Language is production metadata."),
+        _field_result("platform_metadata.duration_seconds", "TECHNICAL_PARAMETER", reason="Duration is a technical parameter."),
+        _field_result("platform_metadata.aspect_ratio", "TECHNICAL_PARAMETER", reason="Aspect ratio is a technical parameter."),
+    ])
+    results.append(_factual_result(
+        "platform_metadata.accessibility_text", metadata.get("accessibility_text", ""),
+        metadata.get("accessibility_claim_version_ids", []), claims, locked_context, content_type="EDITORIAL_COPY",
+    ))
+    for index, _ in enumerate(package.get("creative_notes") or []):
+        results.append(_field_result(f"creative_notes[{index}]", "EDITORIAL_COPY", reason="Internal editorial direction is not published as a factual claim."))
+    for index, _ in enumerate(package.get("non_factual_style_elements") or []):
+        results.append(_field_result(f"non_factual_style_elements[{index}]", "VISUAL_INSTRUCTION", reason="Explicitly non-factual style direction."))
+    brief = package.get("media_brief") or {}
+    results.append(_field_result("media_brief.media_type", "FORMAT_METADATA", reason="Media type is production metadata."))
+    results.append(_visual_result("media_brief.visual_brief", brief.get("visual_brief", ""), all_refs, claims))
+    results.append(_visual_result("media_brief.generation_prompt", brief.get("generation_prompt", ""), all_refs, claims))
+    for key in ("negative_constraints", "factual_constraints"):
+        for index, _ in enumerate(brief.get(key) or []):
+            results.append(_field_result(
+                f"media_brief.{key}[{index}]", "VISUAL_INSTRUCTION",
+                reason="A renderer constraint is an instruction, not a factual assertion.",
+            ))
+    return results
 
 
 def validate_production_package(package, locked_context):
-    """Fail-closed deterministic validation; returns a stable audit result."""
+    """Field-aware deterministic grounding validation with an auditable result per package field."""
     errors = _schema_errors(package)
     claims = {item["claim_version_id"]: item for item in locked_context["approved_claims"]}
     if package.get("format") != locked_context["content_decision"]["recommended_format"]:
@@ -483,54 +720,34 @@ def validate_production_package(package, locked_context):
         errors.append("Package duration does not match the approved Content CEO decision.")
     if package.get("format") == "IMAGE" and metadata.get("aspect_ratio") != CANONICAL_IMAGE_ASPECT_RATIO:
         errors.append(f"Image posts must use the canonical {CANONICAL_IMAGE_ASPECT_RATIO} aspect ratio.")
-    used = set()
-    for location, text, refs in _text_blocks(package):
-        if not isinstance(text, str) or not text.strip():
-            errors.append(f"{location} is empty.")
-            continue
-        if not isinstance(refs, list) or len(refs) != len(set(refs)):
-            errors.append(f"{location} has invalid or duplicate claim references.")
-            continue
-        unknown = [ref for ref in refs if ref not in claims]
-        if unknown:
-            errors.append(f"{location} references unapproved claim versions: {', '.join(unknown)}")
-            continue
-        combined = " ".join(claims[ref]["text"] for ref in refs)
-        factual = bool(_FACTUAL_TERMS.search(text) or _NUMERIC.search(text) or any(token in _tokens(text) for token in _tokens(combined)))
-        if factual and not refs:
-            errors.append(f"{location} contains factual language without an approved claim reference.")
-            continue
-        if not refs:
-            continue
-        used.update(refs)
-        overlap = _tokens(text) & _tokens(combined)
-        if factual and len(overlap) < max(1, min(3, len(_tokens(text)) // 4)):
-            errors.append(f"{location} is not textually supported by its cited approved claim versions.")
-        for value in _NUMERIC.findall(text):
-            if value.lower().replace(" ", "") not in combined.lower().replace(" ", ""):
-                errors.append(f"{location} introduces unsupported numerical value {value!r}.")
-        for quote in _QUOTE.findall(text):
-            quoted_claim = any(quote in claims[ref]["text"] and claims[ref]["claim_type"] == "quotation" for ref in refs)
-            if not quoted_claim:
-                errors.append(f"{location} introduces an unsupported quotation.")
-        for entity in _ENTITY.findall(text):
-            if entity not in combined and not entity.startswith(("Use ", "Keep ")):
-                errors.append(f"{location} introduces unsupported entity {entity!r}.")
-        lowered = text.lower()
-        scopes = {claims[ref]["assertion_scope"].lower() for ref in refs}
-        claim_text = combined.lower()
-        if any(word in lowered for word in ("completed", "delivered", "inaugurated")) and not (
-            any(word in claim_text for word in ("completed", "delivered", "inaugurated")) or scopes & {"outcome", "completed_work"}
-        ):
-            errors.append(f"{location} upgrades the approved claim to a completed outcome.")
-    errors.extend(_media_brief_errors(package, claims))
+    brief = package.get("media_brief") or {}
+    expected_media_type = FORMAT_MEDIA_TYPES.get(package.get("format"))
+    if expected_media_type and brief.get("media_type") != expected_media_type:
+        errors.append(f"media_brief.media_type must be {expected_media_type} for {package.get('format')} packages.")
+    if not [item for item in brief.get("negative_constraints", []) if isinstance(item, str) and item.strip()]:
+        errors.append("media_brief.negative_constraints must list at least one constraint.")
+    field_results = _package_field_results(package, claims, locked_context) if isinstance(package, dict) else []
+    errors.extend(
+        unsupported
+        for result in field_results if result["status"] == "FLAG"
+        for unsupported in result["unsupported_assertions"]
+    )
+    used = {
+        claim_id for result in field_results for claim_id in result["matched_approved_claim_ids"] if claim_id in claims
+    }
     if not used:
         errors.append("The package does not use any approved claim version.")
+    errors = list(dict.fromkeys(errors))
+    overall_status = "FAIL" if errors else (
+        "HUMAN_REVIEW" if any(result["status"] == "UNKNOWN" for result in field_results) else "PASS"
+    )
     result = {
-        "valid": not errors,
-        "errors": list(dict.fromkeys(errors)),
+        "valid": overall_status == "PASS",
+        "status": overall_status,
+        "errors": errors,
+        "field_results": field_results,
         "approved_claim_version_ids": sorted(claims),
         "used_claim_version_ids": sorted(used),
-        "validator_version": PROMPT_SCHEMA_VERSION,
+        "validator_version": GROUNDING_VALIDATOR_VERSION,
     }
     return result

@@ -143,7 +143,7 @@ PRODUCTION_TRANSITIONS = {
     "QUEUED": {"GENERATING", "BLOCKED"},
     "GENERATING": {"VALIDATING", "HUMAN_REVIEW", "FAILED", "BLOCKED"},
     "VALIDATING": {"READY_FOR_APPROVAL", "HUMAN_REVIEW", "BLOCKED", "FAILED"},
-    "READY_FOR_APPROVAL": set(), "HUMAN_REVIEW": set(), "BLOCKED": set(), "FAILED": set(),
+    "READY_FOR_APPROVAL": set(), "HUMAN_REVIEW": {"VALIDATING"}, "BLOCKED": set(), "FAILED": set(),
 }
 RENDER_POLICY_VERSION = os.environ.get("RENDER_POLICY_VERSION", "media-render-policy-v1")
 RENDERER_CONFIG_VERSION = os.environ.get("RENDERER_CONFIG_VERSION", "live-renderer-config-v1")
@@ -4534,6 +4534,12 @@ def _job_locked_context(job_id):
             "SELECT * FROM production_job_media WHERE job_id=? AND rights_status='verified' AND availability_status='available' ORDER BY media_asset_id",
             (job_id,),
         )]
+        provenance = [dict(row) for row in connection.execute(
+            "SELECT pje.claim_version_id,vs.source_name,vs.source_class,pje.canonical_url,pje.evidence_family_id "
+            "FROM production_job_evidence pje JOIN verification_snapshots vs ON vs.id=pje.snapshot_id "
+            "WHERE pje.job_id=? ORDER BY pje.claim_version_id,vs.source_name,pje.snapshot_id",
+            (job_id,),
+        )]
     return {
         "schema_version": job["prompt_schema_version"], "production_policy_version": job["production_policy_version"],
         "event": {"event_id": job["event_id"]},
@@ -4544,6 +4550,7 @@ def _job_locked_context(job_id):
         },
         "content_decision": {
             "decision_id": decision["id"], "recommended_format": decision["recommended_format"],
+            "media_source_strategy": decision["media_source_strategy"],
             "language": decision["language"], "proposed_duration_seconds": decision["proposed_duration_seconds"],
             "priority": decision["priority"], "factual_rationale": decision["factual_rationale"],
         },
@@ -4553,6 +4560,7 @@ def _job_locked_context(job_id):
             "assertion_scope": item["assertion_scope"], "attribution": item["attribution"],
             "required_for_event": item["required_for_event"],
         } for item in claims],
+        "evidence_provenance": provenance,
         "rights_cleared_media": [{
             "media_asset_id": item["media_asset_id"], "media_type": item["media_type"], "url": item["url"],
             "content_hash": item["content_hash"],
@@ -4560,6 +4568,46 @@ def _job_locked_context(job_id):
         "constraints": ["Use only approved_claims for factual content.", "Do not browse or research.",
                         "Preserve attribution and certainty.", "No publishing or rendering is authorized."],
     }
+
+
+def _create_content_package(connection, job, package, validation):
+    version_number = connection.execute(
+        "SELECT COALESCE(MAX(version_number),0)+1 FROM content_packages WHERE event_id=?", (job["event_id"],)
+    ).fetchone()[0]
+    package_json = json.dumps(package, ensure_ascii=False, sort_keys=True)
+    snapshot_ids = [row["snapshot_id"] for row in connection.execute(
+        "SELECT DISTINCT snapshot_id FROM production_job_evidence WHERE job_id=? ORDER BY snapshot_id", (job["id"],)
+    )]
+    package_id = "CP-" + uuid.uuid4().hex[:12].upper()
+    connection.execute(
+        "INSERT INTO content_packages(id,job_id,event_id,version_number,status,requested_format,story_angle,"
+        "content_objective,package_json,content_hash,approved_claim_set_id,approved_claim_set_version,"
+        "approved_claim_version_ids_json,evidence_snapshot_ids_json,evidence_version,media_version,"
+        "production_policy_version,prompt_schema_version,provider,model,provider_mode,fixture_only,"
+        "provider_request_id,input_tokens,output_tokens,cache_creation_input_tokens,cache_read_input_tokens,"
+        "total_tokens,latency_ms,cost_usd,cost_status,validation_result_json,created_at) "
+        "VALUES(?,?,?,?, 'READY_FOR_APPROVAL',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            package_id, job["id"], job["event_id"], version_number,
+            job["requested_format"], package["story_angle"], package["content_objective"],
+            package_json, hashlib.sha256(package_json.encode()).hexdigest(), job["approved_claim_set_id"],
+            job["approved_claim_set_version"], json.dumps(validation["approved_claim_version_ids"]),
+            json.dumps(snapshot_ids), job["evidence_version"], job["media_version"], job["production_policy_version"],
+            job["prompt_schema_version"], job["provider"], job["model"], job["provider_mode"], job["fixture_only"],
+            job["provider_request_id"], job["input_tokens"], job["output_tokens"], job["cache_creation_input_tokens"],
+            job["cache_read_input_tokens"], job["total_tokens"], job["latency_ms"], job["cost_usd"],
+            job["cost_status"], json.dumps(validation, ensure_ascii=False), now(),
+        ),
+    )
+    connection.execute(
+        "UPDATE production_jobs SET validation_status='PASSED',validation_result_json=?,error_code=NULL,"
+        "error_message=NULL,updated_at=? WHERE id=?",
+        (json.dumps(validation, ensure_ascii=False), now(), job["id"]),
+    )
+    _transition_production_job(
+        connection, job["id"], "READY_FOR_APPROVAL", "Validated immutable package is ready for human approval."
+    )
+    return package_id
 
 
 def run_production_job(job_id, provider=None):
@@ -4650,38 +4698,7 @@ def run_production_job(job_id, provider=None):
         return production_job(job_id)
     with connect() as connection:
         connection.execute("BEGIN IMMEDIATE")
-        version_number = connection.execute(
-            "SELECT COALESCE(MAX(version_number),0)+1 FROM content_packages WHERE event_id=?", (job["event_id"],)
-        ).fetchone()[0]
-        package_json = json.dumps(result.package, ensure_ascii=False, sort_keys=True)
-        snapshot_ids = [row["snapshot_id"] for row in connection.execute(
-            "SELECT DISTINCT snapshot_id FROM production_job_evidence WHERE job_id=? ORDER BY snapshot_id", (job_id,)
-        )]
-        connection.execute(
-            "INSERT INTO content_packages(id,job_id,event_id,version_number,status,requested_format,story_angle,"
-            "content_objective,package_json,content_hash,approved_claim_set_id,approved_claim_set_version,"
-            "approved_claim_version_ids_json,evidence_snapshot_ids_json,evidence_version,media_version,"
-            "production_policy_version,prompt_schema_version,provider,model,provider_mode,fixture_only,"
-            "provider_request_id,input_tokens,output_tokens,cache_creation_input_tokens,cache_read_input_tokens,"
-            "total_tokens,latency_ms,cost_usd,cost_status,validation_result_json,created_at) "
-            "VALUES(?,?,?,?, 'READY_FOR_APPROVAL',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (
-                "CP-" + uuid.uuid4().hex[:12].upper(), job_id, job["event_id"], version_number,
-                job["requested_format"], result.package["story_angle"], result.package["content_objective"],
-                package_json, hashlib.sha256(package_json.encode()).hexdigest(), job["approved_claim_set_id"],
-                job["approved_claim_set_version"], json.dumps(validation["approved_claim_version_ids"]),
-                json.dumps(snapshot_ids), job["evidence_version"], job["media_version"], job["production_policy_version"],
-                job["prompt_schema_version"], job["provider"], job["model"], job["provider_mode"], job["fixture_only"],
-                result.provider_request_id, result.input_tokens, result.output_tokens, result.cache_creation_input_tokens,
-                result.cache_read_input_tokens, result.total_tokens, result.latency_ms, result.cost_usd,
-                "known" if result.cost_usd is not None else "unknown", json.dumps(validation), now(),
-            ),
-        )
-        connection.execute(
-            "UPDATE production_jobs SET validation_status='PASSED',validation_result_json=?,updated_at=? WHERE id=?",
-            (json.dumps(validation), now(), job_id),
-        )
-        _transition_production_job(connection, job_id, "READY_FOR_APPROVAL", "Validated immutable package is ready for human approval.")
+        _create_content_package(connection, job, result.package, validation)
         connection.commit()
     return production_job(job_id)
 
@@ -4692,6 +4709,55 @@ def production_job(job_id):
     if row is None:
         raise KeyError(job_id)
     return dict(row)
+
+
+def revalidate_production_draft(draft_id):
+    """Revalidate one immutable provider draft without making a new provider call."""
+    with connect() as connection:
+        draft_row = connection.execute("SELECT * FROM production_drafts WHERE id=?", (draft_id,)).fetchone()
+        if draft_row is None:
+            raise KeyError(draft_id)
+        draft = dict(draft_row)
+        job = dict(connection.execute("SELECT * FROM production_jobs WHERE id=?", (draft["job_id"],)).fetchone())
+        existing = connection.execute("SELECT * FROM content_packages WHERE job_id=?", (job["id"],)).fetchone()
+        if existing:
+            return {"draft": draft, "job": job, "package": dict(existing),
+                    "validation": json.loads(existing["validation_result_json"]), "provider_called_again": False}
+    if job["status"] != "HUMAN_REVIEW" or job["error_code"] != "validation_failed":
+        raise ValueError("Only a validation-failed HUMAN_REVIEW draft can be revalidated.")
+    package = json.loads(draft["structured_output_json"])
+    canonical = json.dumps(package, ensure_ascii=False, sort_keys=True)
+    if hashlib.sha256(canonical.encode()).hexdigest() != draft["content_hash"]:
+        raise ValueError("Production draft content hash does not match its immutable payload.")
+    current = _production_eligibility(job["content_decision_id"])
+    if not current["eligible"] or current["input_version"] != job["input_version"]:
+        raise ValueError("Production inputs changed; the historical draft cannot be finalized.")
+    validation = validate_production_package(package, _job_locked_context(job["id"]))
+    if not validation["valid"]:
+        with connect() as connection:
+            connection.execute(
+                "UPDATE production_jobs SET validation_status='FAILED',validation_result_json=?,error_code='validation_failed',"
+                "error_message=?,updated_at=? WHERE id=?",
+                (json.dumps(validation, ensure_ascii=False), " ".join(validation["errors"])[:500], now(), job["id"]),
+            )
+        return {"draft": draft, "job": production_job(job["id"]), "package": None,
+                "validation": validation, "provider_called_again": False}
+    with connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        existing = connection.execute("SELECT * FROM content_packages WHERE job_id=?", (job["id"],)).fetchone()
+        if existing:
+            connection.commit()
+            return {"draft": draft, "job": production_job(job["id"]), "package": dict(existing),
+                    "validation": json.loads(existing["validation_result_json"]), "provider_called_again": False}
+        _transition_production_job(
+            connection, job["id"], "VALIDATING", "Revalidating the existing immutable provider draft."
+        )
+        package_id = _create_content_package(connection, job, package, validation)
+        connection.commit()
+    with connect() as connection:
+        final_package = dict(connection.execute("SELECT * FROM content_packages WHERE id=?", (package_id,)).fetchone())
+    return {"draft": draft, "job": production_job(job["id"]), "package": final_package,
+            "validation": validation, "provider_called_again": False}
 
 
 def _default_render_media_type(content_format):

@@ -542,6 +542,170 @@ class FakeXAITransport:
         return value
 
 
+class ProductionGroundingValidatorTests(unittest.TestCase):
+    claim_one = "CV-CLAIM-ONE"
+    claim_two = "CV-CLAIM-TWO"
+
+    def context(self, content_format="IMAGE"):
+        return {
+            "content_decision": {
+                "recommended_format": content_format, "language": "English", "proposed_duration_seconds": 8,
+            },
+            "approved_claims": [
+                {
+                    "claim_version_id": self.claim_one,
+                    "text": "The Union government permitted sale of excess FCV tobacco produced in Andhra Pradesh during the 2025-26 crop season.",
+                    "claim_type": "factual_assertion", "assertion_scope": "approval",
+                    "attribution": "The New Indian Express",
+                },
+                {
+                    "claim_version_id": self.claim_two,
+                    "text": "A Union Commerce Ministry notification permitted registered and unregistered growers to sell excess FCV tobacco at all Tobacco Board-authorised auction platforms.",
+                    "claim_type": "factual_assertion", "assertion_scope": "approval",
+                    "attribution": "The New Indian Express",
+                },
+            ],
+            "evidence_provenance": [
+                {"claim_version_id": self.claim_one, "source_name": "The New Indian Express", "source_class": "independent_reporting"},
+                {"claim_version_id": self.claim_two, "source_name": "Official Gazette", "source_class": "official_primary"},
+            ],
+        }
+
+    def package(self):
+        return {
+            "story_angle": "Union government permits sale of excess FCV tobacco produced in Andhra Pradesh for the 2025-26 crop season",
+            "content_objective": "Inform growers about the permitted sale of excess FCV tobacco in Andhra Pradesh for the 2025-26 crop season",
+            "format": "IMAGE",
+            "headline": {
+                "text": "Union Government Permits Sale of Excess FCV Tobacco Produced in Andhra Pradesh for 2025-26 Season",
+                "claim_version_ids": [self.claim_one],
+            },
+            "hook": {
+                "text": "Registered and unregistered growers can sell excess FCV tobacco at Tobacco Board-authorised auction platforms",
+                "claim_version_ids": [self.claim_two],
+            },
+            "caption": {
+                "text": "The Union government permitted sale of excess FCV tobacco produced in Andhra Pradesh during the 2025-26 crop season.\nSource: The New Indian Express",
+                "claim_version_ids": [self.claim_one],
+            },
+            "script": [{
+                "sequence": 1,
+                "text": "The Union government permitted sale of excess FCV tobacco produced in Andhra Pradesh during the 2025-26 crop season.",
+                "claim_version_ids": [self.claim_one],
+            }],
+            "storyboard": [{
+                "scene_number": 1, "duration_seconds": 8,
+                "narration": "The Union government permitted sale of excess FCV tobacco produced in Andhra Pradesh for the 2025-26 crop season.",
+                "on_screen_text": "Union Govt Permits Excess FCV Tobacco Sale in AP",
+                "visual_prompt": "Neutral illustration of an agricultural auction environment with tobacco leaves",
+                "claim_version_ids": [self.claim_one, self.claim_two],
+            }],
+            "thumbnail": {
+                "headline": "FCV Tobacco Sale Permitted", "visual_prompt": "Close-up of dried tobacco leaves",
+                "claim_version_ids": [self.claim_one],
+            },
+            "platform_metadata": {
+                "language": "English", "duration_seconds": 8, "aspect_ratio": "3:4",
+                "accessibility_text": "Dried tobacco leaves. The Union government permitted sale of excess FCV tobacco in Andhra Pradesh for the 2025-26 crop season.",
+                "accessibility_claim_version_ids": [self.claim_one],
+            },
+            "creative_notes": ["Keep the wording neutral."],
+            "non_factual_style_elements": ["Warm editorial palette"],
+            "media_brief": {
+                "media_type": "IMAGE", "visual_brief": "Neutral agricultural still-life with tobacco leaves",
+                "generation_prompt": "Dried tobacco leaves, neutral editorial style, 3:4 portrait aspect ratio",
+                "negative_constraints": ["No people", "No text"],
+                "factual_constraints": ["Do not imply completed sales"],
+            },
+        }
+
+    def validate(self, package=None, context=None):
+        return content_production.validate_production_package(package or self.package(), context or self.context())
+
+    def test_grounding_allows_three_by_four_format_metadata(self):
+        result = self.validate()
+        self.assertEqual(result["status"], "PASS")
+
+    def test_grounding_allows_nine_by_sixteen_format_metadata(self):
+        package = self.package()
+        package["format"] = "REEL"
+        package["platform_metadata"]["aspect_ratio"] = "9:16"
+        package["media_brief"]["media_type"] = "VIDEO"
+        result = self.validate(package, self.context("REEL"))
+        self.assertEqual(result["status"], "PASS")
+
+    def test_grounding_allows_faithful_headline_paraphrase(self):
+        result = self.validate()
+        headline = next(item for item in result["field_results"] if item["field"] == "headline")
+        self.assertEqual(headline["status"], "PASS")
+        self.assertIn(self.claim_one, headline["matched_approved_claim_ids"])
+
+    def test_grounding_normalizes_entity_variants(self):
+        package = self.package()
+        package["headline"]["text"] = "UNION GOVT permits excess FCV tobacco sale in Andhra-Pradesh for 2025-26"
+        self.assertEqual(self.validate(package)["status"], "PASS")
+
+    def test_grounding_allows_non_factual_visual_instruction(self):
+        package = self.package()
+        package["storyboard"][0]["visual_prompt"] = "Neutral illustration of an agricultural auction environment"
+        self.assertEqual(self.validate(package)["status"], "PASS")
+
+    def test_grounding_rejects_visual_instruction_with_unsupported_event(self):
+        package = self.package()
+        package["storyboard"][0]["visual_prompt"] = "Thousands of protesting farmers outside Parliament"
+        result = self.validate(package)
+        self.assertEqual(result["status"], "FAIL")
+        self.assertTrue(any("unsupported depicted event" in error for error in result["errors"]))
+
+    def test_grounding_allows_supported_source_attribution(self):
+        package = self.package()
+        package["caption"]["text"] += "\nAccording to Union Commerce Ministry"
+        package["caption"]["claim_version_ids"] = [self.claim_one, self.claim_two]
+        self.assertEqual(self.validate(package)["status"], "PASS")
+
+    def test_grounding_rejects_unsupported_source_attribution(self):
+        package = self.package()
+        package["caption"]["text"] = package["caption"]["text"].replace("The New Indian Express", "Reuters")
+        result = self.validate(package)
+        self.assertEqual(result["status"], "FAIL")
+        self.assertTrue(any("unsupported source attribution" in error for error in result["errors"]))
+
+    def test_grounding_allows_compressed_thumbnail_copy(self):
+        result = self.validate()
+        thumbnail = next(item for item in result["field_results"] if item["field"] == "thumbnail.headline")
+        self.assertEqual(thumbnail["status"], "PASS")
+
+    def test_grounding_rejects_sensational_unsupported_thumbnail(self):
+        package = self.package()
+        package["thumbnail"]["headline"] = "HUGE WIN: FCV Tobacco Sale Permitted"
+        result = self.validate(package)
+        self.assertEqual(result["status"], "FAIL")
+        self.assertTrue(any("sensational" in error for error in result["errors"]))
+
+    def test_grounding_rejects_unsupported_number(self):
+        package = self.package()
+        package["headline"]["text"] += " worth ₹999 crore"
+        result = self.validate(package)
+        self.assertEqual(result["status"], "FAIL")
+        self.assertTrue(any("unsupported numerical" in error for error in result["errors"]))
+
+    def test_grounding_rejects_unsupported_quote(self):
+        package = self.package()
+        package["caption"]["text"] += ' “This is a huge win.”'
+        result = self.validate(package)
+        self.assertEqual(result["status"], "FAIL")
+        self.assertTrue(any("unsupported quotation" in error for error in result["errors"]))
+
+    def test_grounding_returns_per_field_results(self):
+        result = self.validate()
+        by_field = {item["field"]: item for item in result["field_results"]}
+        self.assertEqual(by_field["headline"]["content_type"], "EDITORIAL_COPY")
+        self.assertEqual(by_field["caption.source_attribution[0]"]["content_type"], "SOURCE_ATTRIBUTION")
+        self.assertEqual(by_field["storyboard[0].visual_prompt"]["content_type"], "VISUAL_INSTRUCTION")
+        self.assertEqual(by_field["platform_metadata.aspect_ratio"]["content_type"], "TECHNICAL_PARAMETER")
+        self.assertTrue(all("matched_approved_claim_ids" in item for item in result["field_results"]))
+
+
 class WorkflowTests(unittest.TestCase):
     def setUp(self):
         # Never inherit real renderer credentials/config from the developer's .env, and never touch the network.
@@ -1735,6 +1899,39 @@ class WorkflowTests(unittest.TestCase):
             ).fetchone()[0], 0)
             with self.assertRaises(sqlite3.IntegrityError):
                 connection.execute("UPDATE content_packages SET story_angle='changed' WHERE id=?", (package["id"],))
+
+    def test_validation_failed_immutable_draft_can_be_revalidated_without_provider_call(self):
+        _, decision = self.executable_content_decision()
+        false_failure = {
+            "valid": False, "status": "FAIL", "errors": ["Controlled legacy false positive."],
+            "field_results": [], "approved_claim_version_ids": [], "used_claim_version_ids": [],
+            "validator_version": "legacy-validator",
+        }
+        with patch.object(app, "PRODUCTION_EXECUTOR", DeferredExecutor()):
+            queued = app.enqueue_production(decision["id"], "fixture")
+        with patch.object(app, "validate_production_package", return_value=false_failure):
+            app.run_production_job(queued["job"]["id"], FixtureProductionProvider())
+        with app.connect() as connection:
+            original = dict(connection.execute(
+                "SELECT * FROM production_drafts WHERE job_id=?", (queued["job"]["id"],)
+            ).fetchone())
+        self.assertEqual(app.production_job(queued["job"]["id"])["status"], "HUMAN_REVIEW")
+        result = app.revalidate_production_draft(original["id"])
+        self.assertFalse(result["provider_called_again"])
+        self.assertEqual(result["job"]["status"], "READY_FOR_APPROVAL")
+        self.assertEqual(result["package"]["version_number"], 1)
+        self.assertEqual(result["package"]["content_hash"], original["content_hash"])
+        with app.connect() as connection:
+            persisted = dict(connection.execute(
+                "SELECT * FROM production_drafts WHERE id=?", (original["id"],)
+            ).fetchone())
+            self.assertEqual(persisted, original)
+            self.assertEqual(connection.execute(
+                "SELECT COUNT(*) FROM production_drafts WHERE job_id=?", (queued["job"]["id"],)
+            ).fetchone()[0], 1)
+            self.assertEqual(connection.execute(
+                "SELECT COUNT(*) FROM content_packages WHERE job_id=?", (queued["job"]["id"],)
+            ).fetchone()[0], 1)
 
     def test_production_blocks_hold_and_test_only_before_job_creation(self):
         event, _, _ = self.production_approved_event(with_media=False)
