@@ -225,6 +225,34 @@
         "language": "English",
         "verification_search_priority": 4
       }
+    },
+    {
+      "id": "upstox-news",
+      "name": "Upstox News",
+      "type": "webpage",
+      "url": "https://upstox.com/news/",
+      "official": false,
+      "source_class": "independent_reporting",
+      "enabled": false,
+      "rate_limit_seconds": 1.0,
+      "poll_interval_seconds": 86400,
+      "identity": {
+        "status": "verified",
+        "verification_method": "publisher_masthead_and_registry",
+        "evidence_url": "https://upstox.com/news/author/upstox-news-desk/",
+        "verification_note": "Upstox News identifies articles from its named editorial news desk; registered only for claim-specific independent corroboration."
+      },
+      "workspace_match": {
+        "leader": "N. Chandrababu Naidu",
+        "jurisdiction": "Andhra Pradesh, India",
+        "topics": ["government administration", "public policy"]
+      },
+      "metadata": {
+        "content_role": "reference",
+        "publisher": "Upstox News Desk",
+        "language": "English",
+        "verification_search_priority": 5
+      }
     }
   ]
 }

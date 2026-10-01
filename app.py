@@ -2151,7 +2151,16 @@ def enqueue_verification(research_run_id, provider_name="grok", *, background=Tr
         )
         row = connection.execute("SELECT * FROM verification_runs WHERE id=?", (run_id,)).fetchone()
         connection.commit()
-    plan_source_acquisition(run_id)
+    with connect() as connection:
+        acquired_exists = connection.execute(
+            "SELECT 1 FROM source_candidates sc JOIN source_acquisition_runs sa ON sa.id=sc.acquisition_run_id "
+            "JOIN claim_source_candidates csc ON csc.candidate_id=sc.id "
+            "JOIN claim_versions cv ON cv.id=csc.claim_version_id JOIN claims c ON c.id=cv.claim_id "
+            "WHERE sa.event_id=? AND c.research_run_id=? AND sc.state='RETRIEVED' LIMIT 1",
+            (research_run["event_id"], research_run_id),
+        ).fetchone()
+    if not acquired_exists:
+        plan_source_acquisition(run_id)
     if background:
         VERIFICATION_EXECUTOR.submit(run_verification_job, run_id, provider)
     else:
@@ -2377,11 +2386,23 @@ def add_evidence_url(verification_run_id, url, claim_ids=None, *, transport=None
             (attempt_id, acquisition_id, "MANUAL_URL", url, json.dumps([item["id"] for item in versions]), timestamp),
         )
 
+    return _execute_source_acquisition(
+        acquisition_id, verification_run_id, versions, [(url, attempt_id)],
+        transport=transport, pdf_extractor=pdf_extractor,
+    )
+
+
+def _execute_source_acquisition(
+    acquisition_id, verification_run_id, versions, initial_queue, *, transport=None, pdf_extractor=None,
+):
+    """Retrieve, classify, family-deduplicate, and packetize one acquisition run."""
+    registry = load_official_source_registry()
+    timestamp = now()
     retriever = SourceRetriever(
         transport or fetch_public_resource, pdf_extractor=pdf_extractor, url_validator=_validate_public_url,
     )
-    queue = [(url, attempt_id)]
-    queued = {canonicalize_url(url)}
+    queue = list(initial_queue)
+    queued = {canonicalize_url(item[0]) for item in queue}
     retrieved = []
     direct_attempt_id = None
     retrieval_count = 0
@@ -2530,6 +2551,89 @@ def add_evidence_url(verification_run_id, url, claim_ids=None, *, transport=None
             )],
             "packets": packets, "adjudication_changed": False,
         }
+
+
+def run_source_acquisition_pass(
+    verification_run_id, leads, *, acquisition_run_id=None, provider="external-search",
+    provider_request_id=None, search_provider_calls=None, search_cost_status="unknown", search_cost_usd=None,
+    transport=None, pdf_extractor=None,
+):
+    """Run one bounded acquisition pass from real discovered URLs using the persisted A-F plan."""
+    if not leads:
+        raise ValueError("source acquisition requires at least one discovered URL")
+    if search_cost_status not in ("known", "unknown", "not_billed"):
+        raise ValueError("invalid search cost status")
+    if search_cost_status == "known" and search_cost_usd is None:
+        raise ValueError("known search cost requires a value")
+    if search_cost_status != "known" and search_cost_usd is not None:
+        raise ValueError("search cost may only be set when known")
+    allowed_strategies = {
+        "A_AUTHORITATIVE_DOMAIN", "B_EXACT_PHRASE", "C_TITLE_NOTIFICATION_FRAGMENT",
+        "D_ENTITY_DATE_RANGE", "E_SECONDARY_CORROBORATION", "F_DIRECT_DOCUMENT_LINK",
+    }
+    for lead in leads:
+        _validate_public_url(lead["url"])
+        if lead.get("strategy") not in allowed_strategies:
+            raise ValueError("discovered URL requires an existing A-F acquisition strategy")
+
+    timestamp = now()
+    with connect() as connection:
+        run = connection.execute("SELECT * FROM verification_runs WHERE id=?", (verification_run_id,)).fetchone()
+        if run is None:
+            raise KeyError(verification_run_id)
+        versions = _acquisition_claim_versions(connection, verification_run_id)
+        known_claim_ids = {item["id"] for item in versions} | {item["claim_id"] for item in versions}
+        if acquisition_run_id:
+            acquisition = connection.execute(
+                "SELECT * FROM source_acquisition_runs WHERE id=?", (acquisition_run_id,)
+            ).fetchone()
+            if acquisition is None:
+                raise KeyError(acquisition_run_id)
+            if acquisition["verification_run_id"] != verification_run_id:
+                raise ValueError("acquisition plan belongs to a different verification run")
+            if acquisition["status"] not in ("PLANNED", "RUNNING"):
+                raise ValueError("acquisition plan has already been finalized")
+        else:
+            acquisition_run_id = "SA-" + uuid.uuid4().hex[:12].upper()
+            connection.execute(
+                "INSERT INTO source_acquisition_runs(id,event_id,verification_run_id,trigger_kind,status,provider,"
+                "started_at,search_cost_status,retrieval_cost_status,llm_cost_status) "
+                "VALUES(?,?,?,'VERIFICATION_PREP','RUNNING',?,?,?,'not_billed','not_billed')",
+                (acquisition_run_id, run["event_id"], verification_run_id, provider, timestamp, search_cost_status),
+            )
+        connection.execute(
+            "UPDATE source_acquisition_runs SET status='RUNNING',provider=?,search_provider_calls=?,"
+            "search_cost_status=?,search_cost_usd=?,error_message=NULL WHERE id=?",
+            (provider, search_provider_calls, search_cost_status, search_cost_usd, acquisition_run_id),
+        )
+        queue = []
+        for lead_index, lead in enumerate(leads):
+            requested = set(lead.get("claim_ids") or [])
+            if requested - known_claim_ids:
+                raise ValueError("a discovered URL targets an unknown claim")
+            targeted = [
+                item["id"] for item in versions
+                if not requested or item["id"] in requested or item["claim_id"] in requested
+            ]
+            attempt_id = "SD-" + uuid.uuid4().hex[:12].upper()
+            connection.execute(
+                "INSERT INTO source_discovery_attempts(id,acquisition_run_id,strategy,query_text,domains_json,"
+                "target_claim_ids_json,provider,status,provider_request_id,result_count,cost_status,cost_usd,"
+                "attempted_at,completed_at) VALUES(?,?,?,?,?,?,?,'COMPLETED',?,1,?,?,?,?)",
+                (
+                    attempt_id, acquisition_run_id, lead["strategy"], lead.get("query") or lead["url"],
+                    json.dumps(lead.get("domains") or []), json.dumps(targeted), provider,
+                    provider_request_id, search_cost_status,
+                    search_cost_usd if lead_index == 0 else (0.0 if search_cost_status == "known" else None),
+                    timestamp, timestamp,
+                ),
+            )
+            queue.append((lead["url"], attempt_id))
+
+    return _execute_source_acquisition(
+        acquisition_run_id, verification_run_id, versions, queue,
+        transport=transport, pdf_extractor=pdf_extractor,
+    )
 
 
 def _snapshot_acquired_candidates(connection, run):

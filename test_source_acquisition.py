@@ -278,6 +278,39 @@ class SourceAcquisitionIntegrationTests(unittest.TestCase):
             page = connection.execute("SELECT * FROM source_candidate_pages WHERE candidate_id=?", (pdf["id"],)).fetchone()
         self.assertEqual(page["page_number"], 3)
 
+    def test_planned_discovery_urls_execute_as_one_acquisition_pass(self):
+        _, _, verification = self.verification_fixture()
+        with app.connect() as connection:
+            plan = connection.execute(
+                "SELECT * FROM source_acquisition_runs WHERE verification_run_id=? "
+                "AND trigger_kind='PLANNED_DISCOVERY'", (verification["id"],),
+            ).fetchone()
+
+        def transport(url):
+            return response(url, f"<html><article><p>{OFFICIAL_TEXT}</p></article></html>")
+
+        leads = [
+            {"url": "https://commerce.gov.in/order", "strategy": "A_AUTHORITATIVE_DOMAIN"},
+            {"url": "https://pib.gov.in/release", "strategy": "E_SECONDARY_CORROBORATION"},
+        ]
+        with patch.object(app, "_validate_public_url", lambda value: None):
+            result = app.run_source_acquisition_pass(
+                verification["id"], leads, acquisition_run_id=plan["id"],
+                provider="test-search", search_provider_calls=1, search_cost_status="not_billed",
+                transport=transport,
+            )
+        self.assertEqual(result["run"]["id"], plan["id"])
+        self.assertEqual(result["run"]["status"], "COMPLETED")
+        self.assertEqual(result["run"]["direct_http_retrievals"], 2)
+        self.assertEqual(len(result["candidates"]), 2)
+        self.assertTrue(all(item["source_class"] == "OFFICIAL_PRIMARY" for item in result["candidates"]))
+        with app.connect() as connection:
+            live_runs = connection.execute(
+                "SELECT COUNT(*) FROM source_acquisition_runs WHERE verification_run_id=?",
+                (verification["id"],),
+            ).fetchone()[0]
+        self.assertEqual(live_runs, 1)
+
     def test_inaccessible_manual_url_is_audited_and_remains_review_required(self):
         signal, _, verification = self.verification_fixture()
         with patch.object(app, "_validate_public_url", lambda value: None):
