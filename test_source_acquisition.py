@@ -28,6 +28,15 @@ OFFICIAL_TEXT = (
     "the 2025-26 crop season. A Union Commerce Ministry notification permitted registered and "
     "unregistered growers to sell excess FCV tobacco at all Tobacco Board-authorised auction platforms."
 )
+GAZETTE_PASSAGE = (
+    "MINISTRY OF COMMERCE AND INDUSTRY (Department of Commerce) NOTIFICATION. "
+    "The Central Government considers it necessary in the public interest to dispose of the excess flue cured "
+    "virginia tobacco of registered growers and unauthorised flue cured virginia tobacco of unregistered growers "
+    "at the authorised auction platforms of the Tobacco Board in the State of Andhra Pradesh. The Central "
+    "Government permits the sale of excess flue cured virginia tobacco of the registered growers and unauthorised "
+    "flue cured virginia tobacco of the unregistered growers at the auction platforms authorised by the Tobacco "
+    "Board in the State of Andhra Pradesh for the auctions during the crop season 2025-2026."
+)
 
 
 def response(url, body, content_type="text/html; charset=utf-8", final_url=None, status=200):
@@ -116,6 +125,22 @@ class SourceAcquisitionUnitTests(unittest.TestCase):
         result = CompositeDiscoveryProvider([empty, fixture]).search(plan)
         self.assertEqual([lead.url for lead in result.leads], ["https://reporter.example/a"])
         self.assertEqual(result.cost_usd, 0.0)
+
+    def test_official_text_directly_supports_claim_semantics(self):
+        result = app.classify_claim_evidence(TOBACCO_CLAIM_B, GAZETTE_PASSAGE)
+        self.assertEqual(result["classification"], "DIRECT_SUPPORT")
+        self.assertEqual(result["missing_facets"], [])
+
+    def test_official_text_partially_supports_claim_when_condition_is_missing(self):
+        passage = "The Central Government permitted the sale of excess FCV tobacco in Andhra Pradesh."
+        result = app.classify_claim_evidence(TOBACCO_CLAIM_A, passage)
+        self.assertEqual(result["classification"], "PARTIAL_SUPPORT")
+        self.assertIn("crop season/date", result["missing_facets"])
+
+    def test_official_text_that_only_mentions_subject_does_not_support_action(self):
+        passage = "The Central Government reviewed excess FCV tobacco in Andhra Pradesh during 2025-2026."
+        result = app.classify_claim_evidence(TOBACCO_CLAIM_A, passage)
+        self.assertEqual(result["classification"], "MENTIONS_ONLY")
 
     def test_html_retrieval_preserves_redirect_metadata_and_direct_pdf(self):
         html = """<html><head><title>FCV order</title><meta name="date" content="2026-09-30">
@@ -310,6 +335,33 @@ class SourceAcquisitionIntegrationTests(unittest.TestCase):
                 (verification["id"],),
             ).fetchone()[0]
         self.assertEqual(live_runs, 1)
+
+    def test_unrelated_unreadable_candidate_does_not_poison_sufficient_evidence(self):
+        _, _, verification = self.verification_fixture()
+        with app.connect() as connection:
+            plan = connection.execute(
+                "SELECT * FROM source_acquisition_runs WHERE verification_run_id=? "
+                "AND trigger_kind='PLANNED_DISCOVERY'", (verification["id"],),
+            ).fetchone()
+
+        def transport(url):
+            if url.endswith("unrelated.pdf"):
+                raise ValueError("unreadable unrelated candidate")
+            return response(url, f"<html><article><p>{OFFICIAL_TEXT}</p></article></html>")
+
+        leads = [
+            {"url": "https://commerce.gov.in/order", "strategy": "A_AUTHORITATIVE_DOMAIN"},
+            {"url": "https://commerce.gov.in/unrelated.pdf", "strategy": "F_DIRECT_DOCUMENT_LINK"},
+        ]
+        with patch.object(app, "_validate_public_url", lambda value: None):
+            result = app.run_source_acquisition_pass(
+                verification["id"], leads, acquisition_run_id=plan["id"],
+                provider="test-search", search_provider_calls=1, search_cost_status="not_billed",
+                transport=transport,
+            )
+        self.assertEqual(result["run"]["status"], "COMPLETED")
+        self.assertTrue(any(item["state"] == "UNAVAILABLE" for item in result["candidates"]))
+        self.assertTrue(all(packet["deterministically_sufficient"] for packet in result["packets"][:2]))
 
     def test_inaccessible_manual_url_is_audited_and_remains_review_required(self):
         signal, _, verification = self.verification_fixture()

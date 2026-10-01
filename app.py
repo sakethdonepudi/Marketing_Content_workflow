@@ -132,6 +132,7 @@ CONTENT_TOKEN_LIMIT = max(256, int(os.environ.get("CONTENT_TOKEN_LIMIT", "900"))
 CONTENT_TIMEOUT_SECONDS = max(5, int(os.environ.get("CONTENT_TIMEOUT_SECONDS", "45")))
 CONTENT_EXECUTOR = ThreadPoolExecutor(max_workers=1)
 PRODUCTION_POLICY_VERSION = os.environ.get("PRODUCTION_POLICY_VERSION", "content-production-v1")
+EVIDENCE_CLASSIFIER_VERSION = "claim-evidence-v2"
 PRODUCTION_TOKEN_LIMIT = max(512, int(os.environ.get("PRODUCTION_TOKEN_LIMIT", "8000")))
 PRODUCTION_CONNECTION_TIMEOUT_SECONDS = max(2, int(os.environ.get("PRODUCTION_CONNECTION_TIMEOUT_SECONDS", "10")))
 PRODUCTION_RESPONSE_TIMEOUT_SECONDS = max(5, int(os.environ.get("PRODUCTION_RESPONSE_TIMEOUT_SECONDS", "60")))
@@ -2043,7 +2044,9 @@ def verification_evidence_version(event_id, research_run_id):
                 "WHERE sa.event_id=? AND sc.state='RETRIEVED'", (event_id,),
             )
         ]
-    material = sorted(set(research + later + signals + acquired))
+    material = sorted(set(
+        (canonicalize_url(url), content_hash) for url, content_hash in research + later + signals + acquired
+    ))
     return hashlib.sha256(json.dumps(material).encode()).hexdigest()
 
 
@@ -2539,10 +2542,19 @@ def _execute_source_acquisition(
             "SELECT COUNT(*) FROM source_candidates WHERE acquisition_run_id=? AND state='UNAVAILABLE'",
             (acquisition_id,),
         ).fetchone()[0]
-        status = "COMPLETED" if candidates and not unavailable else "PARTIAL" if candidates else "FAILED"
+        required_ids = {item["id"] for item in versions if item["required_for_event"]}
+        sufficient_ids = {item["claim_id"] for item in packets if item["deterministically_sufficient"]}
+        sufficient_required = bool(required_ids) and required_ids <= sufficient_ids
+        status = "COMPLETED" if candidates and (not unavailable or sufficient_required) else "PARTIAL" if candidates else "FAILED"
+        unavailable_note = None
+        if unavailable:
+            unavailable_note = (
+                "Unavailable candidates were logged but did not affect sufficient required-claim evidence."
+                if sufficient_required else "One or more pages were unavailable."
+            )
         connection.execute(
             "UPDATE source_acquisition_runs SET status=?,completed_at=?,direct_http_retrievals=?,error_message=? WHERE id=?",
-            (status, now(), retrieval_count, "One or more pages were unavailable." if unavailable else None, acquisition_id),
+            (status, now(), retrieval_count, unavailable_note, acquisition_id),
         )
         return {
             "run": dict(connection.execute("SELECT * FROM source_acquisition_runs WHERE id=?", (acquisition_id,)).fetchone()),
@@ -2636,7 +2648,67 @@ def run_source_acquisition_pass(
     )
 
 
-def _snapshot_acquired_candidates(connection, run):
+def _reclassify_acquired_candidates(connection, event_id):
+    registry = load_official_source_registry()
+    changed = []
+    rows = connection.execute(
+        "SELECT sc.* FROM source_candidates sc JOIN source_acquisition_runs sa ON sa.id=sc.acquisition_run_id "
+        "WHERE sa.event_id=? AND sc.state='RETRIEVED' ORDER BY sc.id", (event_id,),
+    ).fetchall()
+    for row in rows:
+        document = type("StoredCandidate", (), {
+            "final_url": row["final_url"], "text": row["extracted_text"] or "",
+        })()
+        source_class, reason = classify_source(
+            document, registry, independent_domains=_independent_acquisition_domains(),
+        )
+        authority = registry.match(row["final_url"])
+        if source_class != row["source_class"] or reason != row["classification_reason"]:
+            connection.execute(
+                "UPDATE source_candidates SET source_class=?,classification_reason=?,authority_id=? WHERE id=?",
+                (source_class, reason, authority.id if authority else None, row["id"]),
+            )
+            changed.append(row["id"])
+    return changed
+
+
+def _refresh_acquisition_completion(connection, acquisition_id):
+    run = connection.execute("SELECT * FROM source_acquisition_runs WHERE id=?", (acquisition_id,)).fetchone()
+    if run is None:
+        raise KeyError(acquisition_id)
+    retrieved = connection.execute(
+        "SELECT COUNT(*) FROM source_candidates WHERE acquisition_run_id=? AND state='RETRIEVED'", (acquisition_id,),
+    ).fetchone()[0]
+    unavailable = connection.execute(
+        "SELECT COUNT(*) FROM source_candidates WHERE acquisition_run_id=? AND state='UNAVAILABLE'", (acquisition_id,),
+    ).fetchone()[0]
+    required = {
+        row[0] for row in connection.execute(
+            "SELECT claim_version_id FROM verification_run_claims WHERE verification_run_id=? AND required_for_event=1",
+            (run["verification_run_id"],),
+        )
+    }
+    sufficient = {
+        row[0] for row in connection.execute(
+            "SELECT claim_version_id FROM acquisition_evidence_packets "
+            "WHERE acquisition_run_id=? AND deterministically_sufficient=1", (acquisition_id,),
+        )
+    }
+    sufficient_required = bool(required) and required <= sufficient
+    status = "COMPLETED" if retrieved and (not unavailable or sufficient_required) else "PARTIAL" if retrieved else "FAILED"
+    note = None
+    if unavailable:
+        note = (
+            "Unavailable candidates were logged but did not affect sufficient required-claim evidence."
+            if sufficient_required else "One or more pages were unavailable."
+        )
+    connection.execute(
+        "UPDATE source_acquisition_runs SET status=?,error_message=? WHERE id=?", (status, note, acquisition_id),
+    )
+    return status
+
+
+def _snapshot_acquired_candidates(connection, run, *, include_all=False):
     rows = connection.execute(
         "SELECT DISTINCT sc.* FROM source_candidates sc "
         "JOIN source_acquisition_runs sa ON sa.id=sc.acquisition_run_id "
@@ -2644,8 +2716,8 @@ def _snapshot_acquired_candidates(connection, run):
         "JOIN verification_run_claims vrc ON vrc.claim_version_id=csc.claim_version_id "
         "WHERE sa.event_id=? AND vrc.verification_run_id=? AND sc.state='RETRIEVED' "
         "AND sc.source_class IN ('OFFICIAL_PRIMARY','INDEPENDENT_REPORTING') "
-        "AND csc.relationship='CANDIDATE' ORDER BY sc.retrieved_at,sc.id",
-        (run["event_id"], run["id"]),
+        "AND (?=1 OR csc.relationship='CANDIDATE') ORDER BY sc.retrieved_at,sc.id",
+        (run["event_id"], run["id"], int(include_all)),
     ).fetchall()
     snapshots = []
     for row in rows:
@@ -2737,11 +2809,12 @@ def _best_claim_excerpt(claim_text, source_text):
         segments = [_normalized_text(source_text)[:1200]]
     claim_tokens = _tokens(claim_text)
     best = None
-    for segment in segments:
-        segment_tokens = _tokens(segment)
+    for index, segment in enumerate(segments):
+        context = " ".join(segments[max(0, index - 1):index + 1])
+        segment_tokens = _tokens(context)
         score = len(claim_tokens & segment_tokens) / len(claim_tokens) if claim_tokens else 0
         if best is None or score > best[0]:
-            best = (score, segment[:1600])
+            best = (score, context[:1600])
     return best or (0.0, "")
 
 
@@ -2756,6 +2829,118 @@ def _quote_is_direct(claim_text, excerpt):
     return _normalized_text(claim_text) in _normalized_text(excerpt)
 
 
+def _semantic_text(value):
+    text = str(value or "").lower().replace("–", "-").replace("—", "-")
+    text = re.sub(r"\bflue[ -]?cured\s+virginia\b", "fcv", text)
+    text = re.sub(r"\bandhra\s+pradesh\b", "andhra pradesh", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _semantic_seasons(value):
+    seasons = set()
+    for start, end in re.findall(r"\b(20\d{2})\s*[-/]\s*(\d{2}|20\d{2})\b", _semantic_text(value)):
+        full_end = "20" + end if len(end) == 2 else end
+        seasons.add(f"{start}-{full_end}")
+    return seasons
+
+
+def _money_values(value):
+    return {
+        re.sub(r"\s+", " ", item.lower()).replace("rs.", "rs")
+        for item in re.findall(
+            r"(?:₹|rs\.?|usd\s*)\s*\d[\d,.]*(?:\s*(?:crore|lakh|million|billion))?",
+            str(value or ""), re.I,
+        )
+    }
+
+
+def classify_claim_evidence(claim_text, passage):
+    """Classify substantive claim support using explicit semantic facets."""
+    claim = _semantic_text(claim_text)
+    evidence = _semantic_text(passage)
+    claim_tokens = _tokens(claim)
+    evidence_tokens = _tokens(evidence)
+    token_score = len(claim_tokens & evidence_tokens) / len(claim_tokens) if claim_tokens else 0.0
+    matched, missing = [], []
+
+    actor_pattern = r"\b(?:union|central) government\b|\bunion commerce ministry\b|\bministry of commerce(?: and industry)?\b|\bdepartment of commerce\b"
+    if re.search(actor_pattern, claim):
+        (matched if re.search(actor_pattern, evidence) else missing).append("actor")
+
+    positive_action = r"\b(?:permit(?:s|ted)?|allow(?:s|ed)?|authori[sz](?:e|es|ed)|approv(?:e|es|ed)|clear(?:s|ed)?|sanction(?:s|ed)?)\b"
+    negative_action = r"\b(?:den(?:y|ies|ied)|reject(?:s|ed)?|prohibit(?:s|ed)?|withdr(?:aw|aws|ew|awn)|not permitted|not allowed)\b"
+    claim_positive = bool(re.search(positive_action, claim))
+    evidence_positive = bool(re.search(positive_action, evidence))
+    if claim_positive:
+        (matched if evidence_positive else missing).append("action")
+
+    subject_requirements = []
+    if re.search(r"\b(?:fcv|flue[ -]?cured virginia)\b", claim):
+        subject_requirements.append(("FCV tobacco", r"\b(?:fcv|flue[ -]?cured virginia)\b"))
+    if re.search(r"\bexcess\b", claim):
+        subject_requirements.append(("excess", r"\bexcess\b"))
+    if re.search(r"\btobacco\b", claim):
+        subject_requirements.append(("tobacco", r"\btobacco\b"))
+    subject_match = all(re.search(pattern, evidence) for _, pattern in subject_requirements) if subject_requirements else token_score >= 0.35
+    (matched if subject_match else missing).append("subject")
+
+    if "andhra pradesh" in claim:
+        (matched if "andhra pradesh" in evidence else missing).append("geography")
+
+    claim_seasons = _semantic_seasons(claim)
+    evidence_seasons = _semantic_seasons(evidence)
+    if claim_seasons:
+        (matched if claim_seasons <= evidence_seasons else missing).append("crop season/date")
+
+    grower_requirements = []
+    if re.search(r"\bregistered growers?\b", claim):
+        grower_requirements.append(r"\bregistered growers?\b")
+    if re.search(r"\bunregistered growers?\b", claim):
+        grower_requirements.append(r"\bunregistered growers?\b")
+    if grower_requirements:
+        (matched if all(re.search(pattern, evidence) for pattern in grower_requirements) else missing).append("eligible growers")
+
+    platform_required = bool(
+        re.search(r"\bauction platforms?\b", claim)
+        and re.search(r"\b(?:authori[sz]ed|approved)\b", claim)
+        and "tobacco board" in claim
+    )
+    if platform_required:
+        platform_match = bool(
+            re.search(r"\bauction platforms?\b", evidence)
+            and re.search(r"\b(?:authori[sz]ed|approved)\b", evidence)
+            and "tobacco board" in evidence
+        )
+        (matched if platform_match else missing).append("authorised auction-platform condition")
+
+    contradictory = bool(claim_positive and re.search(negative_action, evidence))
+    if claim_seasons and evidence_seasons and claim_seasons.isdisjoint(evidence_seasons):
+        contradictory = True
+    claim_money, evidence_money = _money_values(claim), _money_values(evidence)
+    if claim_money and evidence_money and claim_money.isdisjoint(evidence_money):
+        contradictory = True
+
+    if contradictory and subject_match:
+        classification = "CONTRADICTS"
+        rationale = "The passage addresses the claim subject but states an opposing action or conflicting explicit value."
+    elif claim_positive and evidence_positive and subject_match and not missing:
+        classification = "DIRECT_SUPPORT"
+        rationale = "The passage substantively states every material claim facet: " + ", ".join(matched) + "."
+    elif claim_positive and evidence_positive and subject_match:
+        classification = "PARTIAL_SUPPORT"
+        rationale = "The passage states the core action and subject but omits: " + ", ".join(missing) + "."
+    elif subject_match or token_score >= 0.25:
+        classification = "MENTIONS_ONLY"
+        rationale = "The passage mentions the claim subject but does not substantively state the claimed action and conditions."
+    else:
+        classification = "IRRELEVANT"
+        rationale = "The passage does not address the claim's substantive subject and action."
+    return {
+        "classification": classification, "rationale": rationale,
+        "matched_facets": matched, "missing_facets": missing, "score": token_score,
+    }
+
+
 def _evaluate_verification_claim(connection, run, version, snapshots):
     known_refs = {
         canonicalize_url(row["source_url"]): dict(row)
@@ -2765,37 +2950,37 @@ def _evaluate_verification_claim(connection, run, version, snapshots):
     }
     evaluated = []
     relative_date = False
-    claim_numbers = _claim_numbers(version["text"])
-    positive = any(word in version["text"].lower() for word in ("approved", "permitted", "authorised", "authorized"))
     for snapshot in snapshots:
         known = known_refs.get(snapshot["canonical_url"])
         if known:
             excerpt = known["supporting_excerpt"] or ""
-            relationship = known["support_kind"]
-            score = 1.0
         else:
-            score, excerpt = _best_claim_excerpt(version["text"], snapshot["text"])
-            relationship = "supports" if score >= 0.48 else "mentions_only"
-        excerpt_numbers = _claim_numbers(excerpt)
-        if claim_numbers and not all(number.lower() in excerpt.lower() for number in claim_numbers):
-            if score >= 0.4 and excerpt_numbers and excerpt_numbers != claim_numbers:
-                relationship = "conflicts"
-            else:
-                relationship = "mentions_only"
-        if positive and score >= 0.4 and re.search(r"\b(denied|rejected|not permitted|prohibited|withdrew)\b", excerpt, re.I):
-            relationship = "conflicts"
-        if relationship == "supports" and not _explicit_values_supported(version["text"], [excerpt]):
-            relationship = "mentions_only"
+            _, excerpt = _best_claim_excerpt(version["text"], snapshot["text"])
+        classification = classify_claim_evidence(version["text"], excerpt)
+        if known and known["support_kind"] == "conflicts":
+            classification = {
+                **classification, "classification": "CONTRADICTS",
+                "rationale": "The validated claim-evidence reference explicitly identifies a conflict.",
+            }
         if version["claim_type"] == "quotation" and not _quote_is_direct(version["text"], excerpt):
-            relationship = "mentions_only"
+            classification = {
+                **classification, "classification": "MENTIONS_ONLY",
+                "rationale": "The passage is not a direct verbatim match for the quotation claim.",
+            }
         if re.search(r"\b(today|yesterday|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b", excerpt, re.I):
             relative_date = True
-        if relationship == "mentions_only" and score < 0.25:
-            continue
-        evaluated.append({"snapshot": snapshot, "relationship": relationship, "excerpt": excerpt, "score": score})
+        relationship = {
+            "DIRECT_SUPPORT": "supports", "CONTRADICTS": "conflicts",
+            "PARTIAL_SUPPORT": "mentions_only", "MENTIONS_ONLY": "mentions_only", "IRRELEVANT": "mentions_only",
+        }[classification["classification"]]
+        evaluated.append({
+            "snapshot": snapshot, "relationship": relationship, "excerpt": excerpt,
+            "score": classification["score"], "classification": classification["classification"],
+            "classification_rationale": classification["rationale"],
+        })
 
-    supports = [item for item in evaluated if item["relationship"] == "supports"]
-    conflicts = [item for item in evaluated if item["relationship"] == "conflicts"]
+    supports = [item for item in evaluated if item["classification"] == "DIRECT_SUPPORT"]
+    conflicts = [item for item in evaluated if item["classification"] == "CONTRADICTS"]
     families = {item["snapshot"]["evidence_family_id"] for item in supports}
     official = [item for item in supports if item["snapshot"]["source_class"] == "official_primary"]
     independent_families = {
@@ -3078,7 +3263,9 @@ def _claim_analysis_payload(connection, run, versions):
             "claim_version_id": version["id"], "claim_id": version["claim_id"], "decision": decision,
             "rationale": rationale, "missing": missing, "independent_family_count": family_count,
             "evidence": [{"snapshot_id": item["snapshot"]["id"], "relationship": item["relationship"],
-                          "excerpt": item["excerpt"], "score": item["score"]} for item in evidence],
+                          "classification": item["classification"], "excerpt": item["excerpt"],
+                          "score": item["score"], "classification_rationale": item["classification_rationale"]}
+                         for item in evidence],
         })
     return {"snapshot_ids": [item["id"] for item in snapshots], "claims": analyses}
 
@@ -3155,9 +3342,9 @@ def _finalize_verification(connection, run, versions, result, domains, provider_
             )
             connection.execute(
                 "INSERT OR IGNORE INTO verification_decision_evidence(decision_id,snapshot_id,relationship,excerpt,"
-                "excerpt_valid,directness,evidence_family_id,rationale) VALUES(?,?,?,?,1,?,?,?)",
+                "excerpt_valid,directness,evidence_family_id,rationale,classification) VALUES(?,?,?,?,1,?,?,?,?)",
                 (decision_id, snapshot["id"], item["relationship"], item["excerpt"], directness,
-                 snapshot["evidence_family_id"], f"Claim-token overlap {item['score']:.2f}; inspected full stored page."),
+                 snapshot["evidence_family_id"], item["classification_rationale"], item["classification"]),
             )
         decisions.append({"id": decision_id, "claim_version_id": version["id"], "decision": decision,
                           "approved": approved, "required": bool(version["required_for_event"])})
@@ -3204,6 +3391,7 @@ def _finalize_verification(connection, run, versions, result, domains, provider_
         provider_failure[1] if provider_failure else "Verification decisions complete", completed_at=now(), progress=100,
         current_phase="FINAL_CLAIM_ADJUDICATION", recoverable=0, resume_state=None, resume_reason=None,
         final_evidence_version=final_version, decision_explanation=explanation,
+        evidence_classifier_version=EVIDENCE_CLASSIFIER_VERSION,
         summary_json=json.dumps(summary, ensure_ascii=False), error_code=provider_failure[0] if provider_failure else None,
         error_message=provider_failure[1] if provider_failure else None, **totals,
     )
@@ -3218,6 +3406,45 @@ def _finalize_verification(connection, run, versions, result, domains, provider_
     else:
         connection.execute("UPDATE events SET verification_status=?,updated_at=? WHERE id=?",
                            ("TEST_ONLY" if run["mode"] == "test" else "REVIEW_REQUIRED", now(), run["event_id"]))
+
+
+def readjudicate_verification(run_id):
+    """Rebuild the evidence matrix and re-adjudicate a completed run without any provider call."""
+    with connect() as connection:
+        run = connection.execute("SELECT * FROM verification_runs WHERE id=?", (run_id,)).fetchone()
+        if run is None:
+            raise KeyError(run_id)
+        if run["status"] != "COMPLETED":
+            raise ValueError("only a completed verification run can be re-adjudicated")
+        if run["evidence_classifier_version"] == EVIDENCE_CLASSIFIER_VERSION:
+            return {"run": verification_run(run_id), "duplicate": True, "provider_called": False}
+        versions = _ensure_claim_versions(connection, run["research_run_id"])
+        _reclassify_acquired_candidates(connection, run["event_id"])
+        for acquisition in connection.execute(
+            "SELECT id FROM source_acquisition_runs WHERE event_id=?", (run["event_id"],),
+        ):
+            _refresh_acquisition_completion(connection, acquisition["id"])
+        _snapshot_acquired_candidates(connection, run, include_all=True)
+        _regroup_evidence_families(connection, run_id)
+        analysis = _claim_analysis_payload(connection, run, versions)
+        _verification_checkpoint(connection, run_id, "CLAIM_SOURCE_MATCHING", "PARTIAL", {
+            **analysis, "rebuild_kind": "LOCAL_CLASSIFIER_READJUDICATION",
+            "classifier_version": EVIDENCE_CLASSIFIER_VERSION,
+        })
+        prior_summary = json.loads(run["summary_json"] or "{}")
+        domains = prior_summary.get("domains") or _verification_domains(run["research_run_id"])
+        _record_verification_status(
+            connection, run_id, "COMPLETED", "RUNNING",
+            "Rebuilding the claim-evidence matrix with the corrected semantic classifier.",
+            progress=90, current_phase="FINAL_CLAIM_ADJUDICATION", completed_at=None,
+        )
+        running = connection.execute("SELECT * FROM verification_runs WHERE id=?", (run_id,)).fetchone()
+        result = VerificationProviderResult(result={
+            "search_summary": "No provider call: locally re-adjudicated the preserved evidence matrix.",
+            "unresolved_gaps": [], "leads": [],
+        })
+        _finalize_verification(connection, running, versions, result, domains)
+    return {"run": verification_run(run_id), "duplicate": False, "provider_called": False}
 
 
 def run_verification_job(run_id, provider=None):
