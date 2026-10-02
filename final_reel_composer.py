@@ -25,7 +25,7 @@ from sarvam_tts import normalize_years_for_speech
 ROOT = Path(__file__).resolve().parent
 COMPOSER_SOURCE = ROOT / "tools" / "final_reel_composer.swift"
 COMPOSER_CACHE = ROOT / ".cache" / "final-reel-composer"
-COMPOSER_POLICY_VERSION = "final-reel-composer-v19"
+COMPOSER_POLICY_VERSION = "final-reel-composer-v20"
 VOICE_PROVIDER = "apple-speech"
 VOICE_MODEL = "Aman (en-IN)"
 TELUGU_VOICE_MODEL = "Geeta (te_IN)"
@@ -1162,42 +1162,37 @@ def real_ap_scene_plan(duration, real_assets, *, has_cbn):
     if not has_cbn:
         plan = [(k, w, m) for (k, w, m) in plan if k != "CBN"]
     total_weight = sum(weight for _, weight, _ in plan)
-    closing_seconds = min(3.0, max(2.2, duration * 0.085))
-    main_span = max(1.0, duration - closing_seconds)
     beats, cursor, used = [], 0.0, []
     for index, (kind, weight, motion) in enumerate(plan):
-        span = max(1.4, min(5.0, main_span * weight / total_weight))
+        span = max(1.4, min(5.0, duration * weight / total_weight))
         if kind == "CBN":
             span = min(span, 2.3)
-        if kind == "CLOSING":
-            cursor = main_span
-            end = duration
-        else:
-            end = min(main_span, cursor + span)
-        # J/L-cut: nudge the visual cut off the spoken sentence boundary.
-        if index > 0 and kind != "CLOSING":
-            cursor = max(0.0, cursor + (0.12 if index % 2 else -0.12))
+        # Beats are strictly contiguous: each starts where the previous ended, so the base
+        # loop never shows through. The J/L nudge varies the beat LENGTH, never the join.
+        start = cursor
+        span = max(1.4, span + (0.12 if index % 2 else -0.12))
+        end = duration if kind == "CLOSING" else min(duration, start + span)
+        cursor = end
         if kind == "CBN":
-            beats.append({"kind": "CBN", "start": round(cursor, 3), "end": round(end, 3), "motion": "push-in"})
+            beats.append({"kind": "CBN", "start": round(start, 3), "end": round(end, 3), "motion": "push-in"})
             used.append("CBN")
         elif kind == "POLICY":
-            beats.append({"kind": "MAP", "start": round(cursor, 3), "end": round(end, 3)})
+            beats.append({"kind": "MAP", "start": round(start, 3), "end": round(end, 3)})
             used.append("POLICY_GRAPHIC")
         else:
             key = REAL_AP_CLOSING_KEY if kind == "CLOSING" else kind
             asset = real_assets.get(key) or real_assets.get(kind)
             if not asset:
-                beats.append({"kind": "FOOTAGE", "start": round(cursor, 3), "end": round(end, 3)})
+                beats.append({"kind": "FOOTAGE", "start": round(start, 3), "end": round(end, 3)})
             else:
                 beats.append({
                     "kind": "IMAGE", "scene_key": asset["scene_key"],
                     "image": asset.get("path") or asset.get("storage_uri"),
-                    "start": round(cursor, 3), "end": round(end, 3), "motion": motion or "push-in",
+                    "start": round(start, 3), "end": round(end, 3), "motion": motion or "push-in",
                     "label": asset.get("location"), "real": True, "asset_source": asset.get("candidate_id"),
                 })
                 used.append(asset["scene_key"])
-        cursor = end
-        if cursor >= duration:
+        if end >= duration:
             break
     return beats, used
 
