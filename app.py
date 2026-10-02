@@ -72,6 +72,7 @@ from media_tools import (
 )
 from visual_qa import visual_qa_provider_for
 import final_reel_composer
+import reel_standard
 from meta_distribution import (
     COPY_POLICY_VERSION as DISTRIBUTION_COPY_POLICY_VERSION,
     PLATFORMS as META_PLATFORMS,
@@ -7685,6 +7686,7 @@ def event_room(event_id):
     return {
         "event": dict(event), "signals": signals, "claims": claims, "runs": runs,
         "final_reels": final_reels, "final_reel_source_asset_id": final_reel_eligible,
+        "reel_standard": reel_standard.active_standard(),
         "reference_media": {
             "cbn_options": _reference_media_choices("PUBLIC_FIGURE_PHOTO"),
             "tdp_options": _reference_media_choices("PARTY_LOGO"),
@@ -7749,6 +7751,7 @@ def overview():
         "source_counts": source_counts,
         "metrics": metrics,
         "connected": False,
+        "reel_standard": reel_standard.active_standard(),
         "reference_media": {
             "cbn_options": _reference_media_choices("PUBLIC_FIGURE_PHOTO"),
             "tdp_options": _reference_media_choices("PARTY_LOGO"),

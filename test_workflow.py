@@ -4150,6 +4150,42 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("third_asset_transition_count", source)
         self.assertIn("RENDERED_FRAME", source.upper())
 
+    def test_reel_production_standard_v1_defaults_and_non_bypassable_gates(self):
+        import reel_standard
+        std = reel_standard.active_standard()
+        self.assertEqual(std["version"], "REEL_PRODUCTION_STANDARD_V1")
+        self.assertEqual(std["reference_reel_id"], "FR-8623B1425165")
+        # Compositor anti-patterns are codified, not tribal knowledge.
+        self.assertFalse(std["compositor"]["persistent_base_layer"])
+        self.assertFalse(std["compositor"]["fade_to_zero_before_next_scene"])
+        self.assertIn("fallback footage", std["compositor"]["forbidden"])
+        self.assertFalse(std["review"]["auto_publish"])
+        self.assertFalse(std["rights"]["unknown_allowed"])
+        # Overrides must be explicit, recorded, reasoned, and cannot bypass core gates.
+        with self.assertRaises(reel_standard.StandardOverrideError):
+            reel_standard.validate_override({"bypass": []})
+        with self.assertRaises(reel_standard.StandardOverrideError):
+            reel_standard.validate_override({"reason": "x", "bypass": ["FACTUAL_QA"]})
+        self.assertTrue(reel_standard.validate_override({"reason": "x", "bypass": ["LOCAL_CONTEXT_QA"]})["recorded"])
+        # Reference-standard QA flags a hidden fallback and a third asset.
+        good = {"continuous_narration_qa": {"status": "PASS"}, "editorial_continuity_qa": {"status": "PASS", "distinct_visuals": 8},
+                "rendered_frame_continuity_qa": {"status": "PASS", "third_asset_transition_count": 0, "rendered_repeated_asset_count": 0},
+                "rights_provenance_qa": {"status": "PASS"}, "local_context_qa": {"status": "PASS", "real_ap_percent": 78},
+                "public_figure_qa": {"status": "PASS"}, "subtitle_qa": {"status": "PASS"}, "audio_qa": {"status": "PASS"},
+                "instagram_compatibility": {"compliant": True}, "facebook_compatibility": {"compliant": True},
+                "composition_manifest": {"beats": [{"kind": "IMAGE"}]}}
+        self.assertEqual(reel_standard.reference_standard_qa(good)["status"], "PASS")
+        bad = dict(good, composition_manifest={"beats": [{"kind": "FOOTAGE"}]})
+        self.assertEqual(reel_standard.reference_standard_qa(bad)["status"], "FLAG")
+
+    def test_standard_is_default_and_recorded_on_every_reel(self):
+        source = Path(app.__file__).with_name("final_reel_composer.py").read_text(encoding="utf-8")
+        self.assertIn("PRODUCTION_STANDARD_VERSION", source)
+        self.assertIn("production_standard_version", source)
+        # The active standard is exposed to the review UI.
+        overview = app.overview()
+        self.assertEqual(overview["reel_standard"]["version"], "REEL_PRODUCTION_STANDARD_V1")
+
     def test_generated_scene_provenance_and_beat_plan(self):
         # Every generated scene is an original work with a prompt and provenance recorded.
         scenes = final_reel_composer.generate_scenes(

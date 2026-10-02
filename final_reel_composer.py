@@ -21,11 +21,12 @@ from media_tools import frame_extractor_for, ocr_provider_for
 from meta_distribution import check_compliance
 from media_rendering import renderer_configuration, renderer_for
 from sarvam_tts import normalize_years_for_speech
+from reel_standard import PRODUCTION_STANDARD_VERSION, reference_standard_qa
 
 ROOT = Path(__file__).resolve().parent
 COMPOSER_SOURCE = ROOT / "tools" / "final_reel_composer.swift"
 COMPOSER_CACHE = ROOT / ".cache" / "final-reel-composer"
-COMPOSER_POLICY_VERSION = "final-reel-composer-v25"
+COMPOSER_POLICY_VERSION = "final-reel-composer-v27"
 VOICE_PROVIDER = "apple-speech"
 VOICE_MODEL = "Aman (en-IN)"
 TELUGU_VOICE_MODEL = "Geeta (te_IN)"
@@ -1649,6 +1650,13 @@ def compose_final_reel(source_asset_id, *, connect, storage_root, now, voice_mod
             "narration-trimmed.wav", contiguous, 48000, source_count=1, scene_count=len(beats), audio_restarts=0)
     instagram = check_compliance("INSTAGRAM_REELS", video)
     facebook = check_compliance("FACEBOOK_REELS", video)
+    reference_qa = reference_standard_qa({
+        "continuous_narration_qa": continuous_qa, "editorial_continuity_qa": editorial_qa,
+        "rendered_frame_continuity_qa": rendered_qa or {}, "rights_provenance_qa": rights_result or {},
+        "local_context_qa": local_context_result or {}, "subtitle_qa": subtitle_qa, "audio_qa": audio_qa,
+        "public_figure_qa": public_figure_qa, "instagram_compatibility": instagram,
+        "facebook_compatibility": facebook, "composition_manifest": {"beats": beats},
+    })
     gate_items = [technical_qa, subtitle_qa, audio_qa, factual_qa, public_figure_qa, editorial_qa, naturalness_qa]
     if language == "te":
         gate_items.extend([item for item in (continuous_qa, year_qa) if item and item.get("status") != "N/A"])
@@ -1711,6 +1719,8 @@ def compose_final_reel(source_asset_id, *, connect, storage_root, now, voice_mod
         "local_context_qa_json": json.dumps(local_context_result, ensure_ascii=False, sort_keys=True) if local_context_result else None,
         "rights_provenance_qa_json": json.dumps(rights_result, ensure_ascii=False, sort_keys=True) if rights_result else None,
         "rendered_frame_continuity_qa_json": json.dumps(rendered_qa, ensure_ascii=False, sort_keys=True) if rendered_qa else None,
+        "reference_standard_qa_json": json.dumps(reference_qa, ensure_ascii=False, sort_keys=True),
+        "production_standard_version": PRODUCTION_STANDARD_VERSION,
         "editorial_continuity_qa_json": json.dumps(editorial_qa, ensure_ascii=False, sort_keys=True),
         "narration_naturalness_qa_json": json.dumps(naturalness_qa, ensure_ascii=False, sort_keys=True),
         "narration_job_json": json.dumps(narration_job, ensure_ascii=False, sort_keys=True),
@@ -1740,7 +1750,7 @@ def decoded_final_reel(asset):
                      "editorial_continuity_qa_json", "narration_naturalness_qa_json", "narration_job_json",
                      "continuous_narration_qa_json", "year_pronunciation_qa_json",
                      "local_context_qa_json", "rights_provenance_qa_json",
-                     "rendered_frame_continuity_qa_json"):
+                     "rendered_frame_continuity_qa_json", "reference_standard_qa_json"):
         raw = result.pop(optional, None)
         result[optional.removesuffix("_json")] = json.loads(raw) if raw else None
     return result

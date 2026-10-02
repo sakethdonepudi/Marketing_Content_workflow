@@ -34,4 +34,6 @@ ALTER TABLE final_reel_assets ADD COLUMN year_pronunciation_qa_json TEXT;
 ALTER TABLE final_reel_assets ADD COLUMN local_context_qa_json TEXT;
 ALTER TABLE final_reel_assets ADD COLUMN rights_provenance_qa_json TEXT;
 ALTER TABLE final_reel_assets ADD COLUMN rendered_frame_continuity_qa_json TEXT;
+ALTER TABLE final_reel_assets ADD COLUMN reference_standard_qa_json TEXT;
+ALTER TABLE final_reel_assets ADD COLUMN production_standard_version TEXT;
 

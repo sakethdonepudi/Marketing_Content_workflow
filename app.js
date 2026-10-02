@@ -780,6 +780,8 @@ function finalReelCard(reel, {current = false} = {}) {
     el('span', 'secondary-text', 'Approval is per exact Final Reel version and is never inherited.')));
   const figureQa = reel.public_figure_qa || {};
   side.append(facts([
+    ['Production standard', reel.production_standard_version || '—'],
+    ['Reference-standard QA', (reel.reference_standard_qa || {}).status || '—'],
     ['Source video', `${reel.source_asset_id} v${reel.source_asset_version}`],
     ['CBN asset', reel.cbn_asset_id || 'Not included'],
     ['TDP asset', reel.tdp_asset_id || 'Not included'],
@@ -906,7 +908,9 @@ function renderFinalReels(data, root) {
   const reels = data.final_reels || [];
   const source = data.final_reel_source_asset_id;
   const section = el('div', 'final-reel-section');
+  const standard = data.reel_standard || {};
   const head = el('div', 'reel-section-head', el('h2', '', 'Final Reels'),
+    standard.version ? plainPill(`Standard · ${standard.version}`, 'good') : null,
     source ? plainPill(`Source ready · ${source}`, 'good') : plainPill('No eligible source', 'warn'));
   section.append(head);
   section.append(referenceMediaPanel(data));

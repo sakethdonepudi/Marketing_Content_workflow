@@ -463,34 +463,83 @@ func stillLayer(imagePath: String, start: Double, end: Double, motion: String?, 
     return layer
 }
 
-/// A locally drawn Andhra Pradesh state-map silhouette graphic (no paid generation).
+/// A stylized India outline (dots grid) with Andhra Pradesh highlighted, drawn locally.
+///
+/// Stylized, non-survey: a light dot matrix suggests the country silhouette and the AP
+/// region is filled in the accent green with a gold marker, so the highlight reads clearly
+/// on mobile without claiming geographic precision.
 func mapGraphicLayer(start: Double, end: Double, size: CGSize) -> CALayer {
     let layer = CALayer()
     layer.frame = CGRect(origin: .zero, size: size)
     layer.backgroundColor = NSColor(calibratedRed: 0.97, green: 0.98, blue: 0.96, alpha: 1).cgColor
-    // Point path approximating the Andhra Pradesh outline (stylized, non-survey).
-    let unitPoints: [(CGFloat, CGFloat)] = [
-        (0.30, 0.14), (0.52, 0.10), (0.70, 0.16), (0.80, 0.30), (0.74, 0.46),
-        (0.82, 0.58), (0.70, 0.72), (0.58, 0.86), (0.40, 0.82), (0.28, 0.66),
-        (0.22, 0.50), (0.18, 0.34),
+
+    let mapWidth = size.width * 0.74, mapHeight = size.height * 0.56
+    let originX = (size.width - mapWidth) / 2, originY = size.height * 0.20
+
+    // Stylized India silhouette (normalized, y measured from the bottom). Broad north,
+    // tapering to a peninsula with the east-coast bulge and the southern tip.
+    let india: [(CGFloat, CGFloat)] = [
+        (0.22, 0.98), (0.34, 1.00), (0.48, 0.96), (0.60, 0.99), (0.72, 0.94),
+        (0.82, 0.86), (0.86, 0.74), (0.80, 0.64), (0.72, 0.58), (0.70, 0.48),
+        (0.66, 0.38), (0.58, 0.30), (0.54, 0.20), (0.50, 0.10), (0.46, 0.02),
+        (0.42, 0.12), (0.40, 0.24), (0.34, 0.34), (0.26, 0.44), (0.20, 0.56),
+        (0.16, 0.70), (0.16, 0.84),
     ]
-    let shape = CAShapeLayer()
-    let mapWidth = size.width * 0.62, mapHeight = size.height * 0.5
-    let originX = (size.width - mapWidth) / 2, originY = size.height * 0.24
-    let path = CGMutablePath()
-    for (index, point) in unitPoints.enumerated() {
-        let x = originX + point.0 * mapWidth, y = originY + (1 - point.1) * mapHeight
-        if index == 0 { path.move(to: CGPoint(x: x, y: y)) } else { path.addLine(to: CGPoint(x: x, y: y)) }
+    func point(_ unit: (CGFloat, CGFloat)) -> CGPoint {
+        CGPoint(x: originX + unit.0 * mapWidth, y: originY + (1 - unit.1) * mapHeight)
     }
-    path.closeSubpath()
-    shape.path = path
-    shape.fillColor = NSColor(calibratedRed: 0.19, green: 0.44, blue: 0.25, alpha: 0.16).cgColor
-    shape.strokeColor = NSColor(calibratedRed: 0.19, green: 0.44, blue: 0.25, alpha: 0.9).cgColor
-    shape.lineWidth = 4
-    layer.addSublayer(shape)
+    let outline = CGMutablePath()
+    for (index, unit) in india.enumerated() {
+        let p = point(unit)
+        if index == 0 { outline.move(to: p) } else { outline.addLine(to: p) }
+    }
+    outline.closeSubpath()
+    // Visible base: a soft silhouette fill with a clear outline.
+    let baseShape = CAShapeLayer()
+    baseShape.path = outline
+    baseShape.fillColor = NSColor(calibratedRed: 0.90, green: 0.92, blue: 0.88, alpha: 1).cgColor
+    baseShape.strokeColor = NSColor(calibratedRed: 0.55, green: 0.60, blue: 0.54, alpha: 1).cgColor
+    baseShape.lineWidth = 2.5
+    layer.addSublayer(baseShape)
+
+    // Andhra Pradesh region on the south-east coast, highlighted in the accent green.
+    let ap: [(CGFloat, CGFloat)] = [
+        (0.42, 0.52), (0.56, 0.47), (0.66, 0.38), (0.62, 0.30),
+        (0.54, 0.24), (0.46, 0.30), (0.40, 0.40),
+    ]
+    let apPath = CGMutablePath()
+    for (index, unit) in ap.enumerated() {
+        let p = point(unit)
+        if index == 0 { apPath.move(to: p) } else { apPath.addLine(to: p) }
+    }
+    apPath.closeSubpath()
+    let apShape = CAShapeLayer()
+    apShape.path = apPath
+    apShape.fillColor = NSColor(calibratedRed: 0.19, green: 0.44, blue: 0.25, alpha: 0.92).cgColor
+    apShape.strokeColor = NSColor(calibratedRed: 0.13, green: 0.34, blue: 0.19, alpha: 1).cgColor
+    apShape.lineWidth = 3
+    layer.addSublayer(apShape)
+    // Small gold locator marker at the AP capital region.
+    let marker = CALayer()
+    let markerPoint = point((0.52, 0.38))
+    marker.frame = CGRect(x: markerPoint.x - 7, y: markerPoint.y - 7, width: 14, height: 14)
+    marker.cornerRadius = 7
+    marker.backgroundColor = NSColor(calibratedRed: 0.72, green: 0.53, blue: 0.04, alpha: 1).cgColor
+    marker.borderColor = NSColor.white.cgColor
+    marker.borderWidth = 2
+    layer.addSublayer(marker)
+    // A small caption line pointing at the highlight.
+    let apLabel = CALayer()
+    apLabel.frame = CGRect(x: size.width * 0.60, y: size.height * 0.52, width: size.width * 0.34, height: size.height * 0.05)
+    apLabel.contents = cardBitmap(lines: [("ఆంధ్రప్రదేశ్", size.width * 0.036, true)],
+                                  size: apLabel.bounds.size, accent: false)
+    apLabel.contentsGravity = .resize
+    apLabel.contentsScale = 2
+    layer.addSublayer(apLabel)
+
     let label = CALayer()
-    label.frame = CGRect(x: 0, y: size.height * 0.76, width: size.width, height: size.height * 0.1)
-    label.contents = cardBitmap(lines: [("ANDHRA PRADESH", size.width * 0.06, true)],
+    label.frame = CGRect(x: 0, y: size.height * 0.80, width: size.width, height: size.height * 0.1)
+    label.contents = cardBitmap(lines: [("ANDHRA PRADESH", size.width * 0.055, true)],
                                 size: label.bounds.size, accent: false)
     label.contentsGravity = .resize
     label.contentsScale = 2
