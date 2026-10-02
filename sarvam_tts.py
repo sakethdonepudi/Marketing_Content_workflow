@@ -58,6 +58,40 @@ def synthesize_edge(text, out_path, *, voice=EDGE_TTS_DEFAULT_VOICE, rate_percen
     return str(out_path)
 
 
+# Spoken-Telugu normalization applied to TTS input only; display text keeps digits.
+def normalize_years_for_speech(text):
+    """Replace year tokens with spoken Telugu words so TTS never reads them digit by digit."""
+    replacements = {
+        "2025–26": "రెండు వేల ఇరవై ఐదు - ఇరవై ఆరు",
+        "2025-26": "రెండు వేల ఇరవై ఐదు - ఇరవై ఆరు",
+        "2025": "రెండు వేల ఇరవై ఐదు",
+        "2026": "రెండు వేల ఇరవై ఆరు",
+    }
+    normalized = str(text)
+    for token in ("2025–26", "2025-26", "2025", "2026"):
+        normalized = normalized.replace(token, replacements[token])
+    return normalized
+
+
+def synthesize_edge_continuous(text, out_path, *, voice=EDGE_TTS_VOICE, rate_percent=-11, language=EDGE_TTS_LANGUAGE):
+    """Synthesize the WHOLE narration in one edge_tts request (no chunk joins)."""
+    if not _edge_tts_available():
+        raise NarrationProviderError("edge-tts is not installed.")
+    import edge_tts as edge
+
+    async def run():
+        communicate = edge.Communicate(text=text, voice=voice, rate=edge_rate(rate_percent))
+        await communicate.save(str(out_path))
+
+    try:
+        asyncio.run(run())
+    except Exception as error:
+        raise NarrationProviderError(f"edge_tts synthesis failed: {error}") from error
+    if not Path(out_path).exists() or Path(out_path).stat().st_size < 200:
+        raise NarrationProviderError("edge_tts produced no audio.")
+    return str(out_path)
+
+
 def narration_provider_status():
     return {
         "default_provider": EDGE_TTS_PROVIDER,

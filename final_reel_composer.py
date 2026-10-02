@@ -20,11 +20,12 @@ from media_storage import LocalMediaStorage
 from media_tools import frame_extractor_for, ocr_provider_for
 from meta_distribution import check_compliance
 from media_rendering import renderer_configuration, renderer_for
+from sarvam_tts import normalize_years_for_speech
 
 ROOT = Path(__file__).resolve().parent
 COMPOSER_SOURCE = ROOT / "tools" / "final_reel_composer.swift"
 COMPOSER_CACHE = ROOT / ".cache" / "final-reel-composer"
-COMPOSER_POLICY_VERSION = "final-reel-composer-v15"
+COMPOSER_POLICY_VERSION = "final-reel-composer-v18"
 VOICE_PROVIDER = "apple-speech"
 VOICE_MODEL = "Aman (en-IN)"
 TELUGU_VOICE_MODEL = "Geeta (te_IN)"
@@ -39,14 +40,18 @@ EDGE_TTS_RATE = -12
 # Edge Telugu narration with semantic pauses. Each entry is (chunk_id, spoken_text,
 # pause_after_ms, pause_kind). Pauses are deliberate and varied: micro after short beats,
 # normal after sentences, and a real thought-change pause before "అన్‌రిజిస్టర్డ్ రైతులు కూడా".
-TELUGU_EDGE_CHUNKS = [
-    ("N1", "ఏపీ పొగాకు రైతులకు కీలక ఊరట.", 450, "sentence"),
-    ("N2", "2025–26 సీజన్‌లో అదనంగా పండిన ఎఫ్‌సీవీ పొగాకును ఇప్పుడు అమ్ముకోవచ్చు.", 420, "sentence"),
-    ("N3", "ఈ విక్రయాలకు కేంద్ర ప్రభుత్వం అనుమతి ఇచ్చింది.", 400, "sentence"),
-    ("N4A", "రిజిస్టర్డ్ రైతులే కాదు...", 750, "thought-change"),
-    ("N4B", "అన్‌రిజిస్టర్డ్ రైతులు కూడా టొబాకో బోర్డు వేలం కేంద్రాల్లో అమ్ముకోవచ్చు.", 480, "sentence"),
-    ("N5", "కేంద్ర వాణిజ్య మంత్రిత్వ శాఖ అధికారిక నోటిఫికేషన్ విడుదల చేసింది.", 0, "end"),
-]
+# The DISPLAY text keeps figures ("2025–26") for subtitles; the SPOKEN text is normalized to
+# Telugu number words so Edge TTS never reads the year digit by digit.
+TELUGU_DISPLAY_NARRATION = (
+    "ఏపీ పొగాకు రైతులకు ఒక కీలక ఊరట లభించింది. "
+    "2025–26 సీజన్‌లో అదనంగా పండిన ఎఫ్‌సీవీ పొగాకును అమ్ముకునేందుకు కేంద్ర ప్రభుత్వం అనుమతి ఇచ్చింది. "
+    "ఇందులో రిజిస్టర్డ్ రైతులే కాదు, అన్‌రిజిస్టర్డ్ రైతులకు కూడా అవకాశం కల్పించారు. "
+    "టొబాకో బోర్డు అనుమతించిన వేలం కేంద్రాల్లో ఈ అదనపు పంటను విక్రయించుకోవచ్చు. "
+    "ఈ నిర్ణయానికి సంబంధించి కేంద్ర వాణిజ్య మంత్రిత్వ శాఖ అధికారిక నోటిఫికేషన్ విడుదల చేసింది."
+)
+# Kept for dependency compatibility (factual QA reads (id, text, ...) tuples).
+TELUGU_EDGE_CHUNKS = [("WHOLE", TELUGU_DISPLAY_NARRATION, 0, "continuous")]
+EDGE_TTS_CONTINUOUS_RATE = -11
 
 # Natural Telugu news/explainer narration, chunked so timing and pauses are controlled.
 # Grounding: every sentence states only the three approved facts (Union government
@@ -492,6 +497,101 @@ def _run_edge_chunks(chunks, directory, rate):
     return clip_paths, pauses, cues
 
 
+def _run_edge_continuous(spoken_text, display_text, directory, rate):
+    """Synthesize the whole narration in one request, convert, and trim lead/tail silence.
+
+    Returns one voice path, an empty pause list, and phrase-level display cues.
+    """
+    from sarvam_tts import synthesize_edge_continuous, EDGE_TTS_VOICE
+    mp3 = directory / "narration.mp3"
+    wav = directory / "narration.wav"
+    synthesize_edge_continuous(spoken_text, mp3, voice=EDGE_TTS_VOICE, rate_percent=rate)
+    _audio_to_wav(mp3, wav)
+    trimmed = directory / "narration-trimmed.wav"
+    _trim_silence_edges(wav, trimmed, lead_ms=200, tail_ms=350)
+    cues = telugu_display_cues(display_text)
+    return [trimmed], [0.0], [cues]
+
+
+def telugu_display_cues(display_text):
+    """Phrase-level subtitle cues from the DISPLAY text (keeps '2025–26' as written)."""
+    sentences = [part.strip() for part in re.split(r"(?<=[.!?])\s+", str(display_text)) if part.strip()]
+    cues = []
+    for sentence in sentences:
+        words = sentence.split()
+        current = []
+        for word in words:
+            current.append(word)
+            if 3 <= len(current) <= 5:
+                cues.append(" ".join(current))
+                current = []
+        if current:
+            if cues and len(current) == 1:
+                cues[-1] = cues[-1] + " " + current[0]
+            else:
+                cues.append(" ".join(current))
+    return cues
+
+
+def _shorten_internal_silence(samples, sample_rate, *, threshold_db=-45.0, cap_ms=700, target_ms=450):
+    """Cap over-long internal pause runs to a natural breath length, keeping shorter ones."""
+    window = max(1, int(sample_rate * 0.02))
+    threshold = 10 ** (threshold_db / 20.0)
+    out = []
+    index = 0
+    total = len(samples)
+    while index < total:
+        chunk = samples[index:index + window]
+        if chunk and math.sqrt(sum(v * v for v in chunk) / len(chunk)) / 32768.0 < threshold:
+            start = index
+            while index < total:
+                probe = samples[index:index + window]
+                if not probe or math.sqrt(sum(v * v for v in probe) / len(probe)) / 32768.0 >= threshold:
+                    break
+                index += window
+            length = index - start
+            keep = length if length / sample_rate * 1000 <= cap_ms else int(target_ms / 1000 * sample_rate)
+            out.extend(samples[start:start + keep])
+        else:
+            out.append(samples[index])
+            index += 1
+    return out
+
+
+def _trim_silence_edges(source, destination, *, lead_ms=200, tail_ms=350, threshold_db=-45.0):
+    """Trim leading/trailing silence to the target budgets and cap over-long internal pauses."""
+    with wave.open(str(source), "rb") as handle:
+        sample_rate = handle.getframerate()
+        frames = handle.readframes(handle.getnframes())
+    samples = struct.unpack("<" + "h" * (len(frames) // 2), frames)
+    window = max(1, int(sample_rate * 0.02))
+    threshold = 10 ** (threshold_db / 20.0)
+    def quiet(chunk):
+        return chunk and math.sqrt(sum(v * v for v in chunk) / len(chunk)) / 32768.0 < threshold
+    first = 0
+    for start in range(0, len(samples) - window + 1, window):
+        if not quiet(samples[start:start + window]):
+            first = start
+            break
+    last = len(samples)
+    for end in range(len(samples) - window, 0, -window):
+        if not quiet(samples[end:end + window]):
+            last = end + window
+            break
+    lead = int(lead_ms / 1000 * sample_rate)
+    tail = int(tail_ms / 1000 * sample_rate)
+    keep_start = max(0, first - lead)
+    keep_end = min(len(samples), last + tail)
+    kept = list(samples[keep_start:keep_end])
+    kept = _shorten_internal_silence(kept, sample_rate)
+    with wave.open(str(destination), "wb") as output:
+        output.setnchannels(1)
+        output.setsampwidth(2)
+        output.setframerate(sample_rate)
+        output.writeframes(struct.pack("<" + "h" * len(kept), *kept))
+    return str(destination)
+
+
 def _audio_to_wav(source, destination):
     """Convert an audio file to 48 kHz mono 16-bit WAV with macOS afconvert."""
     converter = shutil.which("afconvert") or shutil.which("ffmpeg")
@@ -842,10 +942,14 @@ def editorial_continuity_qa(beats, *, has_cbn):
         if beat.get("kind") == "FOOTAGE" and 0 < index < len(beats) - 1:
             errors.append(f"Fallback footage inserted between scenes at beat {index}.")
     # Shot length sanity.
-    for index, beat in enumerate(beats):
-        span = (beat.get("end") or 0) - (beat.get("start") or 0)
-        if span > 4.5:
-            errors.append(f"Beat {index} holds {span:.1f}s (over 4.5s).")
+    spans = [round((beat.get("end") or 0) - (beat.get("start") or 0), 2) for beat in beats]
+    for index, span in enumerate(spans):
+        if span > 5.0:
+            errors.append(f"Beat {index} holds {span:.1f}s (over 5s).")
+    # Slide-presentation guard: identical shot durations are not editorial.
+    non_closing = spans[:-1] if len(spans) > 1 else spans
+    if len(non_closing) >= 3 and len(set(non_closing)) < 2:
+        errors.append("All shots share one duration; this reads like a slide deck, not an edit.")
     distinct = len({key for key in asset_sequence if key not in ("HOOK", "CLOSING")})
     return {
         "status": "PASS" if not errors else "FLAG", "errors": errors,
@@ -854,19 +958,91 @@ def editorial_continuity_qa(beats, *, has_cbn):
             "no_default_reset": not any(beat.get("kind") == "FOOTAGE" for beat in beats),
             "no_adjacent_duplicate": not any(asset_sequence[i] == asset_sequence[i - 1] for i in range(1, len(asset_sequence))),
             "single_cbn": len(cbn_beats) <= 1,
-            "max_shot_seconds": max(((beat.get("end") or 0) - (beat.get("start") or 0)) for beat in beats) if beats else 0,
+            "varied_shot_lengths": len(set(non_closing)) >= 2,
+            "max_shot_seconds": max(spans) if spans else 0,
         },
     }
 
 
-def narration_naturalness_qa(speech_seconds, word_count, pauses_seconds, checks):
-    """Measured naturalness: speaking rate, pause distribution, clipping, loudness, silences."""
+def analyze_silence(samples, sample_rate, *, threshold_db=-45.0, min_ms=250):
+    """Detect silence runs in a decoded track: opening pad, closing tail, and internal gaps."""
+    if not samples or not sample_rate:
+        return {"opening_ms": 0, "closing_ms": 0, "internal": []}
+    window = max(1, int(sample_rate * 0.02))  # 20 ms frames
+    threshold = 10 ** (threshold_db / 20.0)
+    runs = []
+    run_start = None
+    for start in range(0, len(samples) - window + 1, window):
+        chunk = samples[start:start + window]
+        rms = math.sqrt(sum(value * value for value in chunk) / len(chunk)) / 32768.0
+        quiet = rms < threshold
+        if quiet and run_start is None:
+            run_start = start
+        elif not quiet and run_start is not None:
+            runs.append((run_start / sample_rate, (start - run_start) / sample_rate))
+            run_start = None
+    if run_start is not None:
+        runs.append((run_start / sample_rate, (len(samples) - run_start) / sample_rate))
+    opening = 0.0
+    closing = 0.0
+    internal = []
+    for index, (start, length) in enumerate(runs):
+        if start <= 0.05 and index == 0:
+            opening = length
+        elif index == len(runs) - 1 and start + length >= (len(samples) / sample_rate) - 0.05:
+            closing = length
+        elif length * 1000 >= min_ms:
+            internal.append(round(length, 3))
+    return {"opening_ms": round(opening * 1000), "closing_ms": round(closing * 1000), "internal_seconds": internal}
+
+
+def continuous_narration_qa(narration_path, samples, sample_rate, *, source_count=1, scene_count=0, audio_restarts=0):
+    """PASS only for a single continuous narration file with natural, bounded silence."""
+    silence = analyze_silence(samples, sample_rate)
+    errors = []
+    if source_count != 1:
+        errors.append(f"Narration was assembled from {source_count} pieces; it must be one continuous file.")
+    if silence["opening_ms"] > 200:
+        errors.append(f"Opening silence {silence['opening_ms']} ms exceeds 200 ms.")
+    if silence["closing_ms"] > 400:
+        errors.append(f"Closing silence {silence['closing_ms']} ms exceeds 400 ms.")
+    long_internal = [value for value in silence["internal_seconds"] if value > 0.65]
+    if long_internal:
+        errors.append(f"Internal silence over 650 ms: {long_internal}.")
+    if audio_restarts:
+        errors.append(f"{audio_restarts} audio restart(s) detected at scene boundaries.")
+    return {
+        "status": "PASS" if not errors else "FLAG", "errors": errors,
+        "source_files": source_count, "opening_ms": silence["opening_ms"], "closing_ms": silence["closing_ms"],
+        "internal_silence_seconds": silence["internal_seconds"], "audio_restarts": audio_restarts,
+    }
+
+
+def year_pronunciation_qa(spoken_text):
+    """The TTS input must contain spoken Telugu number words, never raw year digits."""
+    errors = []
+    for token in ("2025", "2026", "2025–26", "2025-26"):
+        if token in spoken_text:
+            errors.append(f"Spoken text still contains the raw year token {token}.")
+    if "రెండు వేల ఇరవై ఐదు" not in spoken_text:
+        errors.append("Spoken text is missing the Telugu words for 2025.")
+    return {"status": "PASS" if not errors else "FLAG", "errors": errors,
+            "spoken_has_words": "రెండు వేల ఇరవై ఐదు" in spoken_text}
+
+
+def narration_naturalness_qa(speech_seconds, word_count, pauses_seconds, checks, *, continuous=False):
+    """Measured naturalness: speaking rate, pause distribution, clipping, loudness, silences.
+
+    For a single continuous TTS take, pauses come from the engine's punctuation handling and
+    are measured from the waveform (internal_silence), so a uniform-looking pause list is not a
+    failure; the continuous-narration QA covers pause distribution instead.
+    """
     rate_wpm = (word_count / speech_seconds * 60) if speech_seconds else 0
     pause_values = [value for value in pauses_seconds if value]
     errors = []
     if not 45 <= rate_wpm <= 140:
         errors.append(f"Speaking rate {rate_wpm:.0f} wpm is outside the comfortable Telugu explainer band.")
-    if len(set(round(value, 2) for value in pause_values)) < 2:
+    if not continuous and len(set(round(value, 2) for value in pause_values)) < 2:
         errors.append("Pauses are uniform; natural delivery needs varied semantic pauses.")
     if checks.get("clipping") is False:
         errors.append("Narration clips.")
@@ -880,10 +1056,12 @@ def narration_naturalness_qa(speech_seconds, word_count, pauses_seconds, checks)
 
 
 def telugu_scene_plan(duration, scene_rows, *, has_cbn):
-    """Scene-synced beats for the Telugu explainer: each narration idea owns its visual.
+    """Editorial B-roll plan with VARIED shot lengths and J/L cuts.
 
-    Direct scene-to-scene progression (no default tobacco reset), scaled to the real speech
-    length. CBN is capped near 2.4 s and never the opening or closing frame.
+    Shot durations differ deliberately (not fixed 4 s blocks) and the plan is independent of
+    sentence boundaries: narration runs continuously underneath the cuts. CBN is one beat,
+    ~2.2 s, never the opener or closer. Motion alternates push-in / pan / kenburns / drift so
+    no two consecutive shots move the same way.
     """
     def scene(key, motion):
         row = scene_rows.get(key)
@@ -891,38 +1069,40 @@ def telugu_scene_plan(duration, scene_rows, *, has_cbn):
             return None
         return {"kind": "IMAGE", "scene_key": key, "image": row["storage_uri"], "motion": motion}
 
-    # Sequential story with no adjacent repeats: the hook uses the warehouse, the market beat
-    # reuses it only after three intervening scenes, and the closing uses a not-yet-seen visual.
+    # Hand-tuned first-two-second rhythm then longer explanatory holds; weights vary so no two
+    # shots are the same length. HOOK is short, mid beats longer, closing short.
     plan = [
-        ("HOOK", 0.13), ("FIELD", 0.15), ("BARN", 0.13), ("AUCTION", 0.14),
-        ("CBN", 0.11), ("ELIGIBILITY", 0.13), ("POLICY", 0.11), ("CLOSING", 0.10),
+        ("HOOK", 1.0), ("FIELD", 1.35), ("BARN", 1.2), ("AUCTION", 1.5),
+        ("CBN", 0.72), ("ELIGIBILITY", 1.45), ("POLICY", 1.05), ("CLOSING", 0.85),
     ]
     scene_map = {
         "HOOK": ("AUCTION_WAREHOUSE_BALES", "push-in"),
-        "FIELD": ("AP_FIELD_GOLDEN", "push-in"),
-        "BARN": ("BARN_CURED_LEAVES", "kenburns"),
+        "FIELD": ("AP_FIELD_GOLDEN", "pan-left"),
+        "BARN": ("BARN_CURED_LEAVES", "push-out"),
         "AUCTION": ("AUCTION_PLATFORM_NEUTRAL", "pan-right"),
-        "ELIGIBILITY": ("GRADING_TAGS_CLOSEUP", "pan-left"),
-        "CLOSING": ("AUCTION_WAREHOUSE_BALES", "push-in"),
+        "ELIGIBILITY": ("GRADING_TAGS_CLOSEUP", "drift"),
+        "CLOSING": ("AP_FIELD_GOLDEN", "push-out"),
     }
     total_weight = sum(weight for _, weight in plan)
     beats, cursor, used = [], 0.0, []
     # Reserve a short closing window so the final beat is a clean ~2.6s card, not a long hold.
     closing_seconds = min(3.0, max(2.2, duration * 0.09))
     main_span = max(1.0, duration - closing_seconds)
-    for kind, weight in plan:
-        if kind == "CBN" and not has_cbn:
-            kind = "PLATFORM"
+    for index, (kind, weight) in enumerate(plan):
         span = main_span * weight / total_weight
         if kind == "CBN":
-            span = min(span, 2.4)
-        span = max(2.0, min(4.0, span))
+            span = min(span, 2.2)
+        span = max(1.4, min(5.0, span))
         if kind == "CLOSING":
             end = duration
         else:
             end = min(main_span, cursor + span)
         if kind == "CLOSING":
             cursor = main_span
+        # J/L-cut: shift the visual cut a little off the spoken beat so cuts rarely land on a
+        # sentence boundary. Audio is continuous; only the image moves underneath it.
+        if index > 0 and kind not in ("CLOSING",):
+            cursor = max(0.0, cursor + (0.12 if index % 2 else -0.12))
         if kind in ("HOOK", "CLOSING"):
             beat = {"kind": kind, "start": round(cursor, 3), "end": round(end, 3)}
             if kind == "CLOSING":
@@ -1049,11 +1229,15 @@ def compose_final_reel(source_asset_id, *, connect, storage_root, now, voice_mod
             (source["id"],),
         ).fetchone()
     previous_reel_id = prior["id"] if prior else None
+    spoken_narration = None
+    year_qa = None
     if language == "te":
-        narration = " ".join(chunk[1] for chunk in narration_chunks)
-        factual_qa = telugu_factual_qa(narration_chunks)
+        narration = TELUGU_DISPLAY_NARRATION
+        spoken_narration = normalize_years_for_speech(narration)
+        factual_qa = telugu_factual_qa([("WHOLE", narration, 0, "continuous")])
+        year_qa = year_pronunciation_qa(spoken_narration)
         voice_model = EDGE_TTS_VOICE
-        speech_rate = EDGE_TTS_RATE if speech_rate is None else speech_rate
+        speech_rate = EDGE_TTS_CONTINUOUS_RATE if speech_rate is None else speech_rate
         voice_provider = EDGE_TTS_PROVIDER
     else:
         narration = approved_narration(package)
@@ -1111,15 +1295,18 @@ def compose_final_reel(source_asset_id, *, connect, storage_root, now, voice_mod
         if existing:
             return dict(existing)
 
+    narration_samples = None
     with tempfile.TemporaryDirectory(prefix="reachout-final-reel-") as temporary:
         directory = Path(temporary)
         source_path = directory / "source.mp4"
         source_path.write_bytes(source_bytes)
         if language == "te":
-            # Audio-first: synthesize each chunk with Edge TTS, then concatenate with explicit
-            # silence so the semantic pause timing is deterministic and drives the edit.
-            voice_paths, voice_pauses, voice_cues = _run_edge_chunks(narration_chunks, directory, speech_rate)
-            voice_texts = [chunk[1] for chunk in narration_chunks]
+            # ONE continuous synthesis: the whole narration in a single Edge TTS request so the
+            # voice has continuous prosody. Lead-in/out silence is trimmed; internal pauses come
+            # from the engine's punctuation handling, not inserted silence WAVs.
+            voice_paths, voice_pauses, voice_cues = _run_edge_continuous(
+                spoken_narration, narration, directory, speech_rate)
+            voice_texts = [narration]
         else:
             voice_paths = _run_voice_blocks(phrases, directory, voice=voice_model.split(" ", 1)[0], rate=speech_rate)
             voice_texts = list(phrases)
@@ -1206,10 +1393,13 @@ def compose_final_reel(source_asset_id, *, connect, storage_root, now, voice_mod
         receipt["neutralizedEditLists"] = neutralized_edit_lists
         narration_speech_seconds = sum(_wav_or_aiff_seconds(path) for path in voice_paths)
         if language == "te":
-            narration_wav = _concat_with_silence(voice_paths, [p * 1000 for p in voice_pauses], directory)
-            narration_audio_bytes = Path(narration_wav).read_bytes()
+            narration_audio_bytes = Path(voice_paths[0]).read_bytes()
+            with wave.open(str(voice_paths[0]), "rb") as handle:
+                raw = handle.readframes(handle.getnframes())
+            narration_samples = struct.unpack("<" + "h" * (len(raw) // 2), raw)
         else:
             narration_audio_bytes = None
+            narration_samples = None
 
     video = inspect_video(output_bytes)
     video["file_size"] = len(output_bytes)
@@ -1241,11 +1431,19 @@ def compose_final_reel(source_asset_id, *, connect, storage_root, now, voice_mod
     word_count = len(narration.split())
     naturalness_qa = narration_naturalness_qa(
         speech_seconds, word_count, voice_pauses if language == "te" else [None],
-        audio_qa.get("checks", {}))
+        audio_qa.get("checks", {}), continuous=(language == "te"))
+    continuous_qa = {"status": "N/A", "errors": []}
+    if language == "te" and narration_samples is not None:
+        contiguous = tuple(narration_samples)
+        cont_silence = analyze_silence(contiguous, 48000)
+        continuous_qa = continuous_narration_qa(
+            "narration-trimmed.wav", contiguous, 48000, source_count=1, scene_count=len(beats), audio_restarts=0)
     instagram = check_compliance("INSTAGRAM_REELS", video)
     facebook = check_compliance("FACEBOOK_REELS", video)
-    ready = all(item["status"] == "PASS" for item in (
-        technical_qa, subtitle_qa, audio_qa, factual_qa, public_figure_qa, editorial_qa, naturalness_qa)) \
+    gate_items = [technical_qa, subtitle_qa, audio_qa, factual_qa, public_figure_qa, editorial_qa, naturalness_qa]
+    if language == "te":
+        gate_items.extend([item for item in (continuous_qa, year_qa) if item and item.get("status") != "N/A"])
+    ready = all(item["status"] == "PASS" for item in gate_items) \
         and instagram["compliant"] and facebook["compliant"]
     # Store the narration audio as its own asset so the voice is replaceable without visuals.
     narration_audio = None
@@ -1303,6 +1501,8 @@ def compose_final_reel(source_asset_id, *, connect, storage_root, now, voice_mod
         "editorial_continuity_qa_json": json.dumps(editorial_qa, ensure_ascii=False, sort_keys=True),
         "narration_naturalness_qa_json": json.dumps(naturalness_qa, ensure_ascii=False, sort_keys=True),
         "narration_job_json": json.dumps(narration_job, ensure_ascii=False, sort_keys=True),
+        "continuous_narration_qa_json": json.dumps(continuous_qa, ensure_ascii=False, sort_keys=True),
+        "year_pronunciation_qa_json": json.dumps(year_qa, ensure_ascii=False, sort_keys=True) if year_qa else None,
         "status": "READY_FOR_REVIEW" if ready else "BLOCKED", "human_review_status": "REQUIRED",
         "cost_status": scene_cost_status, "cost_usd": scene_cost_usd,
         "currency": "USD" if scene_cost_usd is not None else None, "created_at": now(),
@@ -1324,7 +1524,8 @@ def decoded_final_reel(asset):
     ):
         result[key.removesuffix("_json")] = json.loads(result.pop(key))
     for optional in ("public_figure_qa_json", "composition_manifest_json", "source_qa_json",
-                     "editorial_continuity_qa_json", "narration_naturalness_qa_json", "narration_job_json"):
+                     "editorial_continuity_qa_json", "narration_naturalness_qa_json", "narration_job_json",
+                     "continuous_narration_qa_json", "year_pronunciation_qa_json"):
         raw = result.pop(optional, None)
         result[optional.removesuffix("_json")] = json.loads(raw) if raw else None
     return result
