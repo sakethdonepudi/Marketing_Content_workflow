@@ -1,0 +1,39 @@
+{
+  "workspace_key": "n-chandrababu-naidu-andhra-pradesh",
+  "display_name": "N. Chandrababu Naidu — Andhra Pradesh",
+  "leader": {
+    "canonical_name": "N. Chandrababu Naidu",
+    "aliases": [
+      "N. Chandrababu Naidu",
+      "N Chandrababu Naidu",
+      "Nara Chandrababu Naidu",
+      "Nara Chandra Babu Naidu",
+      "Chandrababu Naidu"
+    ]
+  },
+  "jurisdiction": "Andhra Pradesh, India",
+  "topics": [
+    "official leader updates",
+    "public leadership",
+    "government administration",
+    "public policy",
+    "leader identity"
+  ],
+  "topic_keywords": [
+    "chief minister",
+    "government",
+    "governance",
+    "public policy",
+    "administration",
+    "leadership"
+  ],
+  "allowed_hosts": [
+    "ncbn.info",
+    "prakasam.ap.gov.in",
+    "ap.nic.in",
+    "commerce.gov.in",
+    "www.commerce.gov.in",
+    "pib.gov.in",
+    "www.pib.gov.in"
+  ]
+}
