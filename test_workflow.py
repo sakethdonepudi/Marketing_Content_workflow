@@ -4109,6 +4109,31 @@ class WorkflowTests(unittest.TestCase):
         self.assertTrue(all(item["lifecycle_state"] != "APPROVED_FOR_USE"
                             for item in report["candidates"] if item["license_status"] == "UNKNOWN"))
 
+    def test_real_ap_plan_local_context_and_rights_qa(self):
+        import final_reel_composer as frc
+        assets = {
+            key: {"scene_key": key, "storage_uri": f"local://{key}.jpg", "candidate_id": f"MC-{key}",
+                  "rights_status": "ATTRIBUTION_REQUIRED", "attribution": "Wikimedia Commons / X — CC BY-SA 4.0",
+                  "attribution_required": True, "publisher": "Wikimedia", "location": "Nellore, Andhra Pradesh",
+                  "content_hash": key}
+            for key in ("PLATFORM", "PLANTATION", "BARN", "DRYING", "OFFICIALS", "GUNTUR", "TRACTOR")
+        }
+        beats, used = frc.real_ap_scene_plan(30.0, assets, has_cbn=True)
+        self.assertGreaterEqual(len(beats), 9)
+        self.assertLessEqual(max(b["end"] for b in beats), 30.0)
+        # No fallback reset and varied shot lengths.
+        self.assertFalse(any(b["kind"] == "FOOTAGE" for b in beats))
+        spans = [round(b["end"] - b["start"], 2) for b in beats]
+        self.assertGreaterEqual(len(set(spans)), 2)
+        # Real assets dominate; the map/policy beat is the only non-photo visual.
+        lc = frc.local_context_qa(beats, generated_scene_ids=[])
+        self.assertEqual(lc["status"], "PASS")
+        self.assertGreaterEqual(lc["real_ap_percent"], 60)
+        # Rights QA passes only when every real asset is cleared and attributed.
+        self.assertEqual(frc.rights_provenance_qa(assets)["status"], "PASS")
+        bad = dict(assets, BAD={"scene_key": "BAD", "rights_status": "UNKNOWN", "attribution": None})
+        self.assertEqual(frc.rights_provenance_qa(bad)["status"], "FLAG")
+
     def test_generated_scene_provenance_and_beat_plan(self):
         # Every generated scene is an original work with a prompt and provenance recorded.
         scenes = final_reel_composer.generate_scenes(

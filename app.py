@@ -6647,6 +6647,38 @@ def final_reel_asset(final_reel_id):
     return decoded
 
 
+def _real_assets_for_reel(connection):
+    """Map ingested, rights-cleared media candidates to the real-AP scene plan keys.
+
+    Only APPROVED/INGESTED candidates with reusable rights and stored bytes are returned.
+    """
+    wanted = {
+        "MC-03DBB193FF24": "PLATFORM", "MC-45C070722C33": "PLANTATION", "MC-9D6CA783015D": "BARN",
+        "MC-A64E5567006F": "DRYING", "MC-889125EDC332": "OFFICIALS", "MC-FD804ACF7BB5": "GUNTUR",
+        "MC-01DC62B4E411": "TRACTOR", "MC-3B9836A55AE1": "BARN_LANDSCAPE",
+    }
+    rows = [dict(row) for row in connection.execute(
+        "SELECT * FROM media_candidates WHERE lifecycle_state='INGESTED' AND storage_uri IS NOT NULL "
+        "AND license_status IN ('VERIFIED_REUSE','ATTRIBUTION_REQUIRED','USER_PROVIDED')"
+    )]
+    assets = {}
+    for row in rows:
+        key = wanted.get(row["id"])
+        if not key:
+            continue
+        location = ", ".join(part for part in (row["district"], row["state"] if row["state"] else None) if part) or None
+        if row["state"] and "Andhra Pradesh" not in (location or ""):
+            location = f"{location}, Andhra Pradesh" if location else "Andhra Pradesh"
+        assets[key] = {
+            "scene_key": key, "storage_uri": row["storage_uri"], "candidate_id": row["id"],
+            "rights_status": row["license_status"], "attribution": row["attribution_text"],
+            "attribution_required": bool(row["attribution_required"]), "publisher": row["publisher"],
+            "location": location if row["ap_specific"] == "yes" else None,
+            "content_hash": row["content_hash"], "title": row["title"],
+        }
+    return assets
+
+
 def _reference_asset_for_reel(connection, asset_id, asset_type):
     """Resolve an optional contextual asset, requiring VERIFIED rights and the right type."""
     if asset_id in (None, ""):
@@ -6675,6 +6707,7 @@ def create_final_reel(source_asset_id, *, cbn_asset_id=None, tdp_asset_id=None, 
             raise ValueError("Final Reel composition blocked: " + " ".join(blockers))
         cbn = _reference_asset_for_reel(connection, cbn_asset_id, "PUBLIC_FIGURE_PHOTO")
         tdp = _reference_asset_for_reel(connection, tdp_asset_id, "PARTY_LOGO")
+        real_assets = _real_assets_for_reel(connection)
         scene_rows = {row["scene_key"]: dict(row) for row in connection.execute(
             "SELECT * FROM generated_scenes WHERE scene_key IN ("
             + ",".join("?" for _ in final_reel_composer.SCENE_ORDER) + ") "
@@ -6692,7 +6725,7 @@ def create_final_reel(source_asset_id, *, cbn_asset_id=None, tdp_asset_id=None, 
     try:
         result = composer(source_asset_id, connect=connect, storage_root=RENDER_STORAGE_ROOT, now=now,
                           cbn_asset_id=cbn["id"] if cbn else None, tdp_asset_id=tdp["id"] if tdp else None,
-                          contextual=contextual, scene_rows=scene_rows, language=language)
+                          contextual=contextual, scene_rows=scene_rows, language=language, real_assets=real_assets)
     except final_reel_composer.FinalReelError as error:
         raise ValueError(f"Final Reel composition failed: {error}") from error
     if isinstance(result, dict) and result.get("id"):

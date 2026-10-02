@@ -43,6 +43,8 @@ struct ComposerConfig: Codable {
     let cbnLabelLine2: String?
     /// Ordered multi-visual beats. When present these replace the single looping source.
     let scenes: [SceneBeat]?
+    /// Compact, factual source-attribution credits shown at the very end.
+    let creditsText: String?
 }
 
 struct SceneBeat: Codable {
@@ -50,7 +52,9 @@ struct SceneBeat: Codable {
     let image: String?        // still image path for IMAGE / CBN
     let start: Double
     let end: Double
-    let motion: String?       // push-in, pan-left, pan-right, kenburns
+    let motion: String?       // push-in, push-out, pan-left, pan-right, drift, kenburns
+    let label: String?        // optional factual on-screen location label
+    let real: Bool?           // true when this beat is a real (rights-cleared) photo
 }
 
 struct CueReceipt: Codable {
@@ -541,6 +545,63 @@ func documentGraphicLayer(start: Double, end: Double, size: CGSize) -> CALayer {
     return layer
 }
 
+/// A small factual location tag (e.g. "Nellore, Andhra Pradesh") in the lower-left.
+func locationTagLayer(text: String, start: Double, end: Double, size: CGSize) -> CALayer {
+    let layer = CALayer()
+    let height = size.height * 0.045
+    layer.frame = CGRect(x: size.width * 0.07, y: size.height * 0.155, width: size.width * 0.6, height: height)
+    layer.backgroundColor = NSColor.black.withAlphaComponent(0.42).cgColor
+    layer.cornerRadius = 8
+    layer.masksToBounds = true
+    layer.opacity = 0
+    let textLayer = CALayer()
+    textLayer.frame = layer.bounds
+    textLayer.contents = cardBitmap(lines: [(text, size.width * 0.032, false)], size: layer.bounds.size, accent: false)
+    textLayer.contentsGravity = .resize
+    textLayer.contentsScale = 2
+    layer.addSublayer(textLayer)
+    let visible = min(max(0.4, end - start), 3.0)
+    let opacity = CAKeyframeAnimation(keyPath: "opacity")
+    opacity.values = [0, 1, 1, 0]
+    opacity.keyTimes = [0, 0.15, 0.85, 1]
+    opacity.beginTime = AVCoreAnimationBeginTimeAtZero + start
+    opacity.duration = visible
+    opacity.fillMode = .both
+    opacity.isRemovedOnCompletion = false
+    layer.add(opacity, forKey: "loc-opacity")
+    return layer
+}
+
+/// A compact end-credits block for source attribution (small, readable, non-blocking).
+func creditsLayer(text: String, start: Double, end: Double, size: CGSize) -> CALayer {
+    let layer = CALayer()
+    let lines = text.split(separator: "\n").map { String($0) }
+    let lineHeight = size.width * 0.032
+    let height = min(size.height * 0.3, lineHeight * CGFloat(lines.count) + 28)
+    layer.frame = CGRect(x: size.width * 0.07, y: size.height * 0.14, width: size.width * 0.86, height: height)
+    layer.backgroundColor = NSColor.black.withAlphaComponent(0.55).cgColor
+    layer.cornerRadius = 10
+    layer.masksToBounds = true
+    layer.opacity = 0
+    let textLayer = CALayer()
+    textLayer.frame = layer.bounds
+    textLayer.contents = cardBitmap(lines: lines.map { ($0, size.width * 0.028, false) },
+                                    size: layer.bounds.size, accent: false)
+    textLayer.contentsGravity = .resize
+    textLayer.contentsScale = 2
+    layer.addSublayer(textLayer)
+    let visible = max(0.5, end - start)
+    let opacity = CAKeyframeAnimation(keyPath: "opacity")
+    opacity.values = [0, 1, 1, 1]
+    opacity.keyTimes = [0, 0.2, 0.9, 1]
+    opacity.beginTime = AVCoreAnimationBeginTimeAtZero + start
+    opacity.duration = visible
+    opacity.fillMode = .both
+    opacity.isRemovedOnCompletion = false
+    layer.add(opacity, forKey: "credits-opacity")
+    return layer
+}
+
 /// A small contextual party mark in the corner.
 func logoLayer(imagePath: String, start: Double, end: Double, size: CGSize) -> CALayer {
     let layer = CALayer()
@@ -697,6 +758,10 @@ func compose(_ config: ComposerConfig) throws -> ComposerReceipt {
                 if let image = beat.image, !image.isEmpty {
                     parentLayer.addSublayer(stillLayer(imagePath: image, start: beat.start, end: beat.end,
                                                        motion: motion, size: renderSize))
+                    if let label = beat.label, !label.isEmpty {
+                        parentLayer.addSublayer(locationTagLayer(text: label, start: beat.start, end: beat.end,
+                                                                 size: renderSize))
+                    }
                 }
             case "MAP":
                 parentLayer.addSublayer(mapGraphicLayer(start: beat.start, end: beat.end, size: renderSize))
@@ -736,6 +801,11 @@ func compose(_ config: ComposerConfig) throws -> ComposerReceipt {
         let closingStart = max(2.6, targetDuration - 2.6)
         parentLayer.addSublayer(cardLayer(lines: [(closing, renderSize.width * 0.048, true)],
                                           accent: true, start: closingStart, end: targetDuration, size: renderSize))
+    }
+    // Compact end-credit attribution over the last ~1.9s; never interrupts narration.
+    if let credits = config.creditsText, !credits.isEmpty {
+        let creditsStart = max(0.0, targetDuration - 1.9)
+        parentLayer.addSublayer(creditsLayer(text: credits, start: creditsStart, end: targetDuration, size: renderSize))
     }
     for cue in cues {
         parentLayer.addSublayer(captionLayer(text: cue.text, start: cue.start, end: cue.end,

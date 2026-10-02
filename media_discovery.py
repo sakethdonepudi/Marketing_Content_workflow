@@ -156,3 +156,102 @@ def candidate_report(*, connect):
 def approved_candidates(*, connect):
     """Only candidates cleared for production; the composer may reference these alone."""
     return [c for c in list_candidates(connect=connect) if c["lifecycle_state"] == "APPROVED_FOR_USE"]
+
+
+def ingested_candidates(*, connect):
+    """Approved candidates whose bytes have been stored locally."""
+    return [c for c in list_candidates(connect=connect) if c["lifecycle_state"] == "INGESTED"]
+
+
+MAX_DOWNLOAD_BYTES = 12_000_000
+
+
+def _resolve_direct_url(url, *, user_agent, timeout=60, thumb_width=None):
+    """Resolve a Wikimedia Commons file page to a direct URL (a scaled thumbnail when asked)."""
+    from urllib.parse import urlparse, urlencode, urlunparse
+    from urllib.request import Request, build_opener
+    parsed = urlparse(url)
+    if parsed.hostname == "upload.wikimedia.org":
+        return urlunparse(parsed._replace(query=""))
+    if parsed.hostname and "wikimedia.org" in parsed.hostname and parsed.path.startswith("/wiki/File:"):
+        title = parsed.path.split("/wiki/", 1)[1]
+        api = ("https://commons.wikimedia.org/w/api.php?action=query&format=json&prop=imageinfo&iiprop=url"
+               + (f"&iiurlwidth={int(thumb_width)}" if thumb_width else "")
+               + "&titles=" + urlencode({"": title}).lstrip("="))
+        request = Request(api, headers={"User-Agent": user_agent})
+        with build_opener().open(request, timeout=timeout) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        for page in (payload.get("query") or {}).get("pages", {}).values():
+            info = (page.get("imageinfo") or [{}])[0]
+            candidate = info.get("thumburl") or info.get("url")
+            if candidate:
+                return urlunparse(urlparse(candidate)._replace(query=""))
+        raise MediaDiscoveryError("Could not resolve a direct media URL for the Commons file page.")
+    return urlunparse(parsed._replace(query=""))
+
+
+def _download(url, *, user_agent, timeout=60, resolver=None, retries=4, sleep=None, thumb_width=2000):
+    """Bounded HTTPS download of raw media bytes with backoff for provider rate limits.
+
+    A scaled thumbnail is preferred for very large originals so a 20 MB+ Commons file does
+    not exceed the ingest cap; 2000 px is far more than 720x1280 output needs.
+    """
+    import time as _time
+    from urllib.error import HTTPError
+    from urllib.parse import urlparse
+    from urllib.request import Request, build_opener
+    direct = (resolver or _resolve_direct_url)(url, user_agent=user_agent, thumb_width=thumb_width)
+    parsed = urlparse(direct)
+    if parsed.scheme != "https" or not parsed.hostname:
+        raise MediaDiscoveryError("Only HTTPS media URLs may be ingested.")
+    pause = sleep or _time.sleep
+    last_error = None
+    for attempt in range(1, retries + 1):
+        request = Request(direct, headers={"User-Agent": user_agent, "Accept": "image/*"})
+        try:
+            with build_opener().open(request, timeout=timeout) as response:
+                data = response.read(MAX_DOWNLOAD_BYTES + 1)
+            break
+        except HTTPError as error:
+            last_error = error
+            if error.code not in (429, 500, 502, 503, 504) or attempt == retries:
+                raise
+            pause(min(30.0, 3.0 * 2 ** (attempt - 1)))
+    else:  # pragma: no cover - loop always breaks or raises
+        raise MediaDiscoveryError(f"Download failed: {last_error}")
+    if len(data) > MAX_DOWNLOAD_BYTES:
+        raise MediaDiscoveryError("Media exceeds the 12 MB ingest cap.")
+    if not data:
+        raise MediaDiscoveryError("Downloaded media was empty.")
+    return data
+
+
+def ingest_approved_candidate(candidate_id, *, connect, storage, user_agent="ReachOut-OS/0.3 (media ingest)",
+                              attribution_text=None, downloader=None, now=None):
+    """Download and store bytes for an APPROVED_FOR_USE candidate, then mark it INGESTED."""
+    row = candidate(candidate_id, connect=connect)
+    if row["lifecycle_state"] not in ("APPROVED_FOR_USE", "INGESTED"):
+        raise MediaDiscoveryError("Only APPROVED_FOR_USE media can be ingested.")
+    if not rights_eligible(row["license_status"]):
+        raise MediaDiscoveryError("UNKNOWN-rights media can never be ingested.")
+    if row["lifecycle_state"] == "INGESTED":
+        return row
+    fetch = downloader or (lambda url: _download(url, user_agent=user_agent))
+    data = fetch(row["source_url"])
+    try:
+        from media_inspection import inspect_image
+        decoded = inspect_image(data)
+    except Exception as error:  # noqa: BLE001
+        raise MediaDiscoveryError(f"Downloaded media is not a decodable image: {error}") from error
+    extension = "jpg" if decoded.get("format") == "JPEG" else ("png" if decoded.get("format") == "PNG" else "webp")
+    stored = storage.save(data, extension=extension, metadata={"purpose": "REAL_MEDIA", "candidate": candidate_id})
+    timestamp = (now() if now else _now())
+    with connect() as connection:
+        connection.execute(
+            "UPDATE media_candidates SET lifecycle_state='INGESTED',storage_uri=?,mime_type=?,width=?,height=?,"
+            "file_size=?,content_hash=?,downloaded_at=?,attribution_text=COALESCE(?,attribution_text) WHERE id=?",
+            (stored.storage_uri, decoded.get("mime_type") or "image/jpeg", decoded.get("width"),
+             decoded.get("height"), stored.file_size, stored.checksum_sha256, timestamp,
+             attribution_text, candidate_id),
+        )
+    return candidate(candidate_id, connect=connect)

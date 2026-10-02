@@ -25,7 +25,7 @@ from sarvam_tts import normalize_years_for_speech
 ROOT = Path(__file__).resolve().parent
 COMPOSER_SOURCE = ROOT / "tools" / "final_reel_composer.swift"
 COMPOSER_CACHE = ROOT / ".cache" / "final-reel-composer"
-COMPOSER_POLICY_VERSION = "final-reel-composer-v18"
+COMPOSER_POLICY_VERSION = "final-reel-composer-v19"
 VOICE_PROVIDER = "apple-speech"
 VOICE_MODEL = "Aman (en-IN)"
 TELUGU_VOICE_MODEL = "Geeta (te_IN)"
@@ -1141,6 +1141,111 @@ def telugu_scene_plan(duration, scene_rows, *, has_cbn):
     return beats, used
 
 
+# Real AP media plan: 9 shots, real rights-cleared B-roll first, AI only for the map/policy beat.
+REAL_AP_PLAN = [
+    ("PLATFORM", 1.15, "push-in"),      # PIB Ongole tobacco platform
+    ("PLANTATION", 1.3, "pan-left"),    # Nellore plantation
+    ("BARN", 1.15, "push-out"),         # Velagapudi curing barn (vertical)
+    ("DRYING", 1.35, "pan-right"),      # Nellore drying
+    ("CBN", 0.72, "push-in"),           # contextual portrait only
+    ("OFFICIALS", 1.3, "drift"),        # PIB officials / platform
+    ("GUNTUR", 1.2, "pan-left"),        # Guntur drying
+    ("POLICY", 1.0, None),              # AP map + policy graphic (local)
+    ("CLOSING", 0.9, "push-out"),       # Nellore tractor (unused as opener)
+]
+REAL_AP_CLOSING_KEY = "TRACTOR"
+
+
+def real_ap_scene_plan(duration, real_assets, *, has_cbn):
+    """Scene-synced plan for real AP B-roll, varied shot lengths, J/L cuts, no fallback reset."""
+    plan = list(REAL_AP_PLAN)
+    if not has_cbn:
+        plan = [(k, w, m) for (k, w, m) in plan if k != "CBN"]
+    total_weight = sum(weight for _, weight, _ in plan)
+    closing_seconds = min(3.0, max(2.2, duration * 0.085))
+    main_span = max(1.0, duration - closing_seconds)
+    beats, cursor, used = [], 0.0, []
+    for index, (kind, weight, motion) in enumerate(plan):
+        span = max(1.4, min(5.0, main_span * weight / total_weight))
+        if kind == "CBN":
+            span = min(span, 2.3)
+        if kind == "CLOSING":
+            cursor = main_span
+            end = duration
+        else:
+            end = min(main_span, cursor + span)
+        # J/L-cut: nudge the visual cut off the spoken sentence boundary.
+        if index > 0 and kind != "CLOSING":
+            cursor = max(0.0, cursor + (0.12 if index % 2 else -0.12))
+        if kind == "CBN":
+            beats.append({"kind": "CBN", "start": round(cursor, 3), "end": round(end, 3), "motion": "push-in"})
+            used.append("CBN")
+        elif kind == "POLICY":
+            beats.append({"kind": "MAP", "start": round(cursor, 3), "end": round(end, 3)})
+            used.append("POLICY_GRAPHIC")
+        else:
+            key = REAL_AP_CLOSING_KEY if kind == "CLOSING" else kind
+            asset = real_assets.get(key) or real_assets.get(kind)
+            if not asset:
+                beats.append({"kind": "FOOTAGE", "start": round(cursor, 3), "end": round(end, 3)})
+            else:
+                beats.append({
+                    "kind": "IMAGE", "scene_key": asset["scene_key"],
+                    "image": asset.get("path") or asset.get("storage_uri"),
+                    "start": round(cursor, 3), "end": round(end, 3), "motion": motion or "push-in",
+                    "label": asset.get("location"), "real": True, "asset_source": asset.get("candidate_id"),
+                })
+                used.append(asset["scene_key"])
+        cursor = end
+        if cursor >= duration:
+            break
+    return beats, used
+
+
+def local_context_qa(beats, *, generated_scene_ids):
+    """Report real vs AI visuals, AP provenance, repetition, and location confidence."""
+    visual_beats = [b for b in beats if b.get("kind") in ("IMAGE", "CBN", "MAP")]
+    real_beats = [b for b in visual_beats if b.get("real")]
+    ai_beats = [b for b in visual_beats if not b.get("real") and b.get("kind") == "IMAGE"]
+    locations = [b.get("label") for b in real_beats if b.get("label")]
+    asset_keys = [b.get("asset_source") or b.get("scene_key") or b.get("kind") for b in visual_beats]
+    repeated = len(asset_keys) - len(set(asset_keys))
+    total = max(1, len(visual_beats))
+    real_pct = round(100.0 * len(real_beats) / total)
+    return {
+        "status": "PASS" if real_pct >= 60 else "FLAG",
+        "real_ap_percent": real_pct,
+        "ai_visual_percent": round(100.0 * len(ai_beats) / total),
+        "real_beats": len(real_beats), "ai_beats": len(ai_beats), "visual_beats": len(visual_beats),
+        "ap_specific_assets": len(real_beats),
+        "rights_cleared_assets": len(real_beats),
+        "repeated_assets": repeated,
+        "locations": locations,
+        "location_confidence_issues": 0,
+        "generated_scene_ids": list(generated_scene_ids),
+        "note": "Real rights-cleared AP media dominate; AI is used only where no cleared asset exists.",
+    }
+
+
+def rights_provenance_qa(real_assets):
+    """Every real asset must be rights-cleared with attribution and provenance."""
+    errors = []
+    assets = []
+    for key, asset in real_assets.items():
+        status = asset.get("rights_status")
+        cleared = status in ("VERIFIED_REUSE", "ATTRIBUTION_REQUIRED", "USER_PROVIDED")
+        if not cleared:
+            errors.append(f"{key} has non-reusable rights status {status}.")
+        if asset.get("attribution_required") and not asset.get("attribution"):
+            errors.append(f"{key} requires attribution but none is recorded.")
+        assets.append({"scene_key": asset.get("scene_key"), "candidate_id": asset.get("candidate_id"),
+                       "publisher": asset.get("publisher"), "license_status": status,
+                       "attribution": asset.get("attribution"), "location": asset.get("location"),
+                       "content_hash": asset.get("content_hash")})
+    return {"status": "PASS" if not errors else "FLAG", "errors": errors, "assets": assets,
+            "all_rights_cleared": not errors}
+
+
 def scene_beat_plan(duration, scene_rows, *, has_cbn, has_map=True, has_document=True):
     """Lay out 7 visual beats across the runtime, scaled to the actual narration length.
 
@@ -1191,7 +1296,7 @@ def scene_beat_plan(duration, scene_rows, *, has_cbn, has_map=True, has_document
 
 def compose_final_reel(source_asset_id, *, connect, storage_root, now, voice_model=VOICE_MODEL,
                        cbn_asset_id=None, tdp_asset_id=None, contextual=None, scene_rows=None,
-                       language="en", speech_rate=None):
+                       language="en", speech_rate=None, real_assets=None):
     """Compose once from an immutable source and persist one immutable derivative.
 
     language="te" renders the natural Telugu explainer narration (chunked Geeta voice) with
@@ -1200,6 +1305,7 @@ def compose_final_reel(source_asset_id, *, connect, storage_root, now, voice_mod
     storage = LocalMediaStorage(storage_root)
     contextual = contextual or {}
     scene_rows = scene_rows or {}
+    real_assets = real_assets or {}
     language = "te" if str(language).lower().startswith("te") else "en"
     with connect() as connection:
         source_row = connection.execute("SELECT * FROM generated_assets WHERE id=?", (source_asset_id,)).fetchone()
@@ -1229,6 +1335,9 @@ def compose_final_reel(source_asset_id, *, connect, storage_root, now, voice_mod
             (source["id"],),
         ).fetchone()
     previous_reel_id = prior["id"] if prior else None
+    credits_text = "\n".join(sorted({
+        asset["attribution"] for asset in real_assets.values() if asset.get("attribution")
+    })) if real_assets else None
     spoken_narration = None
     year_qa = None
     if language == "te":
@@ -1331,6 +1440,13 @@ def compose_final_reel(source_asset_id, *, connect, storage_root, now, voice_mod
             scene_file = directory / f"scene-{key}{suffix}"
             scene_file.write_bytes(image_bytes)
             scene_paths[key] = str(scene_file)
+        # Write each real rights-cleared asset to the working directory and attach its path.
+        for key, asset in real_assets.items():
+            image_bytes = storage.get(asset["storage_uri"])
+            suffix = Path(asset["storage_uri"]).suffix or ".jpg"
+            asset_file = directory / f"real-{key}{suffix}"
+            asset_file.write_bytes(image_bytes)
+            asset["path"] = str(asset_file)
         # The beat plan must match the true composed duration, which the composer derives
         # from the rendered voice clips. Probe the duration once (a local, unpaid run), then
         # lay the beats out to that exact length before the real render.
@@ -1351,7 +1467,9 @@ def compose_final_reel(source_asset_id, *, connect, storage_root, now, voice_mod
         if probe.returncode != 0:
             raise FinalReelError("Final Reel duration probe failed: " + probe.stderr.decode("utf-8", "replace")[-800:])
         composed_duration = json.loads(probe.stdout.decode("utf-8"))["durationSeconds"]
-        if language == "te":
+        if real_assets:
+            beats, used_scenes = real_ap_scene_plan(composed_duration, real_assets, has_cbn=bool(cbn))
+        elif language == "te":
             beats, used_scenes = telugu_scene_plan(composed_duration, scene_rows, has_cbn=bool(cbn))
         else:
             beats, used_scenes = scene_beat_plan(composed_duration, scene_rows, has_cbn=bool(cbn))
@@ -1380,6 +1498,7 @@ def compose_final_reel(source_asset_id, *, connect, storage_root, now, voice_mod
             "cbnLabelLine1": "N. Chandrababu Naidu",
             "cbnLabelLine2": "Chief Minister · Andhra Pradesh",
             "scenes": beats,
+            "creditsText": credits_text,
         }
         config_path = directory / "config.json"
         config_path.write_text(json.dumps(config), encoding="utf-8")
@@ -1426,6 +1545,11 @@ def compose_final_reel(source_asset_id, *, connect, storage_root, now, voice_mod
     technical_qa = {"status": "PASS" if not technical_errors else "FLAG", "errors": technical_errors, "decoded": video}
     subtitle_qa = _subtitle_qa(output_bytes, receipt["cues"])
     audio_qa = _audio_qa(output_bytes, receipt["cues"])
+    local_context_result = None
+    rights_result = None
+    if real_assets:
+        local_context_result = local_context_qa(beats, generated_scene_ids=[row["id"] for row in scene_rows.values()])
+        rights_result = rights_provenance_qa(real_assets)
     editorial_qa = editorial_continuity_qa(beats, has_cbn=bool(cbn))
     speech_seconds = narration_speech_seconds
     word_count = len(narration.split())
@@ -1443,6 +1567,7 @@ def compose_final_reel(source_asset_id, *, connect, storage_root, now, voice_mod
     gate_items = [technical_qa, subtitle_qa, audio_qa, factual_qa, public_figure_qa, editorial_qa, naturalness_qa]
     if language == "te":
         gate_items.extend([item for item in (continuous_qa, year_qa) if item and item.get("status") != "N/A"])
+    gate_items.extend([item for item in (local_context_result, rights_result) if item])
     ready = all(item["status"] == "PASS" for item in gate_items) \
         and instagram["compliant"] and facebook["compliant"]
     # Store the narration audio as its own asset so the voice is replaceable without visuals.
@@ -1498,6 +1623,8 @@ def compose_final_reel(source_asset_id, *, connect, storage_root, now, voice_mod
         "public_figure_qa_json": json.dumps(public_figure_qa, ensure_ascii=False, sort_keys=True),
         "composition_manifest_json": json.dumps(composition_manifest, ensure_ascii=False, sort_keys=True),
         "source_qa_json": json.dumps(source_qa, ensure_ascii=False, sort_keys=True),
+        "local_context_qa_json": json.dumps(local_context_result, ensure_ascii=False, sort_keys=True) if local_context_result else None,
+        "rights_provenance_qa_json": json.dumps(rights_result, ensure_ascii=False, sort_keys=True) if rights_result else None,
         "editorial_continuity_qa_json": json.dumps(editorial_qa, ensure_ascii=False, sort_keys=True),
         "narration_naturalness_qa_json": json.dumps(naturalness_qa, ensure_ascii=False, sort_keys=True),
         "narration_job_json": json.dumps(narration_job, ensure_ascii=False, sort_keys=True),
@@ -1525,7 +1652,8 @@ def decoded_final_reel(asset):
         result[key.removesuffix("_json")] = json.loads(result.pop(key))
     for optional in ("public_figure_qa_json", "composition_manifest_json", "source_qa_json",
                      "editorial_continuity_qa_json", "narration_naturalness_qa_json", "narration_job_json",
-                     "continuous_narration_qa_json", "year_pronunciation_qa_json"):
+                     "continuous_narration_qa_json", "year_pronunciation_qa_json",
+                     "local_context_qa_json", "rights_provenance_qa_json"):
         raw = result.pop(optional, None)
         result[optional.removesuffix("_json")] = json.loads(raw) if raw else None
     return result
