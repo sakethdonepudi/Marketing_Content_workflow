@@ -4021,7 +4021,10 @@ class WorkflowTests(unittest.TestCase):
         passed = final_reel_composer.public_figure_context_qa(named, [], contextual)
         self.assertEqual(passed["status"], "PASS")
         unsupported = {"hook": {"text": "Farmers can sell excess FCV tobacco."}, "script": []}
-        self.assertEqual(final_reel_composer.public_figure_context_qa(unsupported, [], contextual)["status"], "FLAG")
+        # Neutral contextual identification is allowed even when the package does not name the figure.
+        self.assertEqual(final_reel_composer.public_figure_context_qa(unsupported, [], contextual)["status"], "PASS")
+        mislabelled = {"cbn": {"asset": {"id": "MA-X", "rights_status": "VERIFIED", "label": "Someone else"}}}
+        self.assertEqual(final_reel_composer.public_figure_context_qa(unsupported, [], mislabelled)["status"], "FLAG")
         attributing = {"hook": {"text": "N. Chandrababu Naidu issued the notification."}, "script": []}
         self.assertEqual(final_reel_composer.public_figure_context_qa(attributing, [], contextual)["status"], "FLAG")
         self.assertEqual(final_reel_composer.public_figure_context_qa(named, [], {})["status"], "PASS")

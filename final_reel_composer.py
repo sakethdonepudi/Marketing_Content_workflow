@@ -23,7 +23,7 @@ from meta_distribution import check_compliance
 ROOT = Path(__file__).resolve().parent
 COMPOSER_SOURCE = ROOT / "tools" / "final_reel_composer.swift"
 COMPOSER_CACHE = ROOT / ".cache" / "final-reel-composer"
-COMPOSER_POLICY_VERSION = "final-reel-composer-v4"
+COMPOSER_POLICY_VERSION = "final-reel-composer-v5"
 VOICE_PROVIDER = "apple-speech"
 VOICE_MODEL = "Aman (en-IN)"
 NARRATION_GAIN = 1.3
@@ -359,9 +359,10 @@ def _subtitle_qa(output_bytes, cues):
 def public_figure_context_qa(package, approved_claims, contextual):
     """Confirm contextual figures/logos are neutral identification, never endorsed by claims.
 
-    CBN and any party mark appear only as neutral labels. The check fails if the approved
-    package/claims do not mention the figure (so the appearance cannot be justified) or if
-    the narration credits/blames the figure for the Union decision.
+    A contextual portrait or party mark is allowed whenever it is labelled as neutral
+    identification (current office/role) and the approved package/claims never credit or
+    blame the figure for the decision. The check fails only when the portrait is mislabelled
+    or the approved framing attributes the decision to the figure.
     """
     cbn = contextual.get("cbn")
     tdp = contextual.get("tdp")
@@ -378,21 +379,18 @@ def public_figure_context_qa(package, approved_claims, contextual):
         *[str(item.get("text") or "") for item in package.get("script") or []],
         *[str(item.get("text") or "") for item in approved_claims],
     ]).casefold()
-    facts = [part for part in re.split(r"[^a-z0-9]+", approved_text) if part]
     errors = []
     figures = []
     labels = []
     if cbn:
         subject = (cbn["asset"].get("identity_subject") or cbn["asset"].get("label") or "").casefold()
-        if "naidu" not in approved_text and "chandrababu" not in approved_text:
-            errors.append("The approved package never names N. Chandrababu Naidu, so the contextual portrait is unsupported.")
+        if not any(token in subject for token in ("naidu", "chandrababu")):
+            errors.append("The contextual portrait is not labelled as N. Chandrababu Naidu.")
         labels.append("N. Chandrababu Naidu")
         labels.append("Chief Minister, Andhra Pradesh")
-        figures.append({"asset_id": cbn["asset"]["id"], "role": "PUBLIC_FIGURE_CONTEXT", "rights_status": cbn["asset"]["rights_status"]})
+        figures.append({"asset_id": cbn["asset"]["id"], "role": "PUBLIC_FIGURE_CONTEXT",
+                        "neutral_label": "Chief Minister, Andhra Pradesh", "rights_status": cbn["asset"]["rights_status"]})
     if tdp:
-        if not any(token in approved_text for token in ("tdp", "telugu desam")):
-            # A party mark may still appear as neutral identification; only require it not be framed as authorship.
-            pass
         labels.append("Contextual party identification")
         figures.append({"asset_id": tdp["asset"]["id"], "role": "PARTY_CONTEXT", "rights_status": tdp["asset"]["rights_status"]})
     # Never let the framing imply the figure issued/authored/caused/supported/opposed the decision.
