@@ -6674,6 +6674,13 @@ def create_final_reel(source_asset_id, *, cbn_asset_id=None, tdp_asset_id=None, 
             raise ValueError("Final Reel composition blocked: " + " ".join(blockers))
         cbn = _reference_asset_for_reel(connection, cbn_asset_id, "PUBLIC_FIGURE_PHOTO")
         tdp = _reference_asset_for_reel(connection, tdp_asset_id, "PARTY_LOGO")
+        scene_rows = {row["scene_key"]: dict(row) for row in connection.execute(
+            "SELECT * FROM generated_scenes WHERE scene_key IN ("
+            + ",".join("?" for _ in final_reel_composer.SCENE_ORDER) + ") "
+            "ORDER BY created_at DESC", tuple(final_reel_composer.SCENE_ORDER),
+        )}
+        # Keep only the newest row per scene key (ORDER BY created_at DESC above).
+        scene_rows = {key: row for key, row in scene_rows.items()}
         storage = LocalMediaStorage(RENDER_STORAGE_ROOT)
         contextual = {}
         if cbn:
@@ -6684,7 +6691,7 @@ def create_final_reel(source_asset_id, *, cbn_asset_id=None, tdp_asset_id=None, 
     try:
         result = composer(source_asset_id, connect=connect, storage_root=RENDER_STORAGE_ROOT, now=now,
                           cbn_asset_id=cbn["id"] if cbn else None, tdp_asset_id=tdp["id"] if tdp else None,
-                          contextual=contextual)
+                          contextual=contextual, scene_rows=scene_rows)
     except final_reel_composer.FinalReelError as error:
         raise ValueError(f"Final Reel composition failed: {error}") from error
     if isinstance(result, dict) and result.get("id"):

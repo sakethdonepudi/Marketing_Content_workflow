@@ -35,6 +35,25 @@ from media_tools import FrameExtractor, OCRProvider, prepare_video_source, sampl
 from visual_qa import ClaudeVisualQAProvider, VisualQAProviderError
 
 
+class DeterministicSceneRenderer:
+    """Test-only scene renderer that returns a local PNG without any network call."""
+
+    name = "xai"
+    model = "scene-fixture"
+    mode = "live"
+
+    def unsupported_reason(self, media_type, aspect_ratio, **requirements):
+        return None
+
+    def render(self, request, *, timeout_seconds):
+        from media_rendering import RenderResult
+        return RenderResult(
+            asset_bytes=deterministic_png(96, 128, request["visual_prompts"][0][:24]),
+            mime_type="image/png", provider_request_id="scene-test", provider_metadata={"fixture": True},
+            provider_cost_usd=0.08, currency="USD", pricing_version="xai-reported-cost-ticks",
+        )
+
+
 class DeferredExecutor:
     def submit(self, *args, **kwargs):
         return None
@@ -4059,6 +4078,33 @@ class WorkflowTests(unittest.TestCase):
         for phrase in ("Reference media", "CBN portrait", "Party logo", "Rights-verified only",
                        "License / permission note", "cbn_asset_id", "tdp_asset_id", "Public-figure QA"):
             self.assertIn(phrase, source)
+
+    def test_generated_scene_provenance_and_beat_plan(self):
+        # Every generated scene is an original work with a prompt and provenance recorded.
+        scenes = final_reel_composer.generate_scenes(
+            ["AP_FIELD_GOLDEN"], connect=app.connect, storage_root=app.RENDER_STORAGE_ROOT, now=app.now,
+            renderer=DeterministicSceneRenderer(),
+        )
+        row = scenes["AP_FIELD_GOLDEN"]
+        self.assertEqual(row["rights_status"], "GENERATED_ORIGINAL")
+        self.assertTrue(row["prompt"] and row["checksum_sha256"])
+        with app.connect() as connection:
+            tables = {r[0] for r in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='generated_scenes'")}
+            cols = {r[1] for r in connection.execute("PRAGMA table_info(final_reel_assets)")}
+        self.assertEqual(tables, {"generated_scenes"})
+        self.assertIn("source_qa_json", cols)
+        # The beat plan must stay inside the runtime and use every supplied scene.
+        rows = {key: {"id": f"GS-{key}", "storage_uri": f"local://{key}.jpg", "checksum_sha256": key,
+                      "rights_status": "GENERATED_ORIGINAL", "provider": "xai", "model": "m",
+                      "prompt": "p", "cost_status": "known", "cost_usd": 0.08}
+                for key in final_reel_composer.SCENE_ORDER}
+        beats, used = final_reel_composer.scene_beat_plan(24.0, rows, has_cbn=True)
+        self.assertGreaterEqual(len(beats), 7)
+        self.assertLessEqual(max(b["end"] for b in beats), 24.0)
+        self.assertLessEqual(max(b["end"] - b["start"] for b in beats), 4.0)
+        self.assertIn("MAP", used)
+        self.assertIn("DOCUMENT", used)
 
     def test_final_reel_subtitles_render_filled_glyphs_and_audio_mix_is_measured(self):
         # The composer must draw solid white glyphs with a black halo, never the

@@ -36,6 +36,16 @@ struct ComposerConfig: Codable {
     let closingHeadline: String?
     let cbnLabelLine1: String?
     let cbnLabelLine2: String?
+    /// Ordered multi-visual beats. When present these replace the single looping source.
+    let scenes: [SceneBeat]?
+}
+
+struct SceneBeat: Codable {
+    let kind: String          // HOOK, IMAGE, CBN, MAP, DOCUMENT, CLOSING
+    let image: String?        // still image path for IMAGE / CBN
+    let start: Double
+    let end: Double
+    let motion: String?       // push-in, pan-left, pan-right, kenburns
 }
 
 struct CueReceipt: Codable {
@@ -221,8 +231,9 @@ func cardBitmap(lines: [(String, CGFloat, Bool)], size: CGSize, accent: Bool) ->
 /// A full-width overlay card that punches in and out over a time window.
 func cardLayer(lines: [(String, CGFloat, Bool)], accent: Bool, start: Double, end: Double, size: CGSize) -> CALayer {
     let layer = CALayer()
-    let height = size.height * 0.34
-    layer.frame = CGRect(x: 0, y: size.height * 0.30, width: size.width, height: height)
+    let height = size.height * 0.27
+    // Sits in the upper-middle band, above the burned-in subtitle strip near the bottom.
+    layer.frame = CGRect(x: 0, y: size.height * 0.44, width: size.width, height: height)
     layer.backgroundColor = NSColor.black.withAlphaComponent(0.55).cgColor
     layer.opacity = 0
     let textLayer = CALayer()
@@ -398,6 +409,147 @@ func vignetteLayer(size: CGSize) -> CALayer {
     return layer
 }
 
+/// A full-frame still beat (generated scene or map/document graphic) with a subtle
+/// Ken Burns move and a soft crossfade in/out so cuts never feel static.
+func stillLayer(imagePath: String, start: Double, end: Double, motion: String?, size: CGSize,
+                fade: Double = 0.35) -> CALayer {
+    let layer = CALayer()
+    layer.frame = CGRect(origin: .zero, size: size)
+    layer.opacity = 0
+    layer.masksToBounds = true
+    guard let image = NSImage(contentsOfFile: imagePath),
+          let cg = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
+        return layer
+    }
+    let photo = CALayer()
+    photo.frame = layer.bounds
+    photo.contents = cg
+    photo.contentsGravity = .resizeAspectFill
+    photo.masksToBounds = true
+    photo.contentsScale = 2
+    layer.addSublayer(photo)
+    let visible = max(0.1, end - start)
+    let opacity = CAKeyframeAnimation(keyPath: "opacity")
+    opacity.values = [0, 1, 1, 0]
+    opacity.keyTimes = [NSNumber(value: 0), NSNumber(value: min(0.2, fade / visible)),
+                        NSNumber(value: max(0.0, 1 - fade / visible)), NSNumber(value: 1)]
+    opacity.beginTime = AVCoreAnimationBeginTimeAtZero + start
+    opacity.duration = visible
+    opacity.fillMode = .both
+    opacity.isRemovedOnCompletion = false
+    layer.add(opacity, forKey: "still-opacity")
+    // Subtle push or pan; never a static hold.
+    let scale = CAKeyframeAnimation(keyPath: "transform.scale")
+    let pan = CAKeyframeAnimation(keyPath: "transform.translation.x")
+    switch motion ?? "push-in" {
+    case "pan-left":
+        scale.values = [1.08, 1.08]; pan.values = [size.width * 0.03, -size.width * 0.03]
+    case "pan-right":
+        scale.values = [1.08, 1.08]; pan.values = [-size.width * 0.03, size.width * 0.03]
+    case "kenburns":
+        scale.values = [1.02, 1.1]; pan.values = [size.width * 0.015, -size.width * 0.02]
+    default:
+        scale.values = [1.02, 1.1]; pan.values = [0, 0]
+    }
+    for animation in [scale, pan] {
+        animation.beginTime = AVCoreAnimationBeginTimeAtZero + start
+        animation.duration = visible
+        animation.fillMode = .both
+        animation.isRemovedOnCompletion = false
+        photo.add(animation, forKey: animation.keyPath)
+    }
+    return layer
+}
+
+/// A locally drawn Andhra Pradesh state-map silhouette graphic (no paid generation).
+func mapGraphicLayer(start: Double, end: Double, size: CGSize) -> CALayer {
+    let layer = CALayer()
+    layer.frame = CGRect(origin: .zero, size: size)
+    layer.backgroundColor = NSColor(calibratedRed: 0.97, green: 0.98, blue: 0.96, alpha: 1).cgColor
+    layer.opacity = 0
+    // Point path approximating the Andhra Pradesh outline (stylized, non-survey).
+    let unitPoints: [(CGFloat, CGFloat)] = [
+        (0.30, 0.14), (0.52, 0.10), (0.70, 0.16), (0.80, 0.30), (0.74, 0.46),
+        (0.82, 0.58), (0.70, 0.72), (0.58, 0.86), (0.40, 0.82), (0.28, 0.66),
+        (0.22, 0.50), (0.18, 0.34),
+    ]
+    let shape = CAShapeLayer()
+    let mapWidth = size.width * 0.62, mapHeight = size.height * 0.5
+    let originX = (size.width - mapWidth) / 2, originY = size.height * 0.24
+    let path = CGMutablePath()
+    for (index, point) in unitPoints.enumerated() {
+        let x = originX + point.0 * mapWidth, y = originY + (1 - point.1) * mapHeight
+        if index == 0 { path.move(to: CGPoint(x: x, y: y)) } else { path.addLine(to: CGPoint(x: x, y: y)) }
+    }
+    path.closeSubpath()
+    shape.path = path
+    shape.fillColor = NSColor(calibratedRed: 0.19, green: 0.44, blue: 0.25, alpha: 0.16).cgColor
+    shape.strokeColor = NSColor(calibratedRed: 0.19, green: 0.44, blue: 0.25, alpha: 0.9).cgColor
+    shape.lineWidth = 4
+    layer.addSublayer(shape)
+    let label = CALayer()
+    label.frame = CGRect(x: 0, y: size.height * 0.76, width: size.width, height: size.height * 0.1)
+    label.contents = cardBitmap(lines: [("ANDHRA PRADESH", size.width * 0.06, true)],
+                                size: label.bounds.size, accent: false)
+    label.contentsGravity = .resize
+    label.contentsScale = 2
+    layer.addSublayer(label)
+    let visible = max(0.1, end - start)
+    let opacity = CAKeyframeAnimation(keyPath: "opacity")
+    opacity.values = [0, 1, 1, 0]; opacity.keyTimes = [0, 0.12, 0.9, 1]
+    opacity.beginTime = AVCoreAnimationBeginTimeAtZero + start
+    opacity.duration = visible; opacity.fillMode = .both; opacity.isRemovedOnCompletion = false
+    layer.add(opacity, forKey: "map-opacity")
+    return layer
+}
+
+/// A locally drawn official-notification style abstract graphic (no paid generation).
+func documentGraphicLayer(start: Double, end: Double, size: CGSize) -> CALayer {
+    let layer = CALayer()
+    layer.frame = CGRect(origin: .zero, size: size)
+    layer.backgroundColor = NSColor(calibratedRed: 0.95, green: 0.96, blue: 0.94, alpha: 1).cgColor
+    layer.opacity = 0
+    let page = CALayer()
+    page.frame = CGRect(x: size.width * 0.14, y: size.height * 0.20, width: size.width * 0.72, height: size.height * 0.44)
+    page.backgroundColor = NSColor.white.cgColor
+    page.cornerRadius = 10
+    page.shadowColor = NSColor.black.cgColor
+    page.shadowOpacity = 0.16; page.shadowRadius = 14; page.shadowOffset = CGSize(width: 0, height: 8)
+    layer.addSublayer(page)
+    var y = page.bounds.height - 28
+    let widths: [CGFloat] = [0.82, 0.9, 0.74, 0.88, 0.6]
+    for (index, ratio) in widths.enumerated() {
+        let bar = CALayer()
+        bar.frame = CGRect(x: 20, y: y, width: (page.bounds.width - 40) * ratio, height: index == 0 ? 14 : 8)
+        bar.cornerRadius = 4
+        bar.backgroundColor = (index == 0
+            ? NSColor(calibratedRed: 0.19, green: 0.44, blue: 0.25, alpha: 0.85)
+            : NSColor(calibratedRed: 0.72, green: 0.75, blue: 0.71, alpha: 1)).cgColor
+        page.addSublayer(bar)
+        y -= index == 0 ? 30 : 22
+    }
+    let seal = CALayer()
+    seal.frame = CGRect(x: page.bounds.width - 70, y: 20, width: 44, height: 44)
+    seal.cornerRadius = 22
+    seal.borderWidth = 3
+    seal.borderColor = NSColor(calibratedRed: 0.72, green: 0.53, blue: 0.04, alpha: 1).cgColor
+    page.addSublayer(seal)
+    let label = CALayer()
+    label.frame = CGRect(x: 0, y: size.height * 0.68, width: size.width, height: size.height * 0.09)
+    label.contents = cardBitmap(lines: [("GOVERNMENT NOTIFICATION", size.width * 0.048, true)],
+                                size: label.bounds.size, accent: false)
+    label.contentsGravity = .resize
+    label.contentsScale = 2
+    layer.addSublayer(label)
+    let visible = max(0.1, end - start)
+    let opacity = CAKeyframeAnimation(keyPath: "opacity")
+    opacity.values = [0, 1, 1, 0]; opacity.keyTimes = [0, 0.12, 0.9, 1]
+    opacity.beginTime = AVCoreAnimationBeginTimeAtZero + start
+    opacity.duration = visible; opacity.fillMode = .both; opacity.isRemovedOnCompletion = false
+    layer.add(opacity, forKey: "doc-opacity")
+    return layer
+}
+
 /// A small contextual party mark in the corner.
 func logoLayer(imagePath: String, start: Double, end: Double, size: CGSize) -> CALayer {
     let layer = CALayer()
@@ -531,8 +683,38 @@ func compose(_ config: ComposerConfig) throws -> ComposerReceipt {
     // Cinematic vignette and a thin gold progress bar across the runtime.
     parentLayer.addSublayer(vignetteLayer(size: renderSize))
     parentLayer.addSublayer(progressLayer(total: targetDuration, size: renderSize))
-    // Contextual figure (rights-cleared) as a circular inset with a lower-third name bar.
-    if let cbnImage = config.cbnImage, !cbnImage.isEmpty {
+    // Multi-visual beats: full-frame stills (generated scenes, map, document) over the base footage.
+    if let scenes = config.scenes, !scenes.isEmpty {
+        for beat in scenes {
+            let motion = beat.motion
+            switch beat.kind {
+            case "IMAGE":
+                if let image = beat.image, !image.isEmpty {
+                    parentLayer.addSublayer(stillLayer(imagePath: image, start: beat.start, end: beat.end,
+                                                       motion: motion, size: renderSize))
+                }
+            case "MAP":
+                parentLayer.addSublayer(mapGraphicLayer(start: beat.start, end: beat.end, size: renderSize))
+            case "DOCUMENT":
+                parentLayer.addSublayer(documentGraphicLayer(start: beat.start, end: beat.end, size: renderSize))
+            case "CBN":
+                if let image = beat.image, !image.isEmpty {
+                    parentLayer.addSublayer(stillLayer(imagePath: image, start: beat.start, end: beat.end,
+                                                       motion: "kenburns", size: renderSize))
+                }
+                parentLayer.addSublayer(figureLayer(imagePath: config.cbnImage ?? beat.image ?? "",
+                                                    start: beat.start, end: beat.end, size: renderSize))
+                parentLayer.addSublayer(lowerThirdLayer(line1: config.cbnLabelLine1 ?? "", line2: config.cbnLabelLine2 ?? "",
+                                                        start: beat.start, end: beat.end, size: renderSize))
+                if let tdpImage = config.tdpImage, !tdpImage.isEmpty {
+                    parentLayer.addSublayer(logoLayer(imagePath: tdpImage, start: beat.start, end: beat.end, size: renderSize))
+                }
+            default:
+                break
+            }
+        }
+    } else if let cbnImage = config.cbnImage, !cbnImage.isEmpty {
+        // Legacy single-loop fallback: contextual figure with a lower-third name bar.
         let contextEnd = min(targetDuration, 11.0)
         parentLayer.addSublayer(figureLayer(imagePath: cbnImage, start: 7.0, end: contextEnd, size: renderSize))
         parentLayer.addSublayer(lowerThirdLayer(line1: config.cbnLabelLine1 ?? "", line2: config.cbnLabelLine2 ?? "",
@@ -541,14 +723,14 @@ func compose(_ config: ComposerConfig) throws -> ComposerReceipt {
             parentLayer.addSublayer(logoLayer(imagePath: tdpImage, start: 7.0, end: contextEnd, size: renderSize))
         }
     }
-    // Hook card and closing card.
+    // Hook card (upper half only) and closing card, both clear of the bottom subtitle band.
     if let headline = config.hookHeadline, !headline.isEmpty {
         parentLayer.addSublayer(cardLayer(lines: [(headline, renderSize.width * 0.062, true),
                                                   (config.hookSubline ?? "", renderSize.width * 0.04, false)],
-                                          accent: true, start: 0.1, end: 2.5, size: renderSize))
+                                          accent: true, start: 0.1, end: 3.4, size: renderSize))
     }
     if let closing = config.closingHeadline, !closing.isEmpty {
-        let closingStart = max(2.6, targetDuration - 2.2)
+        let closingStart = max(2.6, targetDuration - 2.6)
         parentLayer.addSublayer(cardLayer(lines: [(closing, renderSize.width * 0.048, true)],
                                           accent: true, start: closingStart, end: targetDuration, size: renderSize))
     }

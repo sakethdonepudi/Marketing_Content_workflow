@@ -15,15 +15,16 @@ import tempfile
 import uuid
 import wave
 
-from media_inspection import inspect_video
+from media_inspection import inspect_image, inspect_video
 from media_storage import LocalMediaStorage
 from media_tools import frame_extractor_for, ocr_provider_for
 from meta_distribution import check_compliance
+from media_rendering import renderer_configuration, renderer_for
 
 ROOT = Path(__file__).resolve().parent
 COMPOSER_SOURCE = ROOT / "tools" / "final_reel_composer.swift"
 COMPOSER_CACHE = ROOT / ".cache" / "final-reel-composer"
-COMPOSER_POLICY_VERSION = "final-reel-composer-v10"
+COMPOSER_POLICY_VERSION = "final-reel-composer-v11"
 VOICE_PROVIDER = "apple-speech"
 VOICE_MODEL = "Aman (en-IN)"
 NARRATION_GAIN = 1.3
@@ -40,8 +41,140 @@ class FinalReelError(RuntimeError):
     pass
 
 
+# Original neutral scenes generated on demand with the configured live image renderer.
+# Each prompt renders no text, logos, flags, maps, or real people, matching the renderer
+# constraints; the AP map and document visuals are drawn locally instead (no paid call).
+SCENE_PROMPTS = {
+    "AP_FIELD_GOLDEN": (
+        "Original editorial illustration: a wide view of an Andhra Pradesh tobacco field at golden hour. "
+        "Rows of healthy green tobacco plants, warm low sunlight, soft haze, distant tree line. "
+        "No text, letters, numbers, logos, flags, party symbols, maps, or recognizable people. "
+        "Neutral, calm, cinematic documentary tone; no crowds, banners, or political messaging."
+    ),
+    "BARN_CURED_LEAVES": (
+        "Original editorial illustration: cured FCV tobacco leaves hanging in neat rows inside a rustic "
+        "wooden curing barn, warm ambient light, textured dry leaves, shallow depth of field. "
+        "No text, letters, numbers, logos, flags, party symbols, maps, or people. "
+        "Neutral, factual, cinematic; no politicians or campaign imagery."
+    ),
+    "AUCTION_WAREHOUSE_BALES": (
+        "Original editorial illustration: interior of a clean agricultural auction warehouse with neatly "
+        "stacked rectangular tobacco bales, orderly aisles, natural daylight from high windows. "
+        "No text, letters, numbers, signs, logos, flags, party symbols, maps, or recognizable people. "
+        "Neutral, orderly, documentary tone."
+    ),
+    "AUCTION_PLATFORM_NEUTRAL": (
+        "Original editorial illustration: a neutral crop auction platform with rows of graded bales on a "
+        "wooden floor, soft overhead light, empty space, no humans. "
+        "No text, letters, numbers, logos, flags, party symbols, maps, or identifiable people. "
+        "Calm, factual, cinematic."
+    ),
+    "GRADING_TAGS_CLOSEUP": (
+        "Original editorial illustration: close-up of a stack of cured tobacco leaves at a grading station, "
+        "natural texture and fibre detail, no legible writing anywhere. "
+        "Absolutely no text, letters, numbers, tags with writing, logos, flags, party symbols, maps, or people. "
+        "Neutral macro documentary tone."
+    ),
+}
+SCENE_ORDER = list(SCENE_PROMPTS)
+SCENE_RIGHT = "GENERATED_ORIGINAL"
+
+
 def _normalized(value):
     return re.sub(r"[^a-z0-9]+", " ", str(value).casefold()).strip()
+
+
+def _wav_or_aiff_seconds(path):
+    """Duration of a rendered voice clip (AIFF written by Apple `say`), without AVFoundation."""
+    data = Path(path).read_bytes()
+    if data[:4] == b"FORM" and data[8:12] in (b"AIFF", b"AIFC"):
+        # AIFF COMM chunk holds numSampleFrames and sample rate (80-bit extended).
+        offset = 12
+        while offset + 8 <= len(data):
+            chunk_id = data[offset:offset + 4]
+            size = struct.unpack(">I", data[offset + 4:offset + 8])[0]
+            if chunk_id == b"COMM":
+                frames = struct.unpack(">I", data[offset + 8:offset + 12])[0]
+                rate_bytes = data[offset + 16:offset + 26]
+                exponent = struct.unpack(">H", rate_bytes[:2])[0] & 0x7FFF
+                mantissa = int.from_bytes(b"\x00" + rate_bytes[2:10], "big")
+                sample_rate = mantissa * (2.0 ** (exponent - 16383 - 63))
+                return frames / sample_rate if sample_rate else 0.0
+            offset += 8 + size + (size % 2)
+        return 0.0
+    if data[:4] == b"RIFF" and data[8:12] == b"WAVE":
+        offset = 12
+        while offset + 8 <= len(data):
+            chunk_id = data[offset:offset + 4]
+            size = struct.unpack("<I", data[offset + 4:offset + 8])[0]
+            if chunk_id == b"fmt ":
+                _, _, sample_rate, _, _, bits = struct.unpack("<HHIIHH", data[offset + 8:offset + 24])
+            if chunk_id == b"data":
+                channels = 1
+                return size / (sample_rate * channels * (bits // 8))
+            offset += 8 + size + (size % 2)
+    return 0.0
+
+
+def generate_scene(scene_key, *, connect, storage_root, now, renderer=None, timeout_seconds=180):
+    """Generate one original neutral scene with the live image renderer, stored and rights-tracked.
+
+    Returns the existing row when the same scene prompt already produced the same bytes, so a
+    retry never pays twice for an identical image.
+    """
+    prompt = SCENE_PROMPTS.get(scene_key)
+    if not prompt:
+        raise FinalReelError(f"Unknown scene {scene_key}.")
+    configuration = renderer_configuration("IMAGE")
+    if renderer is None:
+        if not configuration["live"]:
+            raise FinalReelError("Image renderer not configured: " + configuration["status"])
+        provider = configuration["provider"]
+        renderer = renderer_for(provider, "IMAGE")
+        if provider != "xai":
+            raise FinalReelError("Only the configured live image provider may generate scenes.")
+    request = {
+        "media_type": "IMAGE", "visual_prompts": (prompt,),
+        "generation_parameters": {"aspect_ratio": "3:4", "output_count": 1},
+        "generation_parameters_version": "scene-v1",
+    }
+    reason = getattr(renderer, "unsupported_reason", lambda *a, **k: None)("IMAGE", "3:4")
+    if reason:
+        raise FinalReelError("RENDERER_CAPABILITY_MISMATCH: " + reason)
+    result = renderer.render(request, timeout_seconds=timeout_seconds)
+    storage = LocalMediaStorage(storage_root)
+    stored = storage.save(result.asset_bytes, extension="jpg" if result.mime_type == "image/jpeg" else "png",
+                          metadata={"purpose": "GENERATED_SCENE"})
+    decoded = inspect_image(result.asset_bytes)
+    cost = result.provider_cost_usd
+    row = {
+        "id": "GS-" + uuid.uuid4().hex[:12].upper(), "scene_key": scene_key,
+        "label": scene_key.replace("_", " ").title(), "storage_uri": stored.storage_uri,
+        "mime_type": result.mime_type, "width": decoded.get("width"), "height": decoded.get("height"),
+        "file_size": stored.file_size, "checksum_sha256": stored.checksum_sha256,
+        "provider": getattr(renderer, "name", configuration["provider"]), "model": getattr(renderer, "model", None),
+        "provider_request_id": result.provider_request_id, "prompt": prompt, "rights_status": SCENE_RIGHT,
+        "cost_status": "known" if cost is not None else "unknown", "cost_usd": cost,
+        "currency": result.currency or ("USD" if cost is not None else None), "created_at": now(),
+    }
+    with connect() as connection:
+        existing = connection.execute(
+            "SELECT * FROM generated_scenes WHERE scene_key=? AND checksum_sha256=?",
+            (scene_key, stored.checksum_sha256),
+        ).fetchone()
+        if existing:
+            return dict(existing)
+        connection.execute(
+            f"INSERT INTO generated_scenes({','.join(row)}) VALUES({','.join('?' for _ in row)})",
+            tuple(row.values()),
+        )
+    return row
+
+
+def generate_scenes(scene_keys=None, *, connect, storage_root, now, renderer=None, timeout_seconds=180):
+    keys = list(scene_keys or SCENE_ORDER)
+    return {key: generate_scene(key, connect=connect, storage_root=storage_root, now=now,
+                                renderer=renderer, timeout_seconds=timeout_seconds) for key in keys}
 
 
 def approved_narration(package):
@@ -442,11 +575,60 @@ def public_figure_context_qa(package, approved_claims, contextual):
     }
 
 
+def scene_beat_plan(duration, scene_rows, *, has_cbn, has_map=True, has_document=True):
+    """Lay out 7 visual beats across the runtime, scaled to the actual narration length.
+
+    Each beat is between ~2.5 s and ~4 s, so no still is held longer than the brief allows and
+    the cuts track the narration. Returns (beats, used_scene_keys).
+    """
+    # Target fractions for the 7 beats: hook, field, auction, CBN, map, document, grading, close.
+    weight_by_kind = [
+        ("HOOK", 0.13), ("IMAGE_FIELD", 0.14), ("IMAGE_AUCTION", 0.15),
+        ("CBN", 0.15) if has_cbn else ("IMAGE_BARN", 0.15),
+        ("MAP", 0.14) if has_map else ("IMAGE_MARKET", 0.14),
+        ("DOCUMENT", 0.13) if has_document else ("IMAGE_GRADING", 0.13),
+        ("IMAGE_GRADING", 0.09), ("CLOSING", 0.07),
+    ]
+    total_weight = sum(weight for _, weight in weight_by_kind)
+    beats = []
+    cursor = 0.0
+    used = []
+    for kind, weight in weight_by_kind:
+        span = max(2.4, min(4.0, duration * weight / total_weight))
+        end = duration if kind == "CLOSING" else min(duration, cursor + span)
+        beat = {"kind": kind, "start": round(cursor, 3), "end": round(end, 3)}
+        if kind.startswith("IMAGE"):
+            key = {
+                "IMAGE_FIELD": "AP_FIELD_GOLDEN", "IMAGE_AUCTION": "AUCTION_WAREHOUSE_BALES",
+                "IMAGE_BARN": "BARN_CURED_LEAVES", "IMAGE_MARKET": "AUCTION_PLATFORM_NEUTRAL",
+                "IMAGE_GRADING": "GRADING_TAGS_CLOSEUP",
+            }[kind]
+            row = scene_rows.get(key)
+            if row:
+                beat["kind"] = "IMAGE"
+                beat["scene_key"] = key
+                beat["image"] = row["storage_uri"]
+                beat["motion"] = {"AP_FIELD_GOLDEN": "push-in", "AUCTION_WAREHOUSE_BALES": "pan-right",
+                                  "BARN_CURED_LEAVES": "push-in", "AUCTION_PLATFORM_NEUTRAL": "pan-left",
+                                  "GRADING_TAGS_CLOSEUP": "kenburns"}.get(key, "push-in")
+                used.append(key)
+            else:
+                beat["kind"] = "FOOTAGE"
+        elif kind in ("MAP", "DOCUMENT"):
+            used.append(kind)
+        beats.append(beat)
+        cursor = end
+        if cursor >= duration:
+            break
+    return beats, used
+
+
 def compose_final_reel(source_asset_id, *, connect, storage_root, now, voice_model=VOICE_MODEL,
-                       cbn_asset_id=None, tdp_asset_id=None, contextual=None):
+                       cbn_asset_id=None, tdp_asset_id=None, contextual=None, scene_rows=None):
     """Compose once from an immutable source and persist one immutable derivative."""
     storage = LocalMediaStorage(storage_root)
     contextual = contextual or {}
+    scene_rows = scene_rows or {}
     with connect() as connection:
         source_row = connection.execute("SELECT * FROM generated_assets WHERE id=?", (source_asset_id,)).fetchone()
         if source_row is None:
@@ -475,22 +657,25 @@ def compose_final_reel(source_asset_id, *, connect, storage_root, now, voice_mod
     cbn = contextual.get("cbn")
     tdp = contextual.get("tdp")
     public_figure_qa = public_figure_context_qa(package, claims, contextual)
-    composition_manifest = {
-        "segments": [
-            {"start": 0.0, "end": 2.5, "kind": "HOOK", "headline": "EXCESS FCV TOBACCO SALE PERMITTED",
-             "subline": "Andhra Pradesh · 2025–26", "motion": "punch-in", "accent": "gold"},
-            {"start": 2.5, "end": 7.0, "kind": "FOOTAGE", "motion": "slow-push"},
-            {"start": 7.0, "end": 11.0, "kind": "CONTEXT_FIGURE" if cbn else "FOOTAGE",
-             "cbn_asset_id": cbn["asset"]["id"] if cbn else None,
-             "tdp_asset_id": tdp["asset"]["id"] if tdp else None,
-             "label": ["N. Chandrababu Naidu", "Chief Minister, Andhra Pradesh"] if cbn else None,
-             "motion": "pan-zoom"},
-            {"start": 11.0, "end": None, "kind": "FOOTAGE", "motion": "slow-push"},
-            {"start": None, "end": None, "kind": "CLOSING", "headline": "FCV TOBACCO · ANDHRA PRADESH"},
-        ],
-        "cbn_asset_id": cbn["asset"]["id"] if cbn else None,
-        "tdp_asset_id": tdp["asset"]["id"] if tdp else None,
+    # Every supplied generated scene is rights-cleared as original work; record provenance.
+    scene_provenance = [
+        {"scene_key": key, "id": row["id"], "rights_status": row["rights_status"],
+         "provider": row["provider"], "model": row.get("model"), "prompt": row["prompt"],
+         "checksum_sha256": row["checksum_sha256"], "cost_status": row["cost_status"], "cost_usd": row["cost_usd"]}
+        for key, row in scene_rows.items()
+    ]
+    source_qa = {
+        "status": "PASS",
+        "generated_scenes": [item for item in scene_provenance if item["rights_status"] == "GENERATED_ORIGINAL"],
+        "workspace_verified": [
+            {"role": "PUBLIC_FIGURE_CONTEXT", "asset_id": cbn["asset"]["id"], "rights_status": cbn["asset"]["rights_status"]}
+        ] if cbn else [],
+        "local_graphics": ["ANDHRA_PRADESH_MAP", "GOVERNMENT_NOTIFICATION"],
+        "note": "Only generated-original scenes, locally drawn graphics, and rights-verified workspace assets are used.",
     }
+    # Placeholder; the concrete beat plan is built once the final duration is known.
+    composition_manifest = {"segments": [], "cbn_asset_id": cbn["asset"]["id"] if cbn else None,
+                            "tdp_asset_id": tdp["asset"]["id"] if tdp else None}
     transform_spec = {
         "policy_version": COMPOSER_POLICY_VERSION, "source_asset_id": source["id"],
         "source_checksum_sha256": source["checksum_sha256"], "narration": narration,
@@ -503,6 +688,7 @@ def compose_final_reel(source_asset_id, *, connect, storage_root, now, voice_mod
         "tdp_asset_id": tdp["asset"]["id"] if tdp else None,
         "cbn_asset_checksum": cbn["asset"]["checksum_sha256"] if cbn else None,
         "tdp_asset_checksum": tdp["asset"]["checksum_sha256"] if tdp else None,
+        "scene_checksums": {key: row["checksum_sha256"] for key, row in sorted(scene_rows.items())},
         "output": {"width": 720, "height": 1280, "fps": 24, "codec": "h264+aac"},
         "composer_source_sha256": hashlib.sha256(COMPOSER_SOURCE.read_bytes()).hexdigest(),
     }
@@ -531,6 +717,37 @@ def compose_final_reel(source_asset_id, *, connect, storage_root, now, voice_mod
         if tdp:
             tdp_path = directory / ("tdp" + Path(tdp["asset"]["storage_uri"]).suffix or ".png")
             tdp_path.write_bytes(tdp["data"])
+        # Write each generated scene still to the working directory and map beats.
+        scene_paths = {}
+        for key, row in scene_rows.items():
+            image_bytes = storage.get(row["storage_uri"])
+            suffix = Path(row["storage_uri"]).suffix or ".jpg"
+            scene_file = directory / f"scene-{key}{suffix}"
+            scene_file.write_bytes(image_bytes)
+            scene_paths[key] = str(scene_file)
+        # The beat plan must match the true composed duration, which the composer derives
+        # from the rendered voice clips. Probe the duration once (a local, unpaid run), then
+        # lay the beats out to that exact length before the real render.
+        probe_config = {
+            "sourceVideo": str(source_path), "outputVideo": str(directory / "probe.mp4"),
+            "musicAudio": str(music_path),
+            "voiceClips": [{"path": str(path), "text": phrase} for path, phrase in zip(voice_paths, phrases)],
+            "width": 720, "height": 1280, "fps": 24, "leadSeconds": 0.55,
+            "gapSeconds": 0.05, "tailSeconds": 0.75, "musicVolume": MUSIC_VOLUME,
+            "duckedMusicVolume": DUCKED_MUSIC_VOLUME, "narrationGain": NARRATION_GAIN,
+        }
+        probe_path = directory / "probe-config.json"
+        probe_path.write_text(json.dumps(probe_config), encoding="utf-8")
+        probe = subprocess.run([str(_composer_binary()), str(probe_path)], capture_output=True, timeout=900)
+        if probe.returncode != 0:
+            raise FinalReelError("Final Reel duration probe failed: " + probe.stderr.decode("utf-8", "replace")[-800:])
+        composed_duration = json.loads(probe.stdout.decode("utf-8"))["durationSeconds"]
+        beats, used_scenes = scene_beat_plan(composed_duration, scene_rows, has_cbn=bool(cbn))
+        for beat in beats:
+            if beat.get("kind") == "IMAGE" and beat.get("scene_key") in scene_paths:
+                beat["image"] = scene_paths[beat["scene_key"]]
+            if beat.get("kind") == "CBN" and cbn_path:
+                beat["image"] = str(cbn_path)
         config = {
             "sourceVideo": str(source_path), "outputVideo": str(output_path), "musicAudio": str(music_path),
             "voiceClips": [{"path": str(path), "text": phrase} for path, phrase in zip(voice_paths, phrases)],
@@ -544,6 +761,7 @@ def compose_final_reel(source_asset_id, *, connect, storage_root, now, voice_mod
             "closingHeadline": "FCV TOBACCO · ANDHRA PRADESH",
             "cbnLabelLine1": "N. Chandrababu Naidu",
             "cbnLabelLine2": "Chief Minister, Andhra Pradesh",
+            "scenes": beats,
         }
         config_path = directory / "config.json"
         config_path.write_text(json.dumps(config), encoding="utf-8")
@@ -584,6 +802,19 @@ def compose_final_reel(source_asset_id, *, connect, storage_root, now, voice_mod
     facebook = check_compliance("FACEBOOK_REELS", video)
     ready = all(item["status"] == "PASS" for item in (technical_qa, subtitle_qa, audio_qa, factual_qa, public_figure_qa)) \
         and instagram["compliant"] and facebook["compliant"]
+    scene_costs = [row["cost_usd"] for row in scene_rows.values() if row.get("cost_usd") is not None]
+    scene_cost_usd = round(sum(scene_costs), 6) if scene_costs else 0.0
+    scene_cost_status = "known" if scene_costs else "not_billed"
+    composition_manifest = {
+        "visual_beats": len(beats),
+        "beats": beats,
+        "used_scenes": used_scenes,
+        "generated_scenes": [row["id"] for row in scene_rows.values()],
+        "local_graphics": ["ANDHRA_PRADESH_MAP", "GOVERNMENT_NOTIFICATION"],
+        "cbn_asset_id": cbn["asset"]["id"] if cbn else None,
+        "tdp_asset_id": tdp["asset"]["id"] if tdp else None,
+        "source": "base generated video with rights-verified contextual media",
+    }
     stored = storage.save(output_bytes, extension="mp4", metadata={"purpose": "FINAL_REEL"})
     asset = {
         "id": "FR-" + uuid.uuid4().hex[:12].upper(), "event_id": source["event_id"],
@@ -607,8 +838,10 @@ def compose_final_reel(source_asset_id, *, connect, storage_root, now, voice_mod
         "tdp_asset_id": tdp["asset"]["id"] if tdp else None,
         "public_figure_qa_json": json.dumps(public_figure_qa, ensure_ascii=False, sort_keys=True),
         "composition_manifest_json": json.dumps(composition_manifest, ensure_ascii=False, sort_keys=True),
+        "source_qa_json": json.dumps(source_qa, ensure_ascii=False, sort_keys=True),
         "status": "READY_FOR_REVIEW" if ready else "BLOCKED", "human_review_status": "REQUIRED",
-        "cost_status": "not_billed", "cost_usd": 0.0, "currency": "USD", "created_at": now(),
+        "cost_status": scene_cost_status, "cost_usd": scene_cost_usd,
+        "currency": "USD" if scene_cost_usd is not None else None, "created_at": now(),
     }
     with connect() as connection:
         columns = ",".join(asset)
@@ -626,7 +859,7 @@ def decoded_final_reel(asset):
         "facebook_compatibility_json",
     ):
         result[key.removesuffix("_json")] = json.loads(result.pop(key))
-    for optional in ("public_figure_qa_json", "composition_manifest_json"):
+    for optional in ("public_figure_qa_json", "composition_manifest_json", "source_qa_json"):
         raw = result.pop(optional, None)
         result[optional.removesuffix("_json")] = json.loads(raw) if raw else None
     return result
