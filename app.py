@@ -2003,6 +2003,89 @@ def _registration_for_verification_url(url):
     return matches[0] if matches else None
 
 
+def _canonical_domain(value):
+    """Canonical source identity: lowercase registrable-ish host without www (source dedupe)."""
+    host = _normalized_host(value)
+    return host or None
+
+
+def ensure_source_registered(*, publisher=None, source_family=None, url=None, domain=None,
+                             source_type="webpage", source_class="independent_reporting",
+                             language=None, region=None, discovery_method=None,
+                             trust_class="UNKNOWN", metadata=None, config_registration=None,
+                             now_fn=None, connection=None):
+    """ONE canonical source registration path.
+
+    Canonicalizes domain identity, reuses an existing source row when present, otherwise creates
+    it transactionally (INSERT OR IGNORE + re-read) so parallel acquisition workers converge on a
+    single row and never trigger a foreign-key failure. Returns a valid `sources.id`.
+
+    This only establishes source LINEAGE; it never asserts evidence support. A search lead is
+    still a lead until its page is fetched and classified.
+    """
+    timestamp = (now_fn or now)()
+    workspace = workspace_identity()["workspace_key"]
+    canonical = _canonical_domain(domain or url or (config_registration or {}).get("url"))
+    if config_registration:
+        publisher = publisher or config_registration.get("name")
+        source_family = source_family or config_registration.get("name")
+        source_class = config_registration.get("source_class") or source_class
+        source_type = config_registration.get("type") or source_type
+        canonical = _canonical_domain(config_registration.get("url")) or canonical
+    display = (publisher or source_family or canonical or "unknown-source").strip()
+    display = re.sub(r"^www\.", "", display)
+    # Deterministic, canonical id: prefer the config id; else a slugified canonical domain.
+    source_id = None
+    if config_registration and config_registration.get("id"):
+        source_id = config_registration["id"]
+    elif canonical:
+        source_id = "src-" + re.sub(r"[^a-z0-9]+", "-", canonical).strip("-")
+    else:
+        source_id = "src-" + re.sub(r"[^a-z0-9]+", "-", display.casefold()).strip("-")
+
+    source_url = url or (config_registration or {}).get("url") or (f"https://{canonical}" if canonical else "")
+    meta = {
+        "canonical_domain": canonical, "discovery_method": discovery_method,
+        "language": language, "region": region, "trust_class": trust_class,
+        "source_family": source_family, **(metadata or {}),
+    }
+    official = 1 if source_class == "official_primary" else 0
+
+    def _register(conn):
+        # 1) Reuse by canonical domain within the workspace (dedupe www/URL variants).
+        if canonical:
+            existing = conn.execute(
+                "SELECT id FROM sources WHERE workspace_key=? AND url IS NOT NULL AND ("
+                "LOWER(REPLACE(SUBSTR(url, INSTR(url,'://')+3), 'www.', '')) LIKE ? ) "
+                "ORDER BY id LIMIT 1",
+                (workspace, canonical + "%")).fetchone()
+            if existing:
+                conn.execute(
+                    "UPDATE sources SET metadata_json=? WHERE id=?", (json.dumps(meta, sort_keys=True), existing["id"]))
+                return existing["id"]
+        # 2) Reuse by exact id.
+        existing = conn.execute("SELECT id FROM sources WHERE id=?", (source_id,)).fetchone()
+        if existing:
+            return existing["id"]
+        # 3) Create transactionally. Re-read after INSERT OR IGNORE for race safety.
+        conn.execute(
+            "INSERT OR IGNORE INTO sources(id,name,source_type,url,official,enabled,metadata_json,created_at,"
+            "workspace_key,validated_at,source_class,identity_status,identity_evidence_url,rate_limit_seconds,"
+            "poll_interval_seconds) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (source_id, display, source_type, source_url, official, 1, json.dumps(meta, sort_keys=True),
+             timestamp, workspace, None, source_class,
+             (config_registration or {}).get("identity", {}).get("status", "review"),
+             (config_registration or {}).get("identity", {}).get("evidence_url"), 1.0, 900))
+        row = conn.execute("SELECT id FROM sources WHERE id=?", (source_id,)).fetchone()
+        return row["id"] if row else source_id
+
+    if connection is not None:
+        # Reuse the caller's transaction so an outer write lock is not re-entered.
+        return _register(connection)
+    with connect() as connection:
+        return _register(connection)
+
+
 def _verification_domains(research_run_id):
     with connect() as connection:
         original_hosts = {
@@ -3099,11 +3182,20 @@ def _inspect_verification_leads(connection, run, gap_bundle, leads, *, deadline=
             continue
         registration = _registration_for_verification_url(url)
         if not registration:
-            connection.execute(
-                "UPDATE verification_leads SET status='REVIEW',status_reason=?,inspected_at=? WHERE id=?",
-                ("No verified source registration matches this host; snippet retained only as a lead.", now(), lead["id"]),
-            )
-            continue
+            # Unknown publisher but valid lead: register by canonical domain identity (hotfix §4).
+            # Trust/evidence classification stays UNKNOWN until the classifier evaluates it.
+            domain = _canonical_domain(url)
+            source_id = ensure_source_registered(
+                publisher=domain, source_family=domain, url=url, domain=domain,
+                source_type="webpage", source_class="independent_reporting",
+                discovery_method="evidence_acquisition", trust_class="UNKNOWN", connection=connection)
+            registration = {"id": source_id, "name": domain, "type": "webpage",
+                            "source_class": "independent_reporting", "url": url, "metadata": {}}
+        else:
+            # A config registration may not exist in the DB (e.g. a fresh workspace): ensure the
+            # row before any signal insert so signals.source_id -> sources.id never fails.
+            ensure_source_registered(config_registration=registration,
+                                     discovery_method="evidence_acquisition", connection=connection)
         # Persist the lead before the existing ingestion path opens its own
         # transaction. A failed fetch remains auditable as a non-evidence lead.
         connection.commit()
@@ -3454,6 +3546,220 @@ def _finalize_verification(connection, run, versions, result, domains, provider_
     else:
         connection.execute("UPDATE events SET verification_status=?,updated_at=? WHERE id=?",
                            ("TEST_ONLY" if run["mode"] == "test" else "REVIEW_REQUIRED", now(), run["event_id"]))
+
+
+def run_evidence_acquisition(verification_run_id, provider=None, *, transport=None):
+    """EVIDENCE_ACQUISITION_V1 (Arch 10, Part A): bounded claim-directed acquisition.
+
+    Triggered when required claims resolve to INSUFFICIENT_EVIDENCE. Runs at most TWO passes,
+    each generating English/Telugu/Romanized claim-directed queries (parallel, bounded), using
+    the provider to discover URLs, fetching pages before they become evidence, rebuilding the
+    claim-source matrix, and re-adjudicating. Then stops; never endless searches.
+    """
+    import evidence_acquisition as ea
+    with connect() as connection:
+        run = connection.execute("SELECT * FROM verification_runs WHERE id=?", (verification_run_id,)).fetchone()
+        if run is None:
+            raise KeyError(verification_run_id)
+        event = connection.execute("SELECT * FROM events WHERE id=?", (run["event_id"],)).fetchone()
+        # Event entities/location for query targeting.
+        entities = []
+        for row in connection.execute(
+            "SELECT entities_json FROM discovery_signals WHERE url IN "
+            "(SELECT url FROM signals WHERE event_id=?) AND entities_json!='[]' LIMIT 20",
+            (run["event_id"],)):
+            for entity in json.loads(row["entities_json"] or "[]"):
+                if entity not in entities:
+                    entities.append(entity)
+        location = None
+        with connect() as connection2:
+            loc = connection2.execute(
+                "SELECT location FROM event_candidates WHERE event_id=?", (run["event_id"],)).fetchone()
+            location = loc["location"] if loc and loc["location"] else None
+    provider = provider or verification_provider_for("test" if run["mode"] == "test" else "grok")
+    summary = {"passes": [], "claims_resolved": [], "claims_unresolved": [], "passes_used": 0}
+    while ea.can_run_pass(connect=connect, verification_run_id=verification_run_id):
+        plan = ea.acquisition_plan(connect=connect, verification_run_id=verification_run_id,
+                                   entities=entities, location=location)
+        if not plan:
+            break
+        started = now()
+        run_row_id = ea.record_run(connect=connect, verification_run_id=verification_run_id,
+                                   event_id=run["event_id"], pass_number=summary["passes_used"] + 1,
+                                   status="RUNNING",
+                                   queries=[q for item in plan for q in item["queries"]],
+                                   parallel=True)
+        # Parallel, bounded claim-directed discovery (English/Telugu/official lanes).
+        from concurrent.futures import ThreadPoolExecutor
+        discovered = []
+        with ThreadPoolExecutor(max_workers=min(4, max(1, len(plan)))) as pool:
+            futures = []
+            for item in plan:
+                gap = {"claims": [{"claim_id": item["claim_id"], "claim_version_id": item["claim_version_id"],
+                                   "text": "", "missing": item["queries"], "required": item["required"]}]}
+                futures.append(pool.submit(_discover_leads_for_claim, provider, gap, item))
+            for future in futures:
+                try:
+                    discovered.extend(future.result() or [])
+                except Exception as error:  # noqa: BLE001 - discovery is best-effort per lane
+                    log_error("evidence_acquisition_lane_failed", error)
+        # Only public URLs; dedupe; prioritize by direct-evidence tier.
+        leads = []
+        seen = set()
+        for lead in ea.prioritize_leads(discovered):
+            url = lead.get("url")
+            if not url or url in seen:
+                continue
+            try:
+                _validate_public_url(url)
+            except ValueError:
+                continue
+            seen.add(url)
+            leads.append(lead)
+        fetched = 0
+        if leads:
+            outcome = run_source_acquisition_pass(
+                verification_run_id, leads, provider="evidence-acquisition",
+                transport=transport) if transport is not None else run_source_acquisition_pass(
+                verification_run_id, leads, provider="evidence-acquisition")
+            fetched = len(outcome.get("candidates") or [])
+            _rebuild_claim_source_matrix(verification_run_id)
+            with connect() as connection:
+                _regroup_evidence_families(connection, verification_run_id)
+                running = connection.execute("SELECT * FROM verification_runs WHERE id=?",
+                                             (verification_run_id,)).fetchone()
+                versions = _ensure_claim_versions(connection, running["research_run_id"])
+                domains = _verification_domains(running["research_run_id"])
+                result = VerificationProviderResult(result={
+                    "search_summary": "Claim-directed evidence acquisition pass.",
+                    "unresolved_gaps": [], "leads": []})
+                _finalize_verification(connection, running, versions, result, domains)
+        resolution = ea.resolve_claims_from_matrix(connect=connect, verification_run_id=verification_run_id)
+        summary["claims_resolved"] = resolution["resolved"]
+        summary["claims_unresolved"] = resolution["unresolved"]
+        summary["passes"].append({"pass": summary["passes_used"] + 1, "queries": len([q for i in plan for q in i["queries"]]),
+                                  "leads": len(leads), "fetched": fetched,
+                                  "resolved": len(resolution["resolved"]), "unresolved": len(resolution["unresolved"])})
+        summary["passes_used"] += 1
+        with connect() as connection:
+            connection.execute(
+                "UPDATE evidence_acquisition_runs SET status=?,urls_discovered=?,urls_fetched=?,completed_at=? "
+                "WHERE id=?",
+                ("COMPLETED" if not resolution["unresolved"] else "EXHAUSTED", len(leads), fetched,
+                 now(), run_row_id))
+        # Stop early if every required claim is now resolved.
+        with connect() as connection:
+            required = [dict(r) for r in connection.execute(
+                "SELECT id FROM claims WHERE event_id=? AND required_for_event=1", (run["event_id"],))]
+        if required and all(claim["id"] in summary["claims_resolved"] for claim in required):
+            break
+    return summary
+
+
+def _discover_leads_for_claim(provider, gap, plan_item):
+    """Ask the provider for URLs targeting one claim; snippets are discovery only."""
+    try:
+        result = provider.find_corroboration(gap, allowed_domains=[],
+                                             search_turn_limit=VERIFICATION_SEARCH_TURNS,
+                                             token_limit=VERIFICATION_TOKEN_LIMIT,
+                                             timeout_seconds=VERIFICATION_SEARCH_TIMEOUT_SECONDS)
+    except TypeError:
+        result = provider.find_corroboration(gap)
+    except Exception as error:  # noqa: BLE001
+        return []
+    leads = []
+    for lead in (result.result or {}).get("leads") or []:
+        lead = dict(lead)
+        lead.setdefault("claim_ids", [plan_item["claim_id"]])
+        lead.setdefault("strategy", "B_EXACT_PHRASE")
+        leads.append(lead)
+    return leads
+
+
+def _rebuild_claim_source_matrix(verification_run_id):
+    """Project the current verification snapshots into the claim-source matrix (A.4)."""
+    import evidence_acquisition as ea
+    with connect() as connection:
+        run = connection.execute("SELECT * FROM verification_runs WHERE id=?", (verification_run_id,)).fetchone()
+        versions = _ensure_claim_versions(connection, run["research_run_id"])
+        analysis = _claim_analysis_payload(connection, run, versions)
+        snapshots = {row["id"]: dict(row) for row in connection.execute(
+            "SELECT * FROM verification_snapshots WHERE verification_run_id=?", (verification_run_id,))}
+    for claim in analysis.get("claims", []):
+        for item in claim.get("evidence", []):
+            snapshot = snapshots.get(item.get("snapshot_id"), {})
+            classification = item.get("classification")
+            support_type = {
+                "DIRECT_SUPPORT": "DIRECT_SUPPORT", "PARTIAL_SUPPORT": "PARTIAL_SUPPORT",
+                "MENTIONS_ONLY": "MENTIONS_ONLY", "CONTRADICTS": "CONTRADICTS",
+            }.get(classification, "IRRELEVANT")
+            ea.record_matrix_row(
+                connect=connect, verification_run_id=verification_run_id,
+                claim_id=claim.get("claim_id") or claim.get("claim_version_id"),
+                claim_version_id=claim.get("claim_version_id"),
+                source_url=snapshot.get("url"), source_name=snapshot.get("source_name"),
+                source_family=snapshot.get("evidence_family_id") or snapshot.get("source_name"),
+                source_class=snapshot.get("source_class"), support_type=support_type,
+                support_span=item.get("excerpt"), published_at=snapshot.get("publication_time"))
+    return analysis
+
+
+def resume_evidence_acquisition(verification_run_id, *, lead_ids=None, transport=None):
+    """Recovery: replay already-discovered leads with corrected source registration.
+
+    Registers missing sources, re-processes stored leads, and re-adjudicates — WITHOUT running a
+    new search and WITHOUT consuming a third acquisition pass (hotfix §9). Only stored leads are
+    replayed; a paid/web search is never re-run when the stored payload exists.
+    """
+    import evidence_acquisition as ea
+    with connect() as connection:
+        run = connection.execute("SELECT * FROM verification_runs WHERE id=?", (verification_run_id,)).fetchone()
+        if run is None:
+            raise KeyError(verification_run_id)
+        rows = [dict(r) for r in connection.execute(
+            "SELECT * FROM verification_leads WHERE verification_run_id=? ORDER BY discovered_at,id",
+            (verification_run_id,))]
+    if lead_ids:
+        rows = [row for row in rows if row["id"] in set(lead_ids)]
+    if not rows:
+        return {"replayed": 0, "ingested": 0, "reason": "no stored leads to replay"}
+    # Ensure every lead's source is registered before any signal insert (no FK failure).
+    prepared = []
+    with connect() as connection:
+        for row in rows:
+            url = row["url"]
+            registration = _registration_for_verification_url(url)
+            if registration:
+                ensure_source_registered(config_registration=registration,
+                                         discovery_method="evidence_acquisition", connection=connection)
+            else:
+                ensure_source_registered(publisher=_canonical_domain(url), source_family=_canonical_domain(url),
+                                         url=url, domain=_canonical_domain(url), source_type="webpage",
+                                         source_class="independent_reporting",
+                                         discovery_method="evidence_acquisition", trust_class="UNKNOWN",
+                                         connection=connection)
+            prepared.append({"url": url, "title": row.get("title"),
+                             "target_claim_ids": json.loads(row.get("target_claim_ids_json") or "[]"),
+                             "source_priority": row.get("source_priority"),
+                             "reason": "Replayed stored evidence-acquisition lead"})
+    with connect() as connection:
+        outcome = _inspect_verification_leads(connection, run, {"claims": []}, prepared)
+        _regroup_evidence_families(connection, verification_run_id)
+        running = connection.execute("SELECT * FROM verification_runs WHERE id=?", (verification_run_id,)).fetchone()
+        versions = _ensure_claim_versions(connection, running["research_run_id"])
+        domains = _verification_domains(running["research_run_id"])
+        _finalize_verification(connection, running, versions, VerificationProviderResult(result={
+            "search_summary": "Replayed stored acquisition leads; no new search.",
+            "unresolved_gaps": [], "leads": []}), domains)
+    _rebuild_claim_source_matrix(verification_run_id)
+    resolution = ea.resolve_claims_from_matrix(connect=connect, verification_run_id=verification_run_id)
+    with connect() as connection:
+        ingested = connection.execute(
+            "SELECT COUNT(*) FROM verification_leads WHERE verification_run_id=? AND status='INGESTED'",
+            (verification_run_id,)).fetchone()[0]
+    return {"replayed": len(prepared), "ingested": ingested,
+            "claims_resolved": resolution["resolved"], "claims_unresolved": resolution["unresolved"],
+            "passes_used": ea.passes_used(connect=connect, verification_run_id=verification_run_id)}
 
 
 def readjudicate_verification(run_id):
@@ -6867,8 +7173,140 @@ def _auto_reel_stage_handler(stage, run):
             raise reel_pipeline.PipelineError(
                 "Mandatory QA did not pass; reel is BLOCKED.", retryable=False,
                 recommended_action="Review the reel's QA flags; fix and regenerate.")
+        # Every READY_FOR_REVIEW reel gets a factual caption/hashtag package (Arch 10, Part C).
+        try:
+            build_post_packages_for_reel(reel_id, event_id)
+        except Exception as error:  # noqa: BLE001 - copy generation never blocks the reel
+            log_error("post_package_generation_failed", error, reel_id=reel_id)
         return {"reel_id": reel_id}
     return {}
+
+
+def end_to_end_speed():
+    """PART F: T_DISCOVERY / T_VERIFICATION / T_PRODUCTION / T_TOTAL with real timestamps."""
+    with connect() as connection:
+        candidates = [dict(r) for r in connection.execute(
+            "SELECT id,event_id,first_seen_at,candidate_created_at FROM event_candidates WHERE event_id IS NOT NULL")]
+        result = []
+        for candidate in candidates:
+            event_id = candidate["event_id"]
+            event = connection.execute(
+                "SELECT created_at FROM events WHERE id=?", (event_id,)).fetchone()
+            verified = connection.execute(
+                "SELECT at FROM transitions WHERE event_id=? AND to_state='VERIFIED' ORDER BY at LIMIT 1",
+                (event_id,)).fetchone()
+            pipeline = connection.execute(
+                "SELECT started_at,completed_at FROM reel_pipeline_runs WHERE event_id=? ORDER BY started_at LIMIT 1",
+                (event_id,)).fetchone()
+            metrics = _intervals(candidate, event, verified, pipeline)
+            if metrics:
+                result.append({"event_id": event_id, **metrics})
+        def pct(values, p):
+            values = sorted(v for v in values if v is not None)
+            if not values:
+                return None
+            return round(values[min(len(values) - 1, int(round((p / 100) * (len(values) - 1))))], 2)
+        return {
+            "events": result,
+            "p50": {key: pct([r.get(key) for r in result], 50) for key in
+                    ("t_discovery", "t_verification", "t_production", "t_total")},
+            "p95": {key: pct([r.get(key) for r in result], 95) for key in
+                    ("t_discovery", "t_verification", "t_production", "t_total")},
+        }
+
+
+def _seconds_between(start, end):
+    if not start or not end:
+        return None
+    try:
+        a = datetime.fromisoformat(str(start).replace("Z", "+00:00"))
+        b = datetime.fromisoformat(str(end).replace("Z", "+00:00"))
+        return round(max(0.0, (b - a).total_seconds()), 2)
+    except (TypeError, ValueError):
+        return None
+
+
+def _intervals(candidate, event, verified, pipeline):
+    first_seen = candidate.get("first_seen_at")
+    candidate_at = candidate.get("candidate_created_at")
+    verified_at = verified["at"] if verified else None
+    started_at = pipeline["started_at"] if pipeline else None
+    completed_at = pipeline["completed_at"] if pipeline else None
+    t_discovery = _seconds_between(first_seen, candidate_at)
+    t_verification = _seconds_between(candidate_at, verified_at)
+    t_production = _seconds_between(started_at, completed_at)
+    t_total = _seconds_between(first_seen, completed_at) or _seconds_between(first_seen, verified_at)
+    if t_discovery is None and t_verification is None and t_production is None:
+        return None
+    return {"t_discovery": t_discovery, "t_verification": t_verification,
+            "t_production": t_production, "t_total": t_total,
+            "verified": bool(verified_at), "reel_completed": bool(completed_at)}
+
+
+def build_post_packages_for_reel(reel_id, event_id, *, regenerate=False):
+    """CAPTION_PACKAGE_V1 (Arch 10, Part C): build Instagram + Facebook packages for a reel.
+
+    Captions derive only from the approved claim set; hashtags/keywords from story context +
+    aggregate content intelligence. Factual, non-partisan, never demographic.
+    """
+    import caption_intelligence as ci
+    import post_package
+    with connect() as connection:
+        reel = connection.execute("SELECT * FROM final_reel_assets WHERE id=?", (reel_id,)).fetchone()
+        if reel is None:
+            raise KeyError(reel_id)
+        claims = [dict(r) for r in connection.execute(
+            "SELECT cv.text FROM approved_claim_set_items aci "
+            "JOIN claim_versions cv ON cv.id=aci.claim_version_id "
+            "JOIN approved_claim_sets acs ON acs.id=aci.claim_set_id "
+            "WHERE acs.event_id=? AND acs.status='APPROVED' ORDER BY aci.claim_version_id", (event_id,))]
+        candidate = connection.execute(
+            "SELECT * FROM event_candidates WHERE event_id=?", (event_id,)).fetchone()
+        event = connection.execute("SELECT title,source FROM events WHERE id=?", (event_id,)).fetchone()
+        signals = [dict(r) for r in connection.execute(
+            "SELECT source_family FROM discovery_signals WHERE url IN "
+            "(SELECT url FROM signals WHERE event_id=?)", (event_id,))]
+    entities = json.loads(candidate["entities_json"] or "[]") if candidate else []
+    location = (candidate["location"] if candidate else None) or "Andhra Pradesh"
+    event_name = (candidate["headline"] if candidate else None) or (event["title"] if event else None)
+    source_families = sorted({s["source_family"] for s in signals if s["source_family"]})
+    attribution = ", ".join(source_families[:3]) or (event["source"] if event else None)
+    # Aggregate content intelligence (Part D): observe entities/keywords for trend tracking.
+    topic_terms = []
+    for entity in entities:
+        topic_terms.append({"term": entity, "kind": "entity"})
+    topic_terms.extend([{"term": location, "kind": "location"}])
+    try:
+        ci.observe_topic_terms(topic_terms, connect=connect, source_family="story")
+    except Exception:  # noqa: BLE001
+        pass
+    research = ci.story_topic_research(connect=connect, event_id=event_id, entities=entities,
+                                       location=location, event_name=event_name,
+                                       source_families=source_families)
+    caption = ci.build_caption(claims=claims, headline=event_name, entities=entities,
+                               location=location, source_attribution=attribution)
+    hashtags = research["relevant_hashtags"] or ci.select_hashtags(
+        ci.candidate_hashtags(entities=entities, location=location, event_name=event_name,
+                              topic_terms=["Agriculture", "Horticulture"]))
+    keywords = research["recurring_keywords"]
+    topic_tags = ci.topic_tags(entities=entities, location=location, event_name=event_name,
+                               topic_terms=["Agriculture", "Horticulture"])
+    packages = []
+    for platform in ("INSTAGRAM", "FACEBOOK"):
+        existing = None if regenerate else post_package.latest_package(reel_id, platform, connect=connect)
+        if existing is not None:
+            packages.append(existing)
+            continue
+        project = ci.build_platform_package(caption, platform=platform, hashtags=hashtags,
+                                            keywords=keywords, attribution=attribution,
+                                            topic_tags=topic_tags)
+        package = post_package.create_package(
+            connect=connect, reel_id=reel_id, event_id=event_id, platform=platform,
+            caption=caption, hashtags=hashtags, keywords=keywords, topic_tags=topic_tags,
+            attribution=attribution, entities=entities, location=location, event_name=event_name,
+            claims=claims)
+        packages.append(package)
+    return {"reel_id": reel_id, "research": research, "packages": packages}
 
 
 def run_auto_reel_pipeline(event_id, *, now=None):
@@ -8387,6 +8825,23 @@ class Handler(SimpleHTTPRequestHandler):
             run["ui_status"] = reel_pipeline.ui_status(run["status"])
             self.send_json({"pipeline": run})
             return
+        match = re.fullmatch(r"/api/reels/([^/]+)/post-packages", path)
+        if match:
+            import post_package
+            packages = post_package.packages_for_reel(match.group(1), connect=connect)
+            state = post_package.copy_approval_state(connect=connect, reel_id=match.group(1))
+            self.send_json({"packages": packages, "approval_state": state})
+            return
+        match = re.fullmatch(r"/api/post-packages/([^/]+)", path)
+        if match:
+            import post_package
+            self.send_json({"package": post_package.package(match.group(1), connect=connect)})
+            return
+        if path == "/api/pipeline-timing":
+            self.send_json({"slowest_stages": reel_pipeline.slowest_stages(connect=connect),
+                            "percentiles": reel_pipeline.pipeline_percentiles(connect=connect),
+                            "end_to_end": end_to_end_speed()})
+            return
         match = re.fullmatch(r"/api/uploads/([^/]+)/content", path)
         if match:
             asset = uploaded_media_asset(match.group(1))
@@ -8530,6 +8985,46 @@ class Handler(SimpleHTTPRequestHandler):
                     return
                 youtube_discovery.queue_cross_source_trigger(query, connect=connect, now=now)
                 self.send_json({"queued": query}, 201)
+                return
+            match = re.fullmatch(r"/api/reels/([^/]+)/post-packages", path)
+            if match:
+                import post_package
+                self.send_json({"packages": post_package.packages_for_reel(match.group(1), connect=connect)})
+                return
+            match = re.fullmatch(r"/api/reels/([^/]+)/post-packages/regenerate", path)
+            if match:
+                with connect() as connection:
+                    reel = connection.execute("SELECT event_id FROM final_reel_assets WHERE id=?",
+                                              (match.group(1),)).fetchone()
+                if reel is None:
+                    self.send_json({"error": "reel not found"}, 404)
+                    return
+                self.send_json(build_post_packages_for_reel(match.group(1), reel["event_id"], regenerate=True), 201)
+                return
+            match = re.fullmatch(r"/api/post-packages/([^/]+)", path)
+            if match:
+                import post_package
+                if method == "POST":
+                    package = post_package.edit_package(
+                        match.group(1), caption=body.get("caption"), hashtags=body.get("hashtags"),
+                        keyword_list=body.get("keywords"), topic_tag_list=body.get("topic_tags"),
+                        edited_by=body.get("edited_by", "reviewer"), connect=connect)
+                    self.send_json({"package": package}, 201)
+                    return
+                self.send_json({"package": post_package.package(match.group(1), connect=connect)})
+                return
+            match = re.fullmatch(r"/api/post-packages/([^/]+)/copy-review", path)
+            if match:
+                import post_package
+                package = post_package.approve_copy(match.group(1), reviewer=body.get("reviewer", "reviewer"),
+                                                    connect=connect)
+                with connect() as connection:
+                    state = post_package.copy_approval_state(connect=connection, reel_id=package["reel_id"])
+                self.send_json({"package": package, "approval_state": state}, 201)
+                return
+            match = re.fullmatch(r"/api/verification/([^/]+)/resume-acquisition", path)
+            if match:
+                self.send_json(resume_evidence_acquisition(match.group(1)), 201)
                 return
             match = re.fullmatch(r"/api/discovered/([^/]+)/handoff", path)
             if match:
