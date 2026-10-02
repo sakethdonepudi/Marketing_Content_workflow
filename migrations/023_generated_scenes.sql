@@ -31,4 +31,6 @@ ALTER TABLE final_reel_assets ADD COLUMN narration_naturalness_qa_json TEXT;
 ALTER TABLE final_reel_assets ADD COLUMN narration_job_json TEXT;
 ALTER TABLE final_reel_assets ADD COLUMN continuous_narration_qa_json TEXT;
 ALTER TABLE final_reel_assets ADD COLUMN year_pronunciation_qa_json TEXT;
+ALTER TABLE final_reel_assets ADD COLUMN local_context_qa_json TEXT;
+ALTER TABLE final_reel_assets ADD COLUMN rights_provenance_qa_json TEXT;
 
