@@ -8667,15 +8667,22 @@ def overview():
     with connect() as connection:
         event_rows = connection.execute(
             "SELECT e.*,COUNT(DISTINCT COALESCE(s.source_id,s.source_name)) AS source_count,"
-            "GROUP_CONCAT(DISTINCT s.source_name) AS source_names,MIN(s.publication_time) AS publication_time "
+            "GROUP_CONCAT(DISTINCT s.source_name) AS source_names,MIN(s.publication_time) AS publication_time,"
+            "(SELECT COUNT(*) FROM research_runs rr WHERE rr.event_id=e.id) AS research_run_count,"
+            "(SELECT COUNT(*) FROM verification_runs vr WHERE vr.event_id=e.id) AS verification_run_count "
             "FROM events e LEFT JOIN signals s ON s.event_id=e.id AND s.item_kind='event' "
-            "GROUP BY e.id ORDER BY e.event_time DESC LIMIT 50"
+            "GROUP BY e.id ORDER BY e.event_time DESC LIMIT 200"
         ).fetchall()
         events = []
+        leads = []
         for row in event_rows:
             event = dict(row)
             event["source_names"] = event["source_names"].split(",") if event["source_names"] else ([event["source"]] if event["source"] else [])
-            events.append(event)
+            is_lead = (event["status"] == "DETECTED" and (event["research_run_count"] or 0) == 0
+                       and (event["verification_run_count"] or 0) == 0)
+            (leads if is_lead else events).append(event)
+        events = events[:50]
+        leads = leads[:100]
         metrics = [dict(row) for row in connection.execute("SELECT * FROM metrics ORDER BY measured_at DESC")]
         reference_count = connection.execute(
             "SELECT COUNT(*) FROM signals WHERE workspace_key=? AND item_kind='reference'",
@@ -8704,6 +8711,7 @@ def overview():
             "jurisdiction": workspace["jurisdiction"],
         },
         "events": events,
+        "leads": leads,
         "reference_count": reference_count,
         "review_count": review_count,
         "rejected_count": rejected_count,
@@ -8820,6 +8828,12 @@ class Handler(SimpleHTTPRequestHandler):
         """True when login is configured. Local dev without credentials stays open."""
         return dashboard_auth.login_enabled()
 
+    def _is_static_asset(self, path):
+        """Static shell assets that must load without a session (never data or HTML documents)."""
+        lowered = path.lower()
+        return lowered.endswith((".js", ".css", ".png", ".jpg", ".jpeg", ".webp", ".svg",
+                                 ".ico", ".woff", ".woff2", ".ttf", ".map"))
+
     def _deny(self, *, redirect):
         if redirect:
             self.send_response(302)
@@ -8915,9 +8929,10 @@ class Handler(SimpleHTTPRequestHandler):
         if path.startswith("/api/") and self._auth_required() and self._current_user() is None:
             self.send_json({"error": "authentication required"}, 401)
             return
-        if not path.startswith("/api/") and path not in ("/", "/index.html") and self._auth_required() \
-                and self._current_user() is None:
-            self._deny(redirect=True)
+        # Static assets (js/css/images/fonts) load without a session so the login page and the
+        # authenticated shell both render; only the HTML shell and APIs require a session.
+        if self._is_static_asset(path):
+            super().do_GET()
             return
         if path in ("/", "/index.html") and self._auth_required() and self._current_user() is None:
             self._deny(redirect=True)

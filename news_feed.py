@@ -50,12 +50,22 @@ def verified_summary(event_id, *, connect, limit=2):
 
 
 def latest_updates(*, connect, include_unverified=True, limit=20):
-    """Latest Updates cards: factual pipeline data only, VERIFIED prioritized by default."""
+    """Latest Updates cards: factual pipeline data only, VERIFIED prioritized by default.
+
+    Raw discovery leads (DETECTED with no research or verification) are excluded — they are not
+    news. They remain visible in the Leads view.
+    """
     with connect() as connection:
         events = [dict(row) for row in connection.execute(
-            "SELECT * FROM events ORDER BY updated_at DESC LIMIT ?", (limit * 2,))]
+            "SELECT e.*,"
+            "(SELECT COUNT(*) FROM research_runs rr WHERE rr.event_id=e.id) AS research_run_count,"
+            "(SELECT COUNT(*) FROM verification_runs vr WHERE vr.event_id=e.id) AS verification_run_count "
+            "FROM events e ORDER BY e.updated_at DESC LIMIT ?", (limit * 2,))]
         cards = []
         for event in events:
+            if (event["status"] == "DETECTED" and (event.get("research_run_count") or 0) == 0
+                    and (event.get("verification_run_count") or 0) == 0):
+                continue  # raw lead, not news
             state = story_state(event)
             if state != "VERIFIED" and not include_unverified:
                 continue

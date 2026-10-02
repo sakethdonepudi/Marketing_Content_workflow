@@ -133,6 +133,8 @@ function renderRailCounts() {
   const total = (state.overview?.events || []).length;
   document.querySelector('[data-page=home]').textContent = 'Home';
   document.querySelector('[data-page=stories]').textContent = `Stories${total ? ` (${total})` : ''}`;
+  const leads = (state.overview?.leads || []).length;
+  document.querySelector('[data-page=leads]').textContent = `Leads${leads ? ` (${leads})` : ''}`;
   document.querySelector('[data-page=review]').textContent = `Review${reviews ? ` (${reviews})` : ''}`;
 }
 
@@ -147,6 +149,7 @@ function setPage(page, eventId = null, tab = 'overview') {
 document.querySelectorAll('.nav-item').forEach(b => b.onclick = () => {
   if (b.dataset.page === 'home') setPage('home');
   else if (b.dataset.page === 'stories') setPage('stories');
+  else if (b.dataset.page === 'leads') setPage('leads');
   else if (b.dataset.page === 'review') setPage('review');
   else if (b.dataset.page === 'media') setPage('media');
   else setPage('system');
@@ -158,6 +161,7 @@ function renderPage() {
   const view = el('div', 'view');
   if (state.page === 'home') renderHome(view);
   else if (state.page === 'stories') renderStories(view);
+  else if (state.page === 'leads') renderLeads(view);
   else if (state.page === 'review') renderReviewList(view);
   else if (state.page === 'media') renderMediaLibrary(view);
   else if (state.page === 'system') renderSystem(view);
@@ -326,14 +330,27 @@ function renderHome(root) {
 /* ---------- Stories ---------- */
 
 function renderStories(root) {
+  // Stories shows only events where downstream work has begun (research/verification/etc.).
+  // Raw single-signal leads live in the Leads view so the ledger is never hidden.
   const events = state.overview?.events || [];
   root.append(el('header', 'page-head', el('div', '', el('div', 'eyebrow', 'All coverage'), el('h1', '', 'Stories'),
-    el('p', 'lede', 'Every event the desk is tracking, from first source to finished reel.'))));
+    el('p', 'lede', 'Events the desk is tracking, from research through finished reel.'))));
+  root.append(el('div', 'section-title', el('h2', '', `Events (${events.length})`)));
+  root.append(events.length ? el('div', 'story-grid', events.map(e => storyCard(e)))
+    : empty('No active stories yet', 'Raw discovery leads appear under Leads until research begins.'));
+}
+
+/* ---------- Leads (raw discovery, never deleted) ---------- */
+
+function renderLeads(root) {
+  const leads = state.overview?.leads || [];
   const discovered = state.discovered || [];
+  root.append(el('header', 'page-head', el('div', '', el('div', 'eyebrow', 'Discovery'), el('h1', '', 'Leads'),
+    el('p', 'lede', 'Raw single-source leads awaiting research. Nothing here is verified news.'))));
   if (discovered.length) {
-    root.append(el('div', 'section', el('div', 'section-title', el('h2', '', `Discovered (${discovered.length})`),
+    root.append(el('div', 'section', el('div', 'section-title', el('h2', '', `Candidate clusters (${discovered.length})`),
       el('span', 'muted', 'Fast same-day leads — not yet verified')),
-      el('div', 'story-grid', discovered.slice(0, 12).map(c => el('div', 'card',
+      el('div', 'story-grid', discovered.slice(0, 24).map(c => el('div', 'card',
         el('div', 'sc-title', c.headline),
         el('div', 'chip-row', pill(c.verification_status, label(c.verification_status)),
           el('span', 'pill plain', c.location || 'Location unknown'),
@@ -342,8 +359,10 @@ function renderStories(root) {
         el('p', 'secondary-text', `First seen ${fmt(c.first_seen_at)}`),
       )))));
   }
-  root.append(el('div', 'section-title', el('h2', '', `Events (${events.length})`)));
-  root.append(events.length ? el('div', 'story-grid', events.map(e => storyCard(e))) : empty('No stories yet', 'Ingest a source to begin.'));
+  root.append(el('div', 'section-title', el('h2', '', `Raw leads (${leads.length})`),
+    el('span', 'muted', 'DETECTED with no research or verification yet')));
+  root.append(leads.length ? el('div', 'story-grid', leads.map(e => storyCard(e)))
+    : empty('No raw leads', 'New discovery signals appear here first.'));
 }
 
 /* ---------- Review list ---------- */

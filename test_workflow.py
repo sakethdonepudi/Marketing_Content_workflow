@@ -1099,9 +1099,13 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(first["event_id"], second["event_id"])
         self.assertTrue(second["clustered"])
         result = app.overview()
-        self.assertEqual(len(result["events"]), 1)
-        self.assertEqual(result["events"][0]["source_count"], 2)
-        self.assertCountEqual(result["events"][0]["source_names"], ["Government Source Fixture", "Leader Source Fixture"])
+        # A freshly ingested raw event (DETECTED, 0 research, 0 verification) is a LEAD, not yet
+        # in the Stories list. Clustering still produced exactly one event with two sources.
+        self.assertEqual(len(result["leads"]), 1)
+        self.assertEqual(result["leads"][0]["id"], first["event_id"])
+        self.assertEqual(result["leads"][0]["source_count"], 2)
+        self.assertCountEqual(result["leads"][0]["source_names"], ["Government Source Fixture", "Leader Source Fixture"])
+        self.assertEqual(result["events"], [])  # nothing in-pipeline yet
         with app.connect() as connection:
             links = connection.execute(
                 "SELECT event_id,COUNT(*) AS total FROM signals GROUP BY event_id"
@@ -5630,6 +5634,77 @@ class WorkflowTests(unittest.TestCase):
         blob = json.dumps({**db, **st})
         for token in ("STAGING_DATABASE_URL", "postgresql://", "S3_SECRET", "access_key"):
             self.assertNotIn(token, blob)
+
+    def test_arch14_raw_leads_hidden_from_stories_and_visible_in_leads(self):
+        import news_feed
+        # A raw DETECTED event with one signal and no research/verification.
+        event = app.ingest_signal(
+            url="https://youtube.example/lead-raw", title="Raw YouTube lead clip",
+            text="A dated individual YouTube upload.", source_name="YouTube", source_type="discovery",
+            source_class="independent_reporting", content_role="item", item_type="news",
+            publication_time="2026-10-02T10:00:00Z")
+        eid = event["event_id"]
+        overview = app.overview()
+        story_ids = {e["id"] for e in overview["events"]}
+        lead_ids = {e["id"] for e in overview["leads"]}
+        self.assertNotIn(eid, story_ids)          # hidden from Stories
+        self.assertIn(eid, lead_ids)              # visible in Leads
+        # Latest Updates must not present a raw lead as news.
+        update_ids = {u["event_id"] for u in news_feed.latest_updates(connect=app.connect)}
+        self.assertNotIn(eid, update_ids)
+
+    def test_arch14_lead_moves_into_stories_when_research_starts(self):
+        event = app.ingest_signal(
+            url="https://youtube.example/lead-promote", title="Promotable lead",
+            text="Dated individual item.", source_name="YouTube", source_type="discovery",
+            source_class="independent_reporting", content_role="item", item_type="news",
+            publication_time="2026-10-02T10:00:00Z")
+        eid = event["event_id"]
+        before = app.overview()
+        self.assertNotIn(eid, {e["id"] for e in before["events"]})
+        self.assertIn(eid, {e["id"] for e in before["leads"]})
+        # Start research via the canonical helper (no manual status mutation).
+        run = app.enqueue_research(eid, "test", background=False)["run"]
+        self.assertEqual(run["event_id"], eid)
+        after = app.overview()
+        self.assertIn(eid, {e["id"] for e in after["events"]})       # now in Stories
+        self.assertNotIn(eid, {e["id"] for e in after["leads"]})     # no longer a raw lead
+        # Ledger preserved: exactly one event and the original signal still exist.
+        with app.connect() as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM events WHERE id=?", (eid,)).fetchone()[0], 1)
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM signals WHERE event_id=?", (eid,)).fetchone()[0], 1)
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM research_runs WHERE event_id=?", (eid,)).fetchone()[0], 1)
+
+    def test_arch14_verified_home_and_verifying_story_states(self):
+        import news_feed
+        # VERIFIED event appears in Latest Updates; VERIFYING is labelled and never VERIFIED.
+        with app.connect() as connection:
+            connection.execute(
+                "INSERT INTO events(id,title,source,status,priority,created_at,updated_at,first_seen_at,"
+                "last_seen_at,workspace_key,event_time,verification_status) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                ("EV-LEAD-VERIFIED", "Verified story headline", "PIB", "VERIFIED", "NORMAL", app.now(),
+                 app.now(), app.now(), app.now(), app.workspace_identity()["workspace_key"], app.now(), "VERIFIED"))
+            connection.execute(
+                "INSERT INTO events(id,title,source,status,priority,created_at,updated_at,first_seen_at,"
+                "last_seen_at,workspace_key,event_time,verification_status) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                ("EV-LEAD-VERIFYING", "Verifying story headline", "NTV", "VERIFYING", "NORMAL", app.now(),
+                 app.now(), app.now(), app.now(), app.workspace_identity()["workspace_key"], app.now(), "RUNNING"))
+        states = {u["event_id"]: u["state"] for u in news_feed.latest_updates(connect=app.connect)}
+        self.assertEqual(states.get("EV-LEAD-VERIFIED"), "VERIFIED")
+        self.assertEqual(states.get("EV-LEAD-VERIFYING"), "VERIFYING")
+        self.assertNotEqual(states.get("EV-LEAD-VERIFYING"), "VERIFIED")
+        # Both are in Stories (in-pipeline), neither is a raw lead.
+        overview = app.overview()
+        story_ids = {e["id"] for e in overview["events"]}
+        self.assertIn("EV-LEAD-VERIFYING", story_ids)
+        self.assertIn("EV-LEAD-VERIFIED", story_ids)
+
+    def test_arch14_navigation_includes_leads(self):
+        html = Path(app.__file__).with_name("index.html").read_text(encoding="utf-8")
+        self.assertIn('data-page="leads"', html)
+        source = Path(app.__file__).with_name("app.js").read_text(encoding="utf-8")
+        self.assertIn("renderLeads", source)
+        self.assertIn("state.overview?.leads", source)
 
     def test_new_shell_has_five_destinations_and_no_publish(self):
         html = Path(app.__file__).with_name("index.html").read_text(encoding="utf-8")
