@@ -8696,6 +8696,7 @@ def overview():
             )
         }
     return {
+        "environment": os.environ.get("APP_ENV", "development").strip().lower() or "development",
         "workspace": {
             "key": workspace["workspace_key"],
             "display_name": workspace["display_name"],
@@ -9489,6 +9490,9 @@ class Handler(SimpleHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    # Fail closed BEFORE serving if the environment is misconfigured (Architecture 14).
+    import persistence
+    persistence.assert_environment_isolation()
     init()
     recover_interrupted_publish_jobs()
     start_publish_scheduler()

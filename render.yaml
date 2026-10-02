@@ -1,0 +1,58 @@
+# Architecture 14 — FREE staging deployment (Render Web Service).
+# Staging only. Production uses its own service; main is not deployed by this file.
+services:
+  - type: web
+    name: reachout-staging
+    runtime: python
+    plan: free
+    branch: staging
+    buildCommand: pip install -r requirements.txt
+    startCommand: python3 app.py
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      # Render injects PORT; the app reads HOST/PORT and binds 0.0.0.0 on Render.
+      - key: HOST
+        value: 0.0.0.0
+      - key: PYTHON_VERSION
+        value: "3.11.9"
+      - key: APP_ENV
+        value: staging
+      - key: REACHOUT_ENV
+        value: staging
+      # External free PostgreSQL (Neon or Supabase). Set in the dashboard — never committed.
+      - key: STAGING_DATABASE_URL
+        sync: false
+      # Central object storage (Cloudflare R2 free tier or other S3-compatible).
+      - key: STORAGE_BACKEND
+        value: s3
+      - key: S3_BUCKET
+        sync: false
+      - key: S3_ENDPOINT_URL
+        sync: false
+      - key: S3_REGION
+        value: auto
+      - key: S3_ACCESS_KEY_ID
+        sync: false
+      - key: S3_SECRET_ACCESS_KEY
+        sync: false
+      # Auth (set in the dashboard — never committed).
+      - key: DASHBOARD_USERNAME
+        sync: false
+      - key: DASHBOARD_PASSWORD_HASH
+        sync: false
+      - key: SESSION_SECRET
+        sync: false
+      - key: DASHBOARD_COOKIE_SECURE
+        value: "1"
+      # YouTube: discovery only; automated uploads stay PRIVATE and upload tests are OFF.
+      - key: YOUTUBE_API_KEY
+        sync: false
+      - key: YOUTUBE_AUTOMATED_PRIVACY
+        value: PRIVATE
+      - key: STAGING_YOUTUBE_UPLOADS_ENABLED
+        value: "0"
+      - key: YOUTUBE_DISCOVERY_ENABLED
+        value: "0"
+      - key: AUTO_REEL_PIPELINE
+        value: "0"

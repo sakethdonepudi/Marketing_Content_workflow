@@ -248,3 +248,12 @@ details.disclosure > .disclosure-body { padding: 0 20px 18px; display: grid; gap
   .ops-home .update-grid { grid-template-columns: 1fr; }
   .ops-summary { padding: 14px; }
 }
+
+/* Architecture 14 — staging environment banner + badge */
+.env-banner { position: sticky; top: 0; z-index: 40; display: flex; gap: 10px; align-items: center;
+  justify-content: center; flex-wrap: wrap; padding: 8px 14px; background: #7a5a00; color: #fff4d6;
+  font-size: 13px; letter-spacing: .3px; border-bottom: 1px solid #a17b12; }
+.env-banner strong { letter-spacing: .8px; }
+.env-badge { display: inline-block; margin: 6px 0; padding: 3px 9px; border-radius: 99px;
+  background: #7a5a00; color: #fff4d6; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
+@media (max-width: 760px) { .env-banner { font-size: 12px; padding: 7px 10px; } }

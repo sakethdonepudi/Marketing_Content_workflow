@@ -1,0 +1,5 @@
+# ReachOut OS runtime dependencies.
+# The app is stdlib-only in development/tests; staging/production add the PostgreSQL driver.
+# Object storage (S3/R2) additionally needs boto3 — uncomment when STORAGE_BACKEND=s3.
+psycopg[binary]>=3.1
+boto3>=1.34

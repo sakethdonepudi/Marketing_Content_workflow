@@ -95,12 +95,27 @@ async function refresh() {
     state.discoveryHealth = discovered.discovery_health || null;
     document.getElementById('clock').textContent = `Updated ${fmt(overview.updated_at)}`;
     document.getElementById('standard-tag').textContent = overview.reel_standard?.version || 'Standard';
+    applyEnvironmentBanner(overview.environment);
     renderLeader(overview);
     renderRailCounts();
     renderPage();
   } catch (error) {
     document.getElementById('page-root').replaceChildren(empty('Cannot reach the local API', error.message));
   }
+}
+
+function applyEnvironmentBanner(environment) {
+  const existing = document.getElementById('env-banner');
+  if (existing) existing.remove();
+  // Server-provided environment only; never inferred from the hostname.
+  if (environment !== 'staging') return;
+  const banner = el('div', 'env-banner',
+    el('strong', '', 'STAGING ENVIRONMENT'),
+    el('span', '', 'Testing environment — changes here are not production.'));
+  banner.id = 'env-banner';
+  document.body.prepend(banner);
+  const badge = document.getElementById('env-badge');
+  if (badge) badge.hidden = false;
 }
 
 function renderLeader(overview) {

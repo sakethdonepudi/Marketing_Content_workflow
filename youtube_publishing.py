@@ -1227,11 +1227,22 @@ class YouTubePublisher:
             return json.loads(response.read().decode("utf-8", "replace"))
 
 
+def youtube_uploads_enabled():
+    """Staging defaults to uploads OFF (STAGING_YOUTUBE_UPLOADS_ENABLED=0) to protect the
+    production channel from accidental test uploads. Production is unaffected."""
+    env = os.environ.get("REACHOUT_ENV", "development").strip().lower()
+    if env == "staging":
+        return os.environ.get("STAGING_YOUTUBE_UPLOADS_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+    return True
+
+
 def request_upload(reel_id, package_id, *, mode="NOW", scheduled_for=None, privacy_status="PRIVATE",
                    timezone_name="Asia/Kolkata", connect, now=None, video_bytes=None, publisher=None,
                    storage=None, requested_by=None):
     """Durable, idempotent YouTube upload request. Defaults to PRIVATE (Part H)."""
     import reel_control
+    if not youtube_uploads_enabled():
+        raise ValueError("YouTube uploads are disabled on staging (STAGING_YOUTUBE_UPLOADS_ENABLED=0).")
     timestamp = now() if now else _now()
     with connect() as connection:
         reel = connection.execute("SELECT * FROM final_reel_assets WHERE id=?", (reel_id,)).fetchone()

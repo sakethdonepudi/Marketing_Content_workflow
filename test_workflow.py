@@ -5508,6 +5508,59 @@ class WorkflowTests(unittest.TestCase):
         self.assertTrue(branching.exists())
         self.assertIn("staging", branching.read_text())
 
+    def test_arch14_environment_field_and_staging_banner(self):
+        import os, json
+        # overview() exposes the environment from APP_ENV (server-provided), defaulting to development.
+        with patch.dict(os.environ, {"APP_ENV": "staging"}, clear=False):
+            self.assertEqual(app.overview()["environment"], "staging")
+        with patch.dict(os.environ, {"APP_ENV": "production"}, clear=False):
+            self.assertEqual(app.overview()["environment"], "production")
+        with patch.dict(os.environ, {"APP_ENV": ""}, clear=False):
+            self.assertEqual(app.overview()["environment"], "development")
+        # No secrets in the overview payload.
+        blob = json.dumps(app.overview())
+        for token in ("STAGING_DATABASE_URL", "PRODUCTION_DATABASE_URL", "YOUTUBE_CLIENT_SECRET",
+                      "SESSION_SECRET", "DASHBOARD_PASSWORD_HASH"):
+            self.assertNotIn(token, blob)
+        # The UI renders the staging banner only for staging.
+        source = Path(app.__file__).with_name("app.js").read_text(encoding="utf-8")
+        self.assertIn("STAGING ENVIRONMENT", source)
+        self.assertIn("environment !== 'staging'", source)
+
+    def test_arch14_staging_isolation_and_upload_guard(self):
+        import os, persistence, youtube_publishing as yp
+        # Staging refuses to share the production DB.
+        with patch.dict(os.environ, {"REACHOUT_ENV": "staging",
+                                     "STAGING_DATABASE_URL": "postgresql://x/db",
+                                     "PRODUCTION_DATABASE_URL": "postgresql://x/db"}, clear=False):
+            with self.assertRaises(persistence.PersistenceError):
+                persistence.assert_environment_isolation()
+        # Staging disables YouTube uploads by default (protects the production channel).
+        with patch.dict(os.environ, {"REACHOUT_ENV": "staging", "STAGING_YOUTUBE_UPLOADS_ENABLED": "0"}, clear=False):
+            self.assertFalse(yp.youtube_uploads_enabled())
+            with self.assertRaises(ValueError):
+                yp.request_upload("FR-X", "YP-X", connect=app.connect)
+        # Production is unaffected.
+        with patch.dict(os.environ, {"REACHOUT_ENV": "production"}, clear=False):
+            self.assertTrue(yp.youtube_uploads_enabled())
+
+    def test_arch14_render_config_and_requirements(self):
+        import yaml
+        root = Path(app.__file__).parent
+        self.assertTrue((root / "requirements.txt").exists())
+        self.assertIn("psycopg", (root / "requirements.txt").read_text())
+        render = root / "render.yaml"
+        self.assertTrue(render.exists())
+        config = yaml.safe_load(render.read_text())
+        service = config["services"][0]
+        self.assertEqual(service["branch"], "staging")
+        self.assertEqual(service["healthCheckPath"], "/api/health")
+        self.assertIn("python3 app.py", service["startCommand"])
+        keys = {item["key"] for item in service["envVars"]}
+        for required in ("STAGING_DATABASE_URL", "STORAGE_BACKEND", "YOUTUBE_AUTOMATED_PRIVACY",
+                         "STAGING_YOUTUBE_UPLOADS_ENABLED", "DASHBOARD_COOKIE_SECURE"):
+            self.assertIn(required, keys)
+
     def test_new_shell_has_five_destinations_and_no_publish(self):
         html = Path(app.__file__).with_name("index.html").read_text(encoding="utf-8")
         for page in ("home", "stories", "review", "media", "system"):
