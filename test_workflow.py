@@ -4381,6 +4381,39 @@ class WorkflowTests(unittest.TestCase):
         # LIVE_DISCOVERY_ENABLED=0 disables the scheduler.
         self.assertFalse(app.LIVE_DISCOVERY_ENABLED)
 
+    def test_real_publisher_parsers_use_saved_fixtures(self):
+        import live_discovery as ld
+        fixtures = Path(app.__file__).parent / "test_fixtures"
+        # RSS parsers (NTV, TV9, Sakshi) parse titles + dates from saved fixtures.
+        for name, min_items in (("ntv_feed.xml", 10), ("tv9_feed.xml", 10), ("sakshi_feed.xml", 3)):
+            items = ld._parse_rss_text((fixtures / name).read_text(encoding="utf-8"))
+            self.assertGreaterEqual(len(items), min_items, name)
+            self.assertTrue(items[0]["title"], name)
+            self.assertTrue(items[0]["url"].startswith("http"), name)
+        # PIB listing parses to raw items or fails closed (never fabricates).
+        pib = ld.parse_pib_listing((fixtures / "pib_listing.html").read_text(encoding="utf-8"))
+        self.assertIsInstance(pib, list)
+        for item in pib:
+            self.assertTrue(item["title"])
+        # The RSS parser tolerates a malformed document by raising, not inventing data.
+        with self.assertRaises(Exception):
+            ld._parse_rss_text("<rss><channel><item><title>broken")
+
+    def test_discovery_source_registry_and_health_states(self):
+        import live_discovery as ld
+        registry = ld.load_registry()
+        ids = {s["source_id"] for s in registry}
+        self.assertTrue({"ntv", "tv9", "sakshi", "pib"} <= ids)
+        # No generic placeholder endpoints remain: unconfigured sources carry no feed_url.
+        for source in registry:
+            if source.get("adapter_type") == "UNAVAILABLE":
+                self.assertIsNone(source.get("feed_url"))
+        ld.sync_sources(connect=app.connect)
+        health = ld.source_health(connect=app.connect)
+        self.assertEqual(health["X"]["status"], "UNCONFIGURED")
+        self.assertEqual(health["YouTube"]["status"], "UNCONFIGURED")
+        self.assertIn("last_polled", health["NTV Telugu"])
+
     def test_new_shell_has_five_destinations_and_no_publish(self):
         html = Path(app.__file__).with_name("index.html").read_text(encoding="utf-8")
         for page in ("home", "stories", "review", "media", "system"):

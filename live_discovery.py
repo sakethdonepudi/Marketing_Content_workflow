@@ -10,6 +10,7 @@ blocking the cycle. A broken source never crashes the cycle; 429s back off with 
 """
 
 from datetime import datetime, timezone
+from pathlib import Path
 import hashlib
 import random
 import re
@@ -107,38 +108,63 @@ def query_variants(group, recent_entities=()):
 
 # ---------- source registry ----------
 
-DEFAULT_SOURCES = (
-    ("youtube", "YouTube", "YouTube", "discover_youtube", False, 300),
-    ("ntv", "NTV Telugu", "NTV Telugu", "discover_news", True, 300),
-    ("tv9", "TV9 Telugu", "TV9 Telugu", "discover_news", True, 300),
-    ("sakshi", "Sakshi", "Sakshi", "discover_news", True, 300),
-    ("eenadu", "Eenadu", "Eenadu", "discover_news", True, 300),
-    ("abn", "ABN Andhra Jyothy", "ABN Andhra Jyothy", "discover_news", True, 300),
-    ("samayam", "Samayam Telugu", "Samayam Telugu", "discover_news", True, 300),
-    ("news18te", "News18 Telugu", "News18 Telugu", "discover_news", True, 300),
-    ("akashvani", "Akashvani/NewsOnAIR", "NewsOnAIR", "discover_news", True, 300),
-    ("pib", "PIB", "Press Information Bureau", "discover_pib", True, 300),
-    ("apgov", "AP Government", "Government of Andhra Pradesh", "discover_ap_gov", True, 300),
-    ("cmo", "CMO Andhra Pradesh", "Chief Minister's Office, AP", "discover_cmo_ap", True, 300),
-    ("x", "X", "X", "discover_x", False, 300),
-    ("instagram", "Instagram", "Instagram", "discover_instagram", False, 300),
-)
+REGISTRY_PATH = Path(__file__).resolve().parent / "config" / "discovery_sources.json"
 
 
-def sync_sources(*, connect, now=None):
-    """Register the default source adapter set; X/Instagram start UNCONFIGURED."""
+def load_registry(path=None):
+    import json
+    return json.loads(Path(path or REGISTRY_PATH).read_text(encoding="utf-8"))["sources"]
+
+
+def adapter_key(source):
+    """Map a registry entry to its adapter function key."""
+    if source.get("adapter_type") == "UNCONFIGURED":
+        return {"YouTube": "discover_youtube", "X": "discover_x", "Instagram": "discover_instagram"}.get(
+            source.get("family"), "discover_news")
+    return {"rss": "discover_news", "pib_listing": "discover_pib"}.get(source.get("parser_name"), "discover_news")
+
+
+def sync_sources(*, connect, now=None, path=None):
+    """Load the validated source registry (config/discovery_sources.json) into the DB."""
     timestamp = now() if now else _now()
     with connect() as connection:
-        for source_id, family, publisher, adapter, configured, interval in DEFAULT_SOURCES:
-            existing = connection.execute("SELECT id FROM discovery_sources WHERE id=?", (source_id,)).fetchone()
+        for source in load_registry(path):
+            existing = connection.execute("SELECT id FROM discovery_sources WHERE id=?", (source["source_id"],)).fetchone()
+            adapter = adapter_key(source)
+            values = (source["family"], source["publisher"], adapter, source.get("adapter_type"),
+                      int(source.get("enabled", True)), int(source.get("configured", True)),
+                      int(source.get("poll_interval_seconds", 300)), source.get("feed_url"), source.get("parser_name"))
             if existing:
-                continue
-            connection.execute(
-                "INSERT INTO discovery_sources(id,family,adapter,publisher,enabled,configured,poll_interval_seconds,"
-                "created_at) VALUES(?,?,?,?,?,?,?,?)",
-                (source_id, family, adapter, publisher, 1, int(configured), interval, timestamp),
-            )
+                connection.execute(
+                    "UPDATE discovery_sources SET family=?,publisher=?,adapter=?,adapter_type=?,enabled=?,configured=?,"
+                    "poll_interval_seconds=?,feed_url=?,parser_name=? WHERE id=?", (*values, source["source_id"]))
+            else:
+                connection.execute(
+                    "INSERT INTO discovery_sources(id,family,adapter,publisher,adapter_type,enabled,configured,"
+                    "poll_interval_seconds,feed_url,parser_name,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                    (source["source_id"], source["family"], adapter, source["publisher"],
+                     source.get("adapter_type"), int(source.get("enabled", True)), int(source.get("configured", True)),
+                     int(source.get("poll_interval_seconds", 300)), source.get("feed_url"), source.get("parser_name"),
+                     timestamp))
 
+
+def parse_pib_listing(html_text, *, base_url="https://www.pib.gov.in"):
+    """Parse PIB's listing HTML into raw items; fail closed when structure is unclear."""
+    pattern = re.compile(
+        r'href="(?P<url>[^"]*(?:PressReleasePage|PRID=|Relese|PressRelease)[^"]*)"[^>]*>(?P<title>[^<]{6,300})<', re.I)
+    items = []
+    for match in pattern.finditer(html_text or ""):
+        title = match.group("title").strip()
+        if not title:
+            continue
+        url = match.group("url")
+        if url.startswith("/"):
+            url = base_url + url
+        date_match = re.search(r"(\d{1,2}\s+\w{3}\s+\d{4})", match.group(0))
+        items.append({"title": title, "url": url,
+                      "published_at": date_match.group(1) if date_match else None,
+                      "text": "", "raw_metadata": {"parser": "pib_listing"}})
+    return items
 
 def sources(*, connect):
     with connect() as connection:
@@ -150,17 +176,26 @@ def source_health(*, connect):
     rows = sources(connect=connect)
     result = {}
     for source in rows:
+        error_text = (source["last_error"] or "").lower()
         if not source["configured"]:
             status = "UNCONFIGURED"
+        elif source.get("adapter_type") == "UNAVAILABLE":
+            status = "FAILED"
+        elif any(token in error_text for token in ("403", "captcha", "bot", "challenge", "blocked")):
+            status = "BLOCKED"
         elif source["consecutive_failures"] >= MAX_CONSECUTIVE_FAILURES:
             status = "FAILED"
         elif source["consecutive_failures"] > 0:
             status = "DEGRADED"
+        elif source["last_success_at"] is None and source["last_polled_at"] is not None:
+            # Polled but produced nothing parseable -> degraded, never falsely HEALTHY.
+            status = "DEGRADED"
         else:
             status = "HEALTHY"
         result[source["family"]] = {
-            "status": status, "last_success": source["last_success_at"], "last_error": source["last_error"],
-            "consecutive_failures": source["consecutive_failures"],
+            "status": status, "adapter_type": source.get("adapter_type"),
+            "last_polled": source.get("last_polled_at"), "last_success": source["last_success_at"],
+            "last_error": source["last_error"], "consecutive_failures": source["consecutive_failures"],
             "average_latency_ms": source["average_latency_ms"], "results_last_24h": source["results_last_24h"],
             "poll_interval_seconds": source["poll_interval_seconds"],
         }
@@ -226,9 +261,22 @@ def run_discovery_cycle(*, connect, adapters, now=None, cold_start=False, handof
         latency = (datetime.now(timezone.utc) - fetch_started).total_seconds() * 1000
         normalized = [normalize_signal(item, source_family=source["family"], publisher=source["publisher"],
                                        source_id=source["id"], now=now) for item in raw_items]
+        # Same-day filter: keep the last 24h; mark unknown dates rather than dropping silently.
+        kept = []
+        for signal in normalized:
+            age = _age_hours_for(signal.get("published_at"), timestamp)
+            if age is None:
+                signal["published_at"] = signal.get("published_at") or "UNKNOWN"
+                kept.append(signal)
+            elif age <= 24.0:
+                kept.append(signal)
+        normalized = kept
         with connect() as connection:
-            fetch_run_id = _record_source_result(connection, source["id"], status="COMPLETED",
-                                                 signals=len(normalized), latency_ms=latency, now=now)
+            # A reachable source with zero parseable items is DEGRADED, not healthy.
+            run_status = "COMPLETED" if normalized else "FAILED"
+            fetch_run_id = _record_source_result(connection, source["id"], status=run_status,
+                                                 signals=len(normalized), latency_ms=latency,
+                                                 error=None if normalized else "no parseable items", now=now)
             for signal in normalized:
                 signal["fetch_run_id"] = fetch_run_id
         cycle["sources_polled"].append(source["family"])
@@ -274,6 +322,24 @@ def run_discovery_cycle(*, connect, adapters, now=None, cold_start=False, handof
 def _json(value):
     import json
     return json.dumps(value, ensure_ascii=False, sort_keys=True)
+
+
+def _age_hours_for(published_at, now_at):
+    """Hours since publication, or None when the timestamp is missing/UNKNOWN."""
+    if not published_at or str(published_at).upper() == "UNKNOWN":
+        return None
+    from email.utils import parsedate_to_datetime
+    try:
+        published = datetime.fromisoformat(str(published_at).replace("Z", "+00:00"))
+    except ValueError:
+        try:
+            published = parsedate_to_datetime(str(published_at))
+        except (TypeError, ValueError):
+            return None
+    if published.tzinfo is None:
+        published = published.replace(tzinfo=timezone.utc)
+    reference = datetime.fromisoformat(str(now_at).replace("Z", "+00:00"))
+    return max(0.0, (reference - published).total_seconds() / 3600)
 
 
 def slo_metrics(*, connect):
@@ -361,21 +427,80 @@ def make_rss_adapter(feed_url, *, user_agent="ReachOut-OS/0.4 (live discovery)")
     return adapter
 
 
-def default_adapters(*, user_agent="ReachOut-OS/0.4 (live discovery)", http=None):
-    """Provider-independent adapter map. RSS/news adapters need no credentials.
+def _fetch_text(url, *, user_agent, timeout=20, http=None):
+    """Fetch a URL as text; honors 429 with bounded backoff. `http` overrides for tests."""
+    if http is not None:
+        result = http(url)
+        return result if isinstance(result, str) else result
+    import time as _time
+    from urllib.error import HTTPError
+    from urllib.request import Request, build_opener
+    for attempt in range(1, 3):
+        try:
+            request = Request(url, headers={"User-Agent": user_agent, "Accept": "application/rss+xml, application/xml, text/html"})
+            with build_opener().open(request, timeout=timeout) as response:
+                return response.read().decode("utf-8", "replace")
+        except HTTPError as error:
+            if error.code != 429 or attempt == 2:
+                raise
+            _time.sleep(backoff_delay(attempt) / 30.0)
 
-    `http` is an injectable transport for tests: http(url) -> list[dict].
+
+def _parse_rss_text(text):
+    """Parse RSS/Atom text into raw items (provider-independent).
+
+    Note: ElementTree Elements with text but no children are falsy, so lookups use explicit
+    `is None` checks rather than `or`.
     """
-    def fetch(url):
+    import xml.etree.ElementTree as ET
+    root = ET.fromstring(text)
+    items = []
+    for item in root.iter():
+        if item.tag.split("}")[-1] not in ("item", "entry"):
+            continue
+        def _first(*names):
+            for name in names:
+                node = item.find(name)
+                if node is None:
+                    node = item.find("{http://www.w3.org/2005/Atom}" + name)
+                if node is not None and node.text and node.text.strip():
+                    return node.text.strip()
+            return ""
+        link_attr = ""
+        for link_node in item.findall("{http://www.w3.org/2005/Atom}link"):
+            if link_node.get("href"):
+                link_attr = link_node.get("href")
+                break
+        url = link_attr or _first("link", "guid")
+        items.append({"title": _first("title"), "text": _first("description", "summary", "content"),
+                      "url": url, "published_at": _first("pubDate", "published", "updated", "date")})
+    return items
+
+
+def default_adapters(*, user_agent="ReachOut-OS/0.5 (live discovery)", http=None):
+    """Provider-independent adapter map keyed by the source's `adapter` column.
+
+    RSS sources use `_parse_rss_text`; the PIB listing uses `parse_pib_listing` (fail-closed).
+    `http(url) -> str` is an injectable text transport for fixture tests.
+    """
+    def rss(source):
+        url = source.get("feed_url")
+        if not url:
+            return []
         if http is not None:
-            return http(url)
+            return _parse_rss_text(http(url))
         return _rss_items(url, user_agent=user_agent)
+
+    def pib(source):
+        url = source.get("feed_url") or "https://www.pib.gov.in/RssMain.aspx?reg=48&lang=2"
+        text = http(url) if http is not None else _fetch_text(url, user_agent=user_agent)
+        return parse_pib_listing(text)
     return {
-        "discover_news": lambda source: fetch(source.get("feed_url") or source.get("url") or ""),
-        "discover_pib": lambda source: fetch(source.get("feed_url") or "https://www.pib.gov.in/RssMain.aspx"),
-        "discover_ap_gov": lambda source: fetch(source.get("feed_url") or "https://www.ap.gov.in/rss.xml"),
-        "discover_cmo_ap": lambda source: fetch(source.get("feed_url") or "https://cm.ap.gov.in/rss.xml"),
-        "discover_youtube": lambda source: fetch(source.get("feed_url") or ""),
+        "discover_news": rss,
+        "discover_pib": pib,
+        "discover_ap_gov": rss,
+        "discover_cmo_ap": rss,
+        "discover_youtube": lambda source: [],
         "discover_x": lambda source: [],
         "discover_instagram": lambda source: [],
     }

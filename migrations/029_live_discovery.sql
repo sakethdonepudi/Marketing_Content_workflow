@@ -19,6 +19,10 @@ CREATE TABLE discovery_sources(
   consecutive_failures INTEGER NOT NULL DEFAULT 0,
   average_latency_ms REAL,
   results_last_24h INTEGER NOT NULL DEFAULT 0,
+  feed_url TEXT,
+  adapter_type TEXT,
+  parser_name TEXT,
+  last_validated_at TEXT,
   created_at TEXT NOT NULL
 );
 
