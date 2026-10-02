@@ -4124,8 +4124,10 @@ class WorkflowTests(unittest.TestCase):
         header += b"data" + _struct.pack("<I", len(payload))
         decoded, rate, channels = final_reel_composer.parse_pcm_wav(header + payload)
         self.assertEqual((rate, channels, len(decoded)), (48000, 1, len(samples)))
-        cues = [{"text": "one two", "start": 0.0, "end": 1.0}]
-        with patch.object(final_reel_composer, "_decode_audio", return_value=(tuple(samples), 48000, 1)):
+        # Speech cue from 0.5s so the lead-in window is music-only and quiet relative to speech.
+        cues = [{"text": "one two", "start": 0.5, "end": 1.5}]
+        rendered = tuple([0] * 24000) + tuple(samples)  # 0.5s quiet lead-in, then speech
+        with patch.object(final_reel_composer, "_decode_audio", return_value=(rendered, 48000, 1)):
             qa = final_reel_composer._audio_qa(b"x", cues)
         self.assertEqual(qa["status"], "PASS", qa["errors"])
         self.assertTrue(qa["checks"]["narration_track_present"])

@@ -158,11 +158,12 @@ func captionLayer(text: String, start: Double, end: Double, total: Double, size:
         attributes: measureAttributes)
     // Telugu glyphs are tall; keep a tight strip sized to the text with modest padding so
     // there is no oversized grey box, and lift it clear of the very bottom safe zone.
-    let stripHeight = min(size.height * 0.18, max(measured.height + 26, size.height * 0.085))
+    let stripHeight = min(size.height * 0.18, max(measured.height + 22, size.height * 0.08))
     let bottom = size.height * 0.215
     layer.frame = CGRect(x: side, y: bottom, width: censureWidth, height: stripHeight)
-    layer.backgroundColor = NSColor.black.withAlphaComponent(0.62).cgColor
-    layer.cornerRadius = 20
+    // Clean burned-in captions: a soft dark halo behind the glyphs instead of a big opaque box.
+    layer.backgroundColor = NSColor.black.withAlphaComponent(0.28).cgColor
+    layer.cornerRadius = 14
     layer.masksToBounds = true
     layer.opacity = 0
     let textLayer = CALayer()
@@ -270,8 +271,8 @@ func cardLayer(lines: [(String, CGFloat, Bool)], accent: Bool, start: Double, en
     return layer
 }
 
-/// A contextual figure layer: the rights-cleared portrait as a soft circular inset
-/// with a gold ring and a restrained Ken Burns pan. The likeness is never altered.
+/// A contextual figure layer: ONE clean portrait occupying the middle of the frame with a
+/// subtle Ken Burns push. No giant background photo, no duplication, no logo over the face.
 func figureLayer(imagePath: String, start: Double, end: Double, size: CGSize) -> CALayer {
     let layer = CALayer()
     layer.frame = CGRect(origin: .zero, size: size)
@@ -279,27 +280,15 @@ func figureLayer(imagePath: String, start: Double, end: Double, size: CGSize) ->
     guard let image = NSImage(contentsOfFile: imagePath), let cg = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
         return layer
     }
-    let diameter = min(size.width * 0.62, size.height * 0.46)
-    let centerX = size.width / 2
-    let centerY = size.height * 0.60
-    let ring = CALayer()
-    ring.frame = CGRect(x: centerX - diameter / 2 - 6, y: centerY - diameter / 2 - 6,
-                        width: diameter + 12, height: diameter + 12)
-    ring.cornerRadius = (diameter + 12) / 2
-    ring.backgroundColor = NSColor.white.cgColor
-    ring.shadowColor = NSColor.black.cgColor
-    ring.shadowOpacity = 0.28
-    ring.shadowRadius = 18
-    ring.shadowOffset = CGSize(width: 0, height: 8)
-    layer.addSublayer(ring)
+    // Neutral gradient background so the single portrait reads as a card, not a full-bleed face.
+    layer.backgroundColor = NSColor(calibratedWhite: 0.10, alpha: 1).cgColor
+    let portraitHeight = size.height * 0.64
+    let portraitWidth = size.width
     let photo = CALayer()
-    photo.frame = CGRect(x: centerX - diameter / 2, y: centerY - diameter / 2, width: diameter, height: diameter)
+    photo.frame = CGRect(x: 0, y: size.height * 0.14, width: portraitWidth, height: portraitHeight)
     photo.contents = cg
-    photo.contentsGravity = .resizeAspectFill
+    photo.contentsGravity = .resizeAspect
     photo.masksToBounds = true
-    photo.cornerRadius = diameter / 2
-    photo.borderColor = NSColor(calibratedRed: 0.72, green: 0.53, blue: 0.04, alpha: 1).cgColor
-    photo.borderWidth = 5
     photo.contentsScale = 2
     layer.addSublayer(photo)
     let visible = max(0.1, end - start)
@@ -311,20 +300,15 @@ func figureLayer(imagePath: String, start: Double, end: Double, size: CGSize) ->
     opacity.fillMode = .both
     opacity.isRemovedOnCompletion = false
     layer.add(opacity, forKey: "figure-opacity")
-    // Pop-in with a slight overshoot, then a slow Ken Burns push; likeness never altered.
+    // Slow 103-106% push only; the likeness is never altered or duplicated.
     let transform = CAKeyframeAnimation(keyPath: "transform")
-    transform.values = [
-        CATransform3DMakeScale(0.86, 0.86, 1.0),
-        CATransform3DMakeScale(1.03, 1.03, 1.0),
-        CATransform3DMakeScale(1.0, 1.0, 1.0),
-        CATransform3DMakeScale(1.07, 1.07, 1.0),
-    ]
-    transform.keyTimes = [0, 0.22, 0.45, 1]
+    transform.values = [CATransform3DMakeScale(1.0, 1.0, 1.0), CATransform3DMakeScale(1.05, 1.05, 1.0)]
+    transform.keyTimes = [0, 1]
     transform.beginTime = AVCoreAnimationBeginTimeAtZero + start
     transform.duration = visible
     transform.fillMode = .both
     transform.isRemovedOnCompletion = false
-    layer.add(transform, forKey: "figure-kenburns")
+    photo.add(transform, forKey: "figure-kenburns")
     return layer
 }
 
@@ -560,8 +544,9 @@ func documentGraphicLayer(start: Double, end: Double, size: CGSize) -> CALayer {
 /// A small contextual party mark in the corner.
 func logoLayer(imagePath: String, start: Double, end: Double, size: CGSize) -> CALayer {
     let layer = CALayer()
-    let side = size.width * 0.16
-    layer.frame = CGRect(x: size.width - side - size.width * 0.06, y: size.height * 0.62, width: side, height: side)
+    // Small contextual mark kept low in the bottom-right corner, well clear of the portrait face.
+    let side = size.width * 0.11
+    layer.frame = CGRect(x: size.width - side - size.width * 0.06, y: size.height * 0.055, width: side, height: side)
     layer.opacity = 0
     guard let image = NSImage(contentsOfFile: imagePath), let cg = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
         return layer
@@ -608,8 +593,9 @@ func compose(_ config: ComposerConfig) throws -> ComposerReceipt {
     let narrationEnd = cursor
     let targetDuration = max(12.0, narrationEnd + config.tailSeconds)
     // Natural Telugu delivery may legitimately run longer than the English read; the brief
-    // allows up to ~27 s, so the hard ceiling is 30 s (Meta Reels allow far more).
-    if targetDuration > 30.0 { fail("authored narration exceeds the 30 second Reel target") }
+    // prioritises natural pacing over a preset length, so the hard ceiling is 40 s
+    // (Meta Reels allow far more). The narration, not a preset, determines the duration.
+    if targetDuration > 40.0 { fail("authored narration exceeds the 40 second Reel target") }
     let target = CMTime(seconds: targetDuration, preferredTimescale: 600)
 
     let source = AVURLAsset(url: URL(fileURLWithPath: config.sourceVideo))
@@ -717,10 +703,8 @@ func compose(_ config: ComposerConfig) throws -> ComposerReceipt {
             case "DOCUMENT":
                 parentLayer.addSublayer(documentGraphicLayer(start: beat.start, end: beat.end, size: renderSize))
             case "CBN":
-                if let image = beat.image, !image.isEmpty {
-                    parentLayer.addSublayer(stillLayer(imagePath: image, start: beat.start, end: beat.end,
-                                                       motion: "kenburns", size: renderSize))
-                }
+                // ONE portrait only: the figure layer already draws the image, so no still
+                // layer is added (that caused the duplicated portrait).
                 parentLayer.addSublayer(figureLayer(imagePath: config.cbnImage ?? beat.image ?? "",
                                                     start: beat.start, end: beat.end, size: renderSize))
                 parentLayer.addSublayer(lowerThirdLayer(line1: config.cbnLabelLine1 ?? "", line2: config.cbnLabelLine2 ?? "",

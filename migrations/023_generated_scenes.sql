@@ -26,4 +26,7 @@ CREATE TABLE generated_scenes(
 CREATE INDEX idx_generated_scenes_key ON generated_scenes(scene_key,created_at DESC);
 
 ALTER TABLE final_reel_assets ADD COLUMN source_qa_json TEXT;
+ALTER TABLE final_reel_assets ADD COLUMN editorial_continuity_qa_json TEXT;
+ALTER TABLE final_reel_assets ADD COLUMN narration_naturalness_qa_json TEXT;
+ALTER TABLE final_reel_assets ADD COLUMN narration_job_json TEXT;
 
