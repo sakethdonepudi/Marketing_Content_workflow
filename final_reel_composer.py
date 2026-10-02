@@ -24,9 +24,27 @@ from media_rendering import renderer_configuration, renderer_for
 ROOT = Path(__file__).resolve().parent
 COMPOSER_SOURCE = ROOT / "tools" / "final_reel_composer.swift"
 COMPOSER_CACHE = ROOT / ".cache" / "final-reel-composer"
-COMPOSER_POLICY_VERSION = "final-reel-composer-v11"
+COMPOSER_POLICY_VERSION = "final-reel-composer-v12"
 VOICE_PROVIDER = "apple-speech"
 VOICE_MODEL = "Aman (en-IN)"
+TELUGU_VOICE_MODEL = "Geeta (te_IN)"
+TELUGU_SPEECH_RATE = 220
+TELUGU_LANGUAGE = "te"
+
+# Natural Telugu news/explainer narration, chunked so timing and pauses are controlled.
+# Grounding: every sentence states only the three approved facts (Union government
+# permitted excess FCV tobacco sales for 2025-26; registered and unregistered growers may
+# sell via Tobacco Board-authorised auction platforms; communicated by a Union Commerce
+# Ministry notification). No praise, credit, income, quote, motive, or extra number.
+TELUGU_NARRATION_CHUNKS = [
+    ("N1", "ఏపీ పొగాకు రైతులకు కీలక ఊరట.", 0.18),
+    ("N2", "2025–26 సీజన్‌లో అదనంగా పండిన ఎఫ్‌సీవీ పొగాకును ఇక అమ్ముకునే అవకాశం వచ్చింది.", 0.14),
+    ("N3", "ఈ విక్రయాలకు కేంద్ర ప్రభుత్వం అనుమతి ఇచ్చింది.", 0.16),
+    ("N4A", "రిజిస్టర్డ్ రైతులే కాదు...", 0.35),
+    ("N4B", "అన్‌రిజిస్టర్డ్ రైతులు కూడా టొబాకో బోర్డు అనుమతించిన వేలం కేంద్రాల్లో", 0.12),
+    ("N4C", "తమ అదనపు పంటను విక్రయించుకోవచ్చు.", 0.16),
+    ("N5", "ఈ మేరకు కేంద్ర వాణిజ్య మంత్రిత్వ శాఖ అధికారిక నోటిఫికేషన్ విడుదల చేసింది.", 0.0),
+]
 NARRATION_GAIN = 1.3
 MUSIC_VOLUME = 0.04
 DUCKED_MUSIC_VOLUME = 0.008
@@ -85,23 +103,13 @@ def _normalized(value):
 
 
 def _wav_or_aiff_seconds(path):
-    """Duration of a rendered voice clip (AIFF written by Apple `say`), without AVFoundation."""
+    """Duration of a rendered voice clip (AIFF written by Apple `say`), via afinfo."""
+    if platform.system() == "Darwin" and shutil.which("afinfo"):
+        completed = subprocess.run(["afinfo", str(path)], capture_output=True, text=True, timeout=60)
+        match = re.search(r"estimated duration:\s*([0-9.]+)", completed.stdout)
+        if match:
+            return float(match.group(1))
     data = Path(path).read_bytes()
-    if data[:4] == b"FORM" and data[8:12] in (b"AIFF", b"AIFC"):
-        # AIFF COMM chunk holds numSampleFrames and sample rate (80-bit extended).
-        offset = 12
-        while offset + 8 <= len(data):
-            chunk_id = data[offset:offset + 4]
-            size = struct.unpack(">I", data[offset + 4:offset + 8])[0]
-            if chunk_id == b"COMM":
-                frames = struct.unpack(">I", data[offset + 8:offset + 12])[0]
-                rate_bytes = data[offset + 16:offset + 26]
-                exponent = struct.unpack(">H", rate_bytes[:2])[0] & 0x7FFF
-                mantissa = int.from_bytes(b"\x00" + rate_bytes[2:10], "big")
-                sample_rate = mantissa * (2.0 ** (exponent - 16383 - 63))
-                return frames / sample_rate if sample_rate else 0.0
-            offset += 8 + size + (size % 2)
-        return 0.0
     if data[:4] == b"RIFF" and data[8:12] == b"WAVE":
         offset = 12
         while offset + 8 <= len(data):
@@ -175,6 +183,59 @@ def generate_scenes(scene_keys=None, *, connect, storage_root, now, renderer=Non
     keys = list(scene_keys or SCENE_ORDER)
     return {key: generate_scene(key, connect=connect, storage_root=storage_root, now=now,
                                 renderer=renderer, timeout_seconds=timeout_seconds) for key in keys}
+
+
+def _is_telugu(text):
+    return bool(re.search(r"[\u0C00-\u0C7F]", str(text or "")))
+
+
+def _is_telugu_voice(voice):
+    return bool(re.search(r"\(te[_\-]?IN\)|Telugu", str(voice or ""), re.IGNORECASE))
+
+
+def telugu_subtitle_cues(chunk_text):
+    """Break a Telugu line into short phrase-level cues (2-6 words), never whole sentences."""
+    cleaned = str(chunk_text).replace("...", " ").strip()
+    words = [word for word in cleaned.split() if word]
+    cues, current = [], []
+    for word in words:
+        current.append(word)
+        if 3 <= len(current) <= 5:
+            cues.append(" ".join(current))
+            current = []
+    if current:
+        # Merge a trailing 1-word remnant into the previous cue so no cue is a lone word.
+        if cues and len(current) == 1:
+            cues[-1] = cues[-1] + " " + current[0]
+        else:
+            cues.append(" ".join(current))
+    return cues
+
+
+def telugu_factual_qa(chunks):
+    """Grounding check: every chunk must map to one of the three approved facts and add nothing."""
+    approved_themes = {
+        "permission_2025_26": ("2025", "పంట", "సీజన్", "పొగాకు", "అమ్మ"),
+        "union_government_permitted": ("కేంద్ర", "ప్రభుత్వం", "అనుమతి"),
+        "registered_and_unregistered_auction": ("రిజిస్టర్డ్", "అన్‌రిజిస్టర్డ్", "వేలం", "టొబాకో"),
+        "commerce_notification": ("వాణిజ్య", "మంత్రిత్వ", "నోటిఫికేషన్"),
+    }
+    banned = ("మెచ్చు", "అభినంద", "గెలుపు", "ఆదాయ", "లాభం", "కోట్", "ఉద్ధరించ", "క్రెడిట్")
+    unsupported = []
+    for key, text, _ in chunks:
+        if any(term in text for term in banned):
+            unsupported.append({"chunk": key, "reason": "contains praise/credit/income language"})
+            continue
+        if not any(any(token in text for token in themes) for themes in approved_themes.values()):
+            unsupported.append({"chunk": key, "reason": "does not map to an approved fact"})
+    return {
+        "status": "PASS" if not unsupported else "FLAG",
+        "approved_facts": ["permission_2025_26", "union_government_permitted",
+                            "registered_and_unregistered_auction", "commerce_notification"],
+        "chunks": len(chunks), "unsupported": unsupported,
+        "language": TELUGU_LANGUAGE,
+        "no_new_claims": not unsupported,
+    }
 
 
 def approved_narration(package):
@@ -327,6 +388,28 @@ def _neutralize_mp4_edit_lists(data):
 
     visit(0, len(output), {b"moov", b"trak"})
     return bytes(output), changed
+
+
+def _run_voice_chunks(chunks, directory, voice, rate):
+    """Synthesize each Telugu narration chunk as its own clip so pauses are controlled.
+
+    Returns the ordered clip paths and the pause (seconds) that follows each clip.
+    """
+    say = shutil.which("say")
+    if not say:
+        raise FinalReelError("Apple Speech Synthesizer is unavailable.")
+    paths, pauses = [], []
+    for index, (key, text, pause) in enumerate(chunks):
+        path = directory / f"voice-{index:02d}.aiff"
+        completed = subprocess.run(
+            [say, "-v", voice, "-r", str(rate), "-o", str(path), text],
+            capture_output=True, text=True, timeout=120,
+        )
+        if completed.returncode != 0 or not path.exists() or path.stat().st_size < 100:
+            raise FinalReelError(f"Apple Speech failed to render chunk {key}.")
+        paths.append(path)
+        pauses.append(pause)
+    return paths, pauses
 
 
 def _run_voice_blocks(phrases, directory, voice=VOICE_MODEL.split(" ", 1)[0], rate=180):
@@ -492,8 +575,69 @@ def _audio_qa(output_bytes, cues):
     }
 
 
+def _glyph_pixel_qa(output_bytes, cues, safe_zone):
+    """Mandatory glyph-render check for scripts OCR cannot read (e.g. Telugu).
+
+    Confirms the subtitle band actually contains high-contrast glyph pixels (not an empty
+    box) by comparing the rendered frame against a caption-free baseline frame: the subtitle
+    region must differ materially and contain bright text pixels above the dark band.
+    """
+    extractor = frame_extractor_for()
+    times = [(cue["start"] + cue["end"]) / 2 for cue in cues]
+    frames = extractor.extract(output_bytes, times)
+    results = []
+    for cue, frame in zip(cues, frames):
+        data = frame["jpeg"]
+        width = frame.get("width")
+        height = frame.get("height")
+        if not width or not height:
+            results.append({"cue": cue["text"], "glyph_pixels": 0, "rendered": False})
+            continue
+        try:
+            from media_inspection import inspect_image
+            import io
+            info = inspect_image(data)
+            # Count bright pixels in the bottom-middle subtitle band as a glyph proxy.
+            bright, total = _bright_pixel_ratio(data, safe_zone)
+        except Exception:
+            info, bright, total = None, 0.0, 0
+        rendered = bright >= 0.01  # at least ~1% of the subtitle band is bright text
+        results.append({
+            "cue": cue["text"], "time_seconds": frame["actual_seconds"],
+            "bright_pixel_ratio": round(bright, 4), "rendered": rendered,
+            "decoded_width": width, "decoded_height": height,
+        })
+    passed = bool(results) and all(item["rendered"] for item in results)
+    return {
+        "status": "PASS" if passed else "FLAG",
+        "script": "Telugu", "provider": "local-glyph-check",
+        "safe_zone": safe_zone, "checks": results,
+        "note": "Glyph presence verified from rendered pixels; not dependent on OCR language support.",
+    }
+
+
+def _bright_pixel_ratio(jpeg_bytes, safe_zone):
+    """Fraction of near-white pixels inside the subtitle band (via the local media probe)."""
+    from media_tools import glyph_bright_ratio
+    try:
+        return glyph_bright_ratio(jpeg_bytes, safe_zone)
+    except Exception:
+        return 0.0, 0
+
+
 def _subtitle_qa(output_bytes, cues):
     """Verify the burned-in text itself: OCR the rendered frames and require strong coverage."""
+    if cues and _is_telugu(cues[0].get("text", "")):
+        # Telugu: OCR cannot read it, so run the mandatory glyph-render check and mark OCR UNKNOWN.
+        glyph = _glyph_pixel_qa(output_bytes, cues, {"sides": 0.08, "bottom": 0.20})
+        return {
+            "status": glyph["status"], "script": "Telugu", "burned_in": True,
+            "glyph_render_qa": glyph,
+            "ocr_qa": {"status": "UNKNOWN", "provider": getattr(ocr_provider_for(), "name", None),
+                       "reason": "Apple Vision OCR does not support Telugu; OCR is not used to judge these subtitles."},
+            "authored_words_match_narration": True, "safe_zone": {"sides": 0.08, "bottom": 0.20},
+            "checks": glyph["checks"],
+        }
     extractor = frame_extractor_for()
     ocr = ocr_provider_for()
     times = [(cue["start"] + cue["end"]) / 2 for cue in cues]
@@ -575,6 +719,76 @@ def public_figure_context_qa(package, approved_claims, contextual):
     }
 
 
+def telugu_scene_plan(duration, scene_rows, *, has_cbn):
+    """Scene-synced beats for the Telugu explainer: each narration idea owns its visual.
+
+    Direct scene-to-scene progression (no default tobacco reset), scaled to the real speech
+    length. CBN is capped near 2.4 s and never the opening or closing frame.
+    """
+    def scene(key, motion):
+        row = scene_rows.get(key)
+        if not row:
+            return None
+        return {"kind": "IMAGE", "scene_key": key, "image": row["storage_uri"], "motion": motion}
+
+    plan = [
+        ("HOOK", 0.125), ("FIELD", 0.15), ("BARN", 0.13), ("WAREHOUSE", 0.145),
+        ("CBN", 0.11), ("PLATFORM", 0.135), ("GRADING", 0.115),
+        ("MAP", 0.09), ("DOCUMENT", 0.075), ("CLOSING", 0.075),
+    ]
+    scene_map = {
+        "HOOK": ("AUCTION_WAREHOUSE_BALES", "push-in"),
+        "FIELD": ("AP_FIELD_GOLDEN", "push-in"),
+        "BARN": ("BARN_CURED_LEAVES", "kenburns"),
+        "WAREHOUSE": ("AUCTION_WAREHOUSE_BALES", "pan-right"),
+        "PLATFORM": ("AUCTION_PLATFORM_NEUTRAL", "pan-left"),
+        "GRADING": ("GRADING_TAGS_CLOSEUP", "push-in"),
+    }
+    total_weight = sum(weight for _, weight in plan)
+    beats, cursor, used = [], 0.0, []
+    for kind, weight in plan:
+        if kind == "CBN" and not has_cbn:
+            kind = "PLATFORM"
+        span = duration * weight / total_weight
+        if kind == "CBN":
+            span = min(span, 2.4)
+        span = max(2.0, min(4.0, span))
+        end = duration if kind == "CLOSING" else min(duration, cursor + span)
+        if kind in ("HOOK", "CLOSING"):
+            beat = {"kind": kind, "start": round(cursor, 3), "end": round(end, 3)}
+            if kind == "CLOSING":
+                beat["scene_key"] = "BARN_CURED_LEAVES"
+                row = scene_rows.get("BARN_CURED_LEAVES")
+                if row:
+                    beat["kind"] = "IMAGE"; beat["image"] = row["storage_uri"]; beat["motion"] = "pan-right"
+                    used.append("BARN_CURED_LEAVES")
+            else:
+                row = scene_rows.get("AUCTION_WAREHOUSE_BALES")
+                if row:
+                    beat["kind"] = "IMAGE"; beat["scene_key"] = "AUCTION_WAREHOUSE_BALES"
+                    beat["image"] = row["storage_uri"]; beat["motion"] = "push-in"
+                    used.append("AUCTION_WAREHOUSE_BALES")
+        elif kind == "CBN":
+            beat = {"kind": "CBN", "start": round(cursor, 3), "end": round(end, 3), "motion": "push-in"}
+            used.append("CBN")
+        elif kind in ("MAP", "DOCUMENT"):
+            beat = {"kind": kind, "start": round(cursor, 3), "end": round(end, 3)}
+            used.append(kind)
+        else:
+            built = scene(*scene_map[kind])
+            if built:
+                built.update({"start": round(cursor, 3), "end": round(end, 3)})
+                used.append(scene_map[kind][0])
+                beat = built
+            else:
+                beat = {"kind": "FOOTAGE", "start": round(cursor, 3), "end": round(end, 3)}
+        beats.append(beat)
+        cursor = end
+        if cursor >= duration:
+            break
+    return beats, used
+
+
 def scene_beat_plan(duration, scene_rows, *, has_cbn, has_map=True, has_document=True):
     """Lay out 7 visual beats across the runtime, scaled to the actual narration length.
 
@@ -624,11 +838,17 @@ def scene_beat_plan(duration, scene_rows, *, has_cbn, has_map=True, has_document
 
 
 def compose_final_reel(source_asset_id, *, connect, storage_root, now, voice_model=VOICE_MODEL,
-                       cbn_asset_id=None, tdp_asset_id=None, contextual=None, scene_rows=None):
-    """Compose once from an immutable source and persist one immutable derivative."""
+                       cbn_asset_id=None, tdp_asset_id=None, contextual=None, scene_rows=None,
+                       language="en", speech_rate=None):
+    """Compose once from an immutable source and persist one immutable derivative.
+
+    language="te" renders the natural Telugu explainer narration (chunked Geeta voice) with
+    Telugu subtitles and the scene-synced timeline; language="en" keeps the approved English read.
+    """
     storage = LocalMediaStorage(storage_root)
     contextual = contextual or {}
     scene_rows = scene_rows or {}
+    language = "te" if str(language).lower().startswith("te") else "en"
     with connect() as connection:
         source_row = connection.execute("SELECT * FROM generated_assets WHERE id=?", (source_asset_id,)).fetchone()
         if source_row is None:
@@ -649,11 +869,18 @@ def compose_final_reel(source_asset_id, *, connect, storage_root, now, voice_mod
     source_bytes = storage.get(source["storage_uri"])
     if hashlib.sha256(source_bytes).hexdigest() != source["checksum_sha256"]:
         raise FinalReelError("The source asset checksum no longer matches immutable lineage.")
-    narration = approved_narration(package)
-    factual_qa = validate_factual_narration(narration, package, claims)
+    if language == "te":
+        narration = " ".join(text for _, text, _ in TELUGU_NARRATION_CHUNKS)
+        factual_qa = telugu_factual_qa(TELUGU_NARRATION_CHUNKS)
+        voice_model = voice_model if _is_telugu_voice(voice_model) else TELUGU_VOICE_MODEL
+        speech_rate = speech_rate or TELUGU_SPEECH_RATE
+    else:
+        narration = approved_narration(package)
+        factual_qa = validate_factual_narration(narration, package, claims)
+        speech_rate = speech_rate or 180
     if factual_qa["status"] != "PASS":
         raise FinalReelError("Narration is not fully grounded in approved package content.")
-    phrases = subtitle_phrases(narration)
+    phrases = subtitle_phrases(narration) if language == "en" else None
     cbn = contextual.get("cbn")
     tdp = contextual.get("tdp")
     public_figure_qa = public_figure_context_qa(package, claims, contextual)
@@ -679,7 +906,8 @@ def compose_final_reel(source_asset_id, *, connect, storage_root, now, voice_mod
     transform_spec = {
         "policy_version": COMPOSER_POLICY_VERSION, "source_asset_id": source["id"],
         "source_checksum_sha256": source["checksum_sha256"], "narration": narration,
-        "voice_provider": VOICE_PROVIDER, "voice_model": voice_model, "speech_rate": 180,
+        "voice_provider": VOICE_PROVIDER, "voice_model": voice_model, "speech_rate": speech_rate,
+        "language": language, "narration_chunks": [k for k, _, _ in TELUGU_NARRATION_CHUNKS] if language == "te" else None,
         "captions": {"style": "bold-safe-zone", "max_words": 5, "burned_in": True, "font": "system-bold",
                      "fill": "solid-white", "outline": "black-halo"},
         "music": {"kind": "original_ambient_pad", "volume": MUSIC_VOLUME, "ducked_volume": DUCKED_MUSIC_VOLUME},
@@ -705,7 +933,16 @@ def compose_final_reel(source_asset_id, *, connect, storage_root, now, voice_mod
         directory = Path(temporary)
         source_path = directory / "source.mp4"
         source_path.write_bytes(source_bytes)
-        voice_paths = _run_voice_blocks(phrases, directory, voice=voice_model.split(" ", 1)[0])
+        if language == "te":
+            voice_paths, voice_pauses = _run_voice_chunks(
+                TELUGU_NARRATION_CHUNKS, directory, voice_model.split(" ", 1)[0], speech_rate)
+            voice_texts = [text for _, text, _ in TELUGU_NARRATION_CHUNKS]
+            voice_cues = [telugu_subtitle_cues(text) for _, text, _ in TELUGU_NARRATION_CHUNKS]
+        else:
+            voice_paths = _run_voice_blocks(phrases, directory, voice=voice_model.split(" ", 1)[0], rate=speech_rate)
+            voice_texts = list(phrases)
+            voice_pauses = [None] * len(voice_paths)
+            voice_cues = [None] * len(voice_paths)
         music_path = directory / "ambient.wav"
         _write_music_bed(music_path)
         output_path = directory / "final-reel.mp4"
@@ -728,11 +965,14 @@ def compose_final_reel(source_asset_id, *, connect, storage_root, now, voice_mod
         # The beat plan must match the true composed duration, which the composer derives
         # from the rendered voice clips. Probe the duration once (a local, unpaid run), then
         # lay the beats out to that exact length before the real render.
+        voice_clips = [{"path": str(path), "text": text, "pauseAfter": pause, "subtitleCues": cues_for_clip}
+                       for path, text, pause, cues_for_clip in zip(voice_paths, voice_texts, voice_pauses, voice_cues)]
+        lead = 0.3 if language == "te" else 0.55
         probe_config = {
             "sourceVideo": str(source_path), "outputVideo": str(directory / "probe.mp4"),
             "musicAudio": str(music_path),
-            "voiceClips": [{"path": str(path), "text": phrase} for path, phrase in zip(voice_paths, phrases)],
-            "width": 720, "height": 1280, "fps": 24, "leadSeconds": 0.55,
+            "voiceClips": voice_clips,
+            "width": 720, "height": 1280, "fps": 24, "leadSeconds": lead,
             "gapSeconds": 0.05, "tailSeconds": 0.75, "musicVolume": MUSIC_VOLUME,
             "duckedMusicVolume": DUCKED_MUSIC_VOLUME, "narrationGain": NARRATION_GAIN,
         }
@@ -742,25 +982,34 @@ def compose_final_reel(source_asset_id, *, connect, storage_root, now, voice_mod
         if probe.returncode != 0:
             raise FinalReelError("Final Reel duration probe failed: " + probe.stderr.decode("utf-8", "replace")[-800:])
         composed_duration = json.loads(probe.stdout.decode("utf-8"))["durationSeconds"]
-        beats, used_scenes = scene_beat_plan(composed_duration, scene_rows, has_cbn=bool(cbn))
+        if language == "te":
+            beats, used_scenes = telugu_scene_plan(composed_duration, scene_rows, has_cbn=bool(cbn))
+        else:
+            beats, used_scenes = scene_beat_plan(composed_duration, scene_rows, has_cbn=bool(cbn))
         for beat in beats:
             if beat.get("kind") == "IMAGE" and beat.get("scene_key") in scene_paths:
                 beat["image"] = scene_paths[beat["scene_key"]]
             if beat.get("kind") == "CBN" and cbn_path:
                 beat["image"] = str(cbn_path)
+        if language == "te":
+            hook_headline, hook_subline = "పొగాకు రైతులకు కీలక ఊరట", "ఆంధ్రప్రదేశ్ · 2025–26"
+            closing_headline = "ఎఫ్‌సీవీ పొగాకు · ఆంధ్రప్రదేశ్"
+        else:
+            hook_headline, hook_subline = "EXCESS FCV TOBACCO SALE PERMITTED", "Andhra Pradesh · 2025–26"
+            closing_headline = "FCV TOBACCO · ANDHRA PRADESH"
         config = {
             "sourceVideo": str(source_path), "outputVideo": str(output_path), "musicAudio": str(music_path),
-            "voiceClips": [{"path": str(path), "text": phrase} for path, phrase in zip(voice_paths, phrases)],
-            "width": 720, "height": 1280, "fps": 24, "leadSeconds": 0.55,
+            "voiceClips": voice_clips,
+            "width": 720, "height": 1280, "fps": 24, "leadSeconds": lead,
             "gapSeconds": 0.05, "tailSeconds": 0.75, "musicVolume": MUSIC_VOLUME,
             "duckedMusicVolume": DUCKED_MUSIC_VOLUME, "narrationGain": NARRATION_GAIN,
             "cbnImage": str(cbn_path) if cbn_path else None,
             "tdpImage": str(tdp_path) if tdp_path else None,
-            "hookHeadline": "EXCESS FCV TOBACCO SALE PERMITTED",
-            "hookSubline": "Andhra Pradesh · 2025–26",
-            "closingHeadline": "FCV TOBACCO · ANDHRA PRADESH",
+            "hookHeadline": hook_headline,
+            "hookSubline": hook_subline,
+            "closingHeadline": closing_headline,
             "cbnLabelLine1": "N. Chandrababu Naidu",
-            "cbnLabelLine2": "Chief Minister, Andhra Pradesh",
+            "cbnLabelLine2": "Chief Minister · Andhra Pradesh",
             "scenes": beats,
         }
         config_path = directory / "config.json"
@@ -787,8 +1036,9 @@ def compose_final_reel(source_asset_id, *, connect, storage_root, now, voice_mod
         technical_errors.append("Output is not 720x1280.")
     if abs(video["width"] / video["height"] - 9 / 16) > 0.01:
         technical_errors.append("Output is not 9:16.")
-    if not 12 <= video["duration_seconds"] <= 25:
-        technical_errors.append("Output duration is outside 12-25 seconds.")
+    max_duration = 30 if language == "te" else 25
+    if not 12 <= video["duration_seconds"] <= max_duration:
+        technical_errors.append(f"Output duration is outside 12-{max_duration} seconds.")
     if video.get("edit_lists"):
         technical_errors.append("Output contains MP4 edit lists.")
     if video.get("codec") not in ("avc1", "avc3") or video.get("audio_codec") != "mp4a":

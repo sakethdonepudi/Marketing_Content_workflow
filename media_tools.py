@@ -109,6 +109,22 @@ class AppleVisionOCRProvider(OCRProvider):
         ]
 
 
+def glyph_bright_ratio(image_bytes, safe_zone=None):
+    """Fraction of near-white pixels in the bottom-middle subtitle band (script-agnostic glyph check).
+
+    Used to confirm burned-in subtitles actually drew glyph pixels for scripts Apple Vision
+    OCR cannot read, such as Telugu.
+    """
+    if platform.system() != "Darwin" or not PROBE_SOURCE.exists() or not shutil.which("swiftc"):
+        raise MediaToolUnavailable("No local glyph checker is available on this host.")
+    zone = json.dumps(safe_zone or {"sides": 0.08, "bottom": 0.20})
+    with tempfile.NamedTemporaryFile(suffix=".jpg") as handle:
+        handle.write(image_bytes)
+        handle.flush()
+        result = _run_probe(["glyph", handle.name, zone], timeout=120)
+    return float(result.get("bright_ratio", 0.0)), int(result.get("total", 0))
+
+
 def ocr_provider_for(name=None):
     name = (name if name is not None else os.environ.get("OCR_PROVIDER", "auto")).strip().lower()
     if name in ("", "none", "off"):

@@ -6662,11 +6662,12 @@ def _reference_asset_for_reel(connection, asset_id, asset_type):
     return asset
 
 
-def create_final_reel(source_asset_id, *, cbn_asset_id=None, tdp_asset_id=None, composer=None):
+def create_final_reel(source_asset_id, *, cbn_asset_id=None, tdp_asset_id=None, composer=None, language="en"):
     """Compose exactly one immutable Final Reel derivative from an eligible source video.
 
     Contextual CBN/TDP assets are optional; when supplied they must be rights-verified
-    rows in uploaded_media_assets, never an arbitrary path or URL.
+    rows in uploaded_media_assets, never an arbitrary path or URL. language="te" uses the
+    natural Telugu explainer narration and scene-synced timeline.
     """
     with connect() as connection:
         asset, job, blockers = _final_reel_source_blockers(connection, source_asset_id)
@@ -6691,7 +6692,7 @@ def create_final_reel(source_asset_id, *, cbn_asset_id=None, tdp_asset_id=None, 
     try:
         result = composer(source_asset_id, connect=connect, storage_root=RENDER_STORAGE_ROOT, now=now,
                           cbn_asset_id=cbn["id"] if cbn else None, tdp_asset_id=tdp["id"] if tdp else None,
-                          contextual=contextual, scene_rows=scene_rows)
+                          contextual=contextual, scene_rows=scene_rows, language=language)
     except final_reel_composer.FinalReelError as error:
         raise ValueError(f"Final Reel composition failed: {error}") from error
     if isinstance(result, dict) and result.get("id"):
@@ -7992,6 +7993,7 @@ class Handler(SimpleHTTPRequestHandler):
             if match:
                 self.send_json({"asset": create_final_reel(
                     match.group(1), cbn_asset_id=body.get("cbn_asset_id"), tdp_asset_id=body.get("tdp_asset_id"),
+                    language=body.get("language", "en"),
                 )}, 201)
                 return
             match = re.fullmatch(r"/api/final-reels/([^/]+)/review", path)

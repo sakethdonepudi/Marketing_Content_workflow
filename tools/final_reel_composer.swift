@@ -10,6 +10,11 @@ import QuartzCore
 struct VoiceClip: Codable {
     let path: String
     let text: String
+    /// Seconds of pause to insert after this clip; falls back to config.gapSeconds when nil.
+    let pauseAfter: Double?
+    /// Optional phrase-level subtitle cues for this clip; when present they subdivide the
+    /// clip's time evenly so long Telugu lines show short, readable phrases.
+    let subtitleCues: [String]?
 }
 
 struct ComposerConfig: Codable {
@@ -151,8 +156,10 @@ func captionLayer(text: String, start: Double, end: Double, total: Double, size:
     let measured = (text.uppercased() as NSString).boundingRect(
         with: NSSize(width: censureWidth - 40, height: censureWidth), options: [.usesLineFragmentOrigin, .usesFontLeading],
         attributes: measureAttributes)
-    let stripHeight = min(size.height * 0.22, max(measured.height + 44, size.height * 0.11))
-    let bottom = size.height * 0.20
+    // Telugu glyphs are tall; keep a tight strip sized to the text with modest padding so
+    // there is no oversized grey box, and lift it clear of the very bottom safe zone.
+    let stripHeight = min(size.height * 0.18, max(measured.height + 26, size.height * 0.085))
+    let bottom = size.height * 0.215
     layer.frame = CGRect(x: side, y: bottom, width: censureWidth, height: stripHeight)
     layer.backgroundColor = NSColor.black.withAlphaComponent(0.62).cgColor
     layer.cornerRadius = 20
@@ -585,12 +592,24 @@ func compose(_ config: ComposerConfig) throws -> ComposerReceipt {
     var cues: [CueReceipt] = []
     for (index, clip) in config.voiceClips.enumerated() {
         let end = cursor + voiceDurations[index]
-        cues.append(CueReceipt(text: clip.text, start: cursor, end: end))
-        cursor = end + (index == config.voiceClips.count - 1 ? 0 : config.gapSeconds)
+        if let phrases = clip.subtitleCues, !phrases.isEmpty {
+            // Subdivide this clip's window evenly across its phrase-level cues.
+            let step = (end - cursor) / Double(phrases.count)
+            for (offset, phrase) in phrases.enumerated() {
+                let cueStart = cursor + step * Double(offset)
+                cues.append(CueReceipt(text: phrase, start: cueStart, end: cueStart + step))
+            }
+        } else {
+            cues.append(CueReceipt(text: clip.text, start: cursor, end: end))
+        }
+        let pause = clip.pauseAfter ?? config.gapSeconds
+        cursor = end + (index == config.voiceClips.count - 1 ? 0 : pause)
     }
     let narrationEnd = cursor
     let targetDuration = max(12.0, narrationEnd + config.tailSeconds)
-    if targetDuration > 25.0 { fail("authored narration exceeds the 25 second Reel target") }
+    // Natural Telugu delivery may legitimately run longer than the English read; the brief
+    // allows up to ~27 s, so the hard ceiling is 30 s (Meta Reels allow far more).
+    if targetDuration > 30.0 { fail("authored narration exceeds the 30 second Reel target") }
     let target = CMTime(seconds: targetDuration, preferredTimescale: 600)
 
     let source = AVURLAsset(url: URL(fileURLWithPath: config.sourceVideo))
