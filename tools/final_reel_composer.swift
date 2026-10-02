@@ -252,7 +252,8 @@ func cardLayer(lines: [(String, CGFloat, Bool)], accent: Bool, start: Double, en
     return layer
 }
 
-/// A contextual figure layer: the rights-cleared portrait with a restrained pan/zoom.
+/// A contextual figure layer: the rights-cleared portrait as a soft circular inset
+/// with a gold ring and a restrained Ken Burns pan. The likeness is never altered.
 func figureLayer(imagePath: String, start: Double, end: Double, size: CGSize) -> CALayer {
     let layer = CALayer()
     layer.frame = CGRect(origin: .zero, size: size)
@@ -260,62 +261,140 @@ func figureLayer(imagePath: String, start: Double, end: Double, size: CGSize) ->
     guard let image = NSImage(contentsOfFile: imagePath), let cg = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
         return layer
     }
-    let photoHeight = size.height * 0.62
-    let photoWidth = size.width
+    let diameter = min(size.width * 0.62, size.height * 0.46)
+    let centerX = size.width / 2
+    let centerY = size.height * 0.60
+    let ring = CALayer()
+    ring.frame = CGRect(x: centerX - diameter / 2 - 6, y: centerY - diameter / 2 - 6,
+                        width: diameter + 12, height: diameter + 12)
+    ring.cornerRadius = (diameter + 12) / 2
+    ring.backgroundColor = NSColor.white.cgColor
+    ring.shadowColor = NSColor.black.cgColor
+    ring.shadowOpacity = 0.28
+    ring.shadowRadius = 18
+    ring.shadowOffset = CGSize(width: 0, height: 8)
+    layer.addSublayer(ring)
     let photo = CALayer()
-    photo.frame = CGRect(x: 0, y: size.height * 0.16, width: photoWidth, height: photoHeight)
+    photo.frame = CGRect(x: centerX - diameter / 2, y: centerY - diameter / 2, width: diameter, height: diameter)
     photo.contents = cg
     photo.contentsGravity = .resizeAspectFill
     photo.masksToBounds = true
+    photo.cornerRadius = diameter / 2
+    photo.borderColor = NSColor(calibratedRed: 0.72, green: 0.53, blue: 0.04, alpha: 1).cgColor
+    photo.borderWidth = 5
     photo.contentsScale = 2
     layer.addSublayer(photo)
     let visible = max(0.1, end - start)
     let opacity = CAKeyframeAnimation(keyPath: "opacity")
     opacity.values = [0, 1, 1, 0]
-    opacity.keyTimes = [0, 0.1, 0.9, 1]
+    opacity.keyTimes = [0, 0.12, 0.88, 1]
     opacity.beginTime = AVCoreAnimationBeginTimeAtZero + start
     opacity.duration = visible
     opacity.fillMode = .both
     opacity.isRemovedOnCompletion = false
     layer.add(opacity, forKey: "figure-opacity")
-    // Slow Ken Burns push and pan; the portrait likeness itself is never altered.
+    // Pop-in with a slight overshoot, then a slow Ken Burns push; likeness never altered.
     let transform = CAKeyframeAnimation(keyPath: "transform")
     transform.values = [
+        CATransform3DMakeScale(0.86, 0.86, 1.0),
+        CATransform3DMakeScale(1.03, 1.03, 1.0),
         CATransform3DMakeScale(1.0, 1.0, 1.0),
-        CATransform3DMakeScale(1.08, 1.08, 1.0),
+        CATransform3DMakeScale(1.07, 1.07, 1.0),
     ]
-    transform.keyTimes = [0, 1]
+    transform.keyTimes = [0, 0.22, 0.45, 1]
     transform.beginTime = AVCoreAnimationBeginTimeAtZero + start
     transform.duration = visible
     transform.fillMode = .both
     transform.isRemovedOnCompletion = false
-    photo.add(transform, forKey: "figure-kenburns")
+    layer.add(transform, forKey: "figure-kenburns")
     return layer
 }
 
-/// A small neutral label strip for the contextual figure.
-func figureLabelLayer(line1: String, line2: String, start: Double, end: Double, size: CGSize) -> CALayer {
+/// A news-style lower-third name bar with a gold accent tab.
+func lowerThirdLayer(line1: String, line2: String, start: Double, end: Double, size: CGSize) -> CALayer {
     let layer = CALayer()
-    let height = size.height * 0.11
-    layer.frame = CGRect(x: 0, y: size.height * 0.05, width: size.width, height: height)
-    layer.backgroundColor = NSColor.black.withAlphaComponent(0.6).cgColor
+    let barHeight = size.height * 0.08
+    // Sits high on the frame (below the top edge, above the portrait and the bottom
+    // subtitle band) so the name and the burned-in words never sit close enough for
+    // OCR to merge them into one blob.
+    layer.frame = CGRect(x: size.width * 0.08, y: size.height * 0.10, width: size.width * 0.84, height: barHeight)
+    layer.backgroundColor = NSColor.black.withAlphaComponent(0.72).cgColor
+    layer.cornerRadius = 10
+    layer.masksToBounds = true
     layer.opacity = 0
+    let tab = CALayer()
+    tab.frame = CGRect(x: 0, y: 0, width: 7, height: barHeight)
+    tab.backgroundColor = NSColor(calibratedRed: 0.72, green: 0.53, blue: 0.04, alpha: 1).cgColor
+    layer.addSublayer(tab)
     let textLayer = CALayer()
-    textLayer.frame = layer.bounds
-    textLayer.contents = cardBitmap(lines: [(line1, size.width * 0.052, true), (line2, size.width * 0.04, false)],
-                                    size: layer.bounds.size, accent: false)
+    textLayer.frame = CGRect(x: 18, y: 0, width: layer.bounds.width - 26, height: barHeight)
+    textLayer.contents = cardBitmap(lines: [(line1, size.width * 0.05, true), (line2, size.width * 0.038, false)],
+                                    size: textLayer.bounds.size, accent: false)
     textLayer.contentsGravity = .resize
     textLayer.contentsScale = 2
     layer.addSublayer(textLayer)
     let visible = max(0.1, end - start)
     let opacity = CAKeyframeAnimation(keyPath: "opacity")
     opacity.values = [0, 1, 1, 0]
-    opacity.keyTimes = [0, 0.1, 0.9, 1]
+    opacity.keyTimes = [0, 0.1, 0.92, 1]
     opacity.beginTime = AVCoreAnimationBeginTimeAtZero + start
     opacity.duration = visible
     opacity.fillMode = .both
     opacity.isRemovedOnCompletion = false
-    layer.add(opacity, forKey: "figure-label-opacity")
+    layer.add(opacity, forKey: "lower-third-opacity")
+    // Slide in from the left.
+    let position = CAKeyframeAnimation(keyPath: "transform.translation.x")
+    position.values = [-90, 0, 0]
+    position.keyTimes = [0, 0.18, 1]
+    position.beginTime = AVCoreAnimationBeginTimeAtZero + start
+    position.duration = visible
+    position.fillMode = .both
+    position.isRemovedOnCompletion = false
+    layer.add(position, forKey: "lower-third-slide")
+    return layer
+}
+
+/// A thin progress bar along the bottom that fills across the whole runtime.
+func progressLayer(total: Double, size: CGSize) -> CALayer {
+    let layer = CALayer()
+    let height: CGFloat = 6
+    layer.frame = CGRect(x: 0, y: 0, width: size.width, height: height)
+    layer.backgroundColor = NSColor.white.withAlphaComponent(0.22).cgColor
+    let fill = CALayer()
+    fill.frame = CGRect(x: 0, y: 0, width: 0, height: height)
+    fill.backgroundColor = NSColor(calibratedRed: 0.93, green: 0.77, blue: 0.28, alpha: 1).cgColor
+    layer.addSublayer(fill)
+    let width = CABasicAnimation(keyPath: "bounds.size.width")
+    width.fromValue = 0
+    width.toValue = size.width
+    width.beginTime = AVCoreAnimationBeginTimeAtZero
+    width.duration = total
+    width.fillMode = .both
+    width.isRemovedOnCompletion = false
+    fill.add(width, forKey: "progress-fill")
+    return layer
+}
+
+/// A soft cinematic vignette that darkens the edges without touching the subject.
+func vignetteLayer(size: CGSize) -> CALayer {
+    let layer = CALayer()
+    layer.frame = CGRect(origin: .zero, size: size)
+    layer.backgroundColor = NSColor.clear.cgColor
+    layer.shadowColor = NSColor.black.cgColor
+    layer.shadowOpacity = 0.35
+    layer.shadowRadius = size.width * 0.22
+    layer.shadowOffset = .zero
+    layer.mask = {
+        let mask = CALayer()
+        mask.frame = layer.bounds
+        mask.backgroundColor = NSColor.white.cgColor
+        let hole = CALayer()
+        hole.frame = layer.bounds.insetBy(dx: size.width * 0.18, dy: size.height * 0.18)
+        hole.cornerRadius = size.width * 0.3
+        hole.backgroundColor = NSColor.black.cgColor
+        mask.addSublayer(hole)
+        return mask
+    }()
     return layer
 }
 
@@ -449,12 +528,15 @@ func compose(_ config: ComposerConfig) throws -> ComposerReceipt {
     let videoLayer = CALayer()
     videoLayer.frame = parentLayer.frame
     parentLayer.addSublayer(videoLayer)
-    // Contextual figure (rights-cleared) with a restrained pan/zoom and neutral label.
+    // Cinematic vignette and a thin gold progress bar across the runtime.
+    parentLayer.addSublayer(vignetteLayer(size: renderSize))
+    parentLayer.addSublayer(progressLayer(total: targetDuration, size: renderSize))
+    // Contextual figure (rights-cleared) as a circular inset with a lower-third name bar.
     if let cbnImage = config.cbnImage, !cbnImage.isEmpty {
         let contextEnd = min(targetDuration, 11.0)
         parentLayer.addSublayer(figureLayer(imagePath: cbnImage, start: 7.0, end: contextEnd, size: renderSize))
-        parentLayer.addSublayer(figureLabelLayer(line1: config.cbnLabelLine1 ?? "", line2: config.cbnLabelLine2 ?? "",
-                                                 start: 7.0, end: contextEnd, size: renderSize))
+        parentLayer.addSublayer(lowerThirdLayer(line1: config.cbnLabelLine1 ?? "", line2: config.cbnLabelLine2 ?? "",
+                                                start: 7.0, end: contextEnd, size: renderSize))
         if let tdpImage = config.tdpImage, !tdpImage.isEmpty {
             parentLayer.addSublayer(logoLayer(imagePath: tdpImage, start: 7.0, end: contextEnd, size: renderSize))
         }

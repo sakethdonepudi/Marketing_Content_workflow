@@ -719,12 +719,13 @@ function reelReviewActions(reel) {
   return actions;
 }
 
-function finalReelCard(reel) {
+function finalReelCard(reel, {current = false} = {}) {
   const src = `/api/final-reels/${encodeURIComponent(reel.id)}/content`;
   const frame = el('div', 'preview-frame');
   const video = el('video');
   video.controls = true; video.playsInline = true; video.preload = 'metadata'; video.src = src; video.className = 'preview-video';
   frame.append(video, el('div', 'preview-badge', plainPill('Final Reel · 9:16 composited', 'good')));
+  if (current) frame.append(el('div', 'preview-actions reel-current-tag', plainPill('Current', 'good')));
   frame.append(el('div', 'preview-actions', externalLink('Open full size', src, 'btn ghost')));
   const left = el('div', '', frame,
     el('div', 'preview-caption', `${reel.width}×${reel.height} · ${reel.duration_seconds}s · ${reel.mime_type} · ${bytes(reel.file_size)} · ${label(reel.status)}`),
@@ -800,7 +801,7 @@ function finalReelCard(reel) {
     at: item.created_at, title: label(item.action),
     detail: `${item.reviewer}${item.comment ? ` · ${item.comment}` : ''}`, tone: tone(item.action),
   }))));
-  return card('reel-card', el('div', 'media-layout', left, el('div', '', side, disclosure('Lineage & technical details', details))));
+  return card(`reel-card${current ? ' reel-current' : ''}`, el('div', 'media-layout', left, el('div', '', side, disclosure('Lineage & technical details', details))));
 }
 
 function uploadReferenceMedia(kind, assetType, form, status) {
@@ -888,13 +889,24 @@ function renderFinalReels(data, root) {
   const reels = data.final_reels || [];
   const source = data.final_reel_source_asset_id;
   const section = el('div', 'final-reel-section');
-  section.append(cardHead(`Final Reels (${reels.length})`,
-    source ? plainPill(`Source ready · ${source}`, 'good') : plainPill('No eligible source', 'warn')));
+  const head = el('div', 'reel-section-head', el('h2', '', 'Final Reels'),
+    source ? plainPill(`Source ready · ${source}`, 'good') : plainPill('No eligible source', 'warn'));
+  section.append(head);
   section.append(referenceMediaPanel(data));
   if (!reels.length) {
     section.append(empty('No Final Reel yet', 'Create a 9:16 Reel from a QA-passed generated video. Every composition is a new immutable version.'));
-  } else {
-    reels.forEach(reel => section.append(finalReelCard(reel)));
+    root.append(section);
+    return;
+  }
+  // Show only the newest version; older runs stay immutable but are collapsed.
+  const [current, ...older] = reels;
+  section.append(finalReelCard(current, {current: true}));
+  if (older.length) {
+    const rows = older.map(reel => el('div', 'reel-history-row',
+      pill(reel.status), el('span', 'ref', reel.id), el('span', 'secondary-text',
+        `${reel.width}×${reel.height} · ${Math.round(reel.duration_seconds)}s · ${label(reel.latest_review?.action || 'REQUIRED')}`),
+      el('span', 'muted', fmt(reel.created_at))));
+    section.append(disclosure(`Previous versions (${older.length}) — kept for audit`, rows));
   }
   root.append(section);
 }

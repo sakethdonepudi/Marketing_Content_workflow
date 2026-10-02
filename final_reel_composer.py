@@ -23,7 +23,7 @@ from meta_distribution import check_compliance
 ROOT = Path(__file__).resolve().parent
 COMPOSER_SOURCE = ROOT / "tools" / "final_reel_composer.swift"
 COMPOSER_CACHE = ROOT / ".cache" / "final-reel-composer"
-COMPOSER_POLICY_VERSION = "final-reel-composer-v5"
+COMPOSER_POLICY_VERSION = "final-reel-composer-v9"
 VOICE_PROVIDER = "apple-speech"
 VOICE_MODEL = "Aman (en-IN)"
 NARRATION_GAIN = 1.3
@@ -69,6 +69,34 @@ def validate_factual_narration(narration, package, approved_claims):
         "unsupported_sentences": unsupported,
         "no_new_factual_claims": bool(sentences and not unsupported),
     }
+
+
+_CONFUSABLE = str.maketrans({
+    # lowercase Cyrillic
+    "\u043e": "o", "\u0430": "a", "\u0435": "e", "\u0441": "c", "\u0440": "p", "\u0443": "y",
+    "\u0445": "x", "\u043a": "k", "\u043c": "m", "\u0442": "t", "\u043d": "h", "\u0432": "b",
+    # uppercase Cyrillic
+    "\u041e": "o", "\u0410": "a", "\u0415": "e", "\u0421": "c", "\u0420": "p", "\u0423": "y",
+    "\u0425": "x", "\u041a": "k", "\u041c": "m", "\u0422": "t", "\u041d": "h", "\u0412": "b",
+})
+
+
+def _fold(text):
+    """Normalize OCR text, folding common Cyrillic/Latin lookalikes that Apple Vision emits.
+
+    Confusables are translated *before* the non-alphanumeric cleanup, otherwise the
+    Cyrillic letters would be stripped to spaces and split a word in two.
+    """
+    return _normalized(str(text).casefold().translate(_CONFUSABLE))
+
+
+def _token_coverage(expected, detected):
+    expected_tokens = _fold(expected).split()
+    detected_tokens = set(_fold(detected).split())
+    if not expected_tokens:
+        return 1.0
+    hits = sum(1 for token in expected_tokens if token in detected_tokens)
+    return hits / len(expected_tokens)
 
 
 def subtitle_phrases(narration):
@@ -330,9 +358,7 @@ def _subtitle_qa(output_bytes, cues):
     for cue, frame in zip(cues, frames):
         detections = ocr.detect(frame["jpeg"])
         detected = " ".join(item["text"] for item in detections)
-        expected_tokens = set(_normalized(cue["text"]).split())
-        detected_tokens = set(_normalized(detected).split())
-        coverage = len(expected_tokens & detected_tokens) / max(1, len(expected_tokens))
+        coverage = _token_coverage(cue["text"], detected)
         results.append({
             "cue": cue["text"], "time_seconds": frame["actual_seconds"],
             "detected_text": detected, "token_coverage": round(coverage, 3),
