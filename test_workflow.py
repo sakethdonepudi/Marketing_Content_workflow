@@ -4518,14 +4518,18 @@ class WorkflowTests(unittest.TestCase):
         dyn = yd.dynamic_queries_for_entities(["anant ambani"], limit=6)
         self.assertTrue(any("అనంత్" in q for q in dyn))
         self.assertTrue(any("Madanapalle" in q or "Guntur" in q for q in dyn))
-        # Rotation advances the persisted cursor and only samples ONE bucket per cycle.
-        yd.update_checkpoint(connect=app.connect, bucket_cursor=0, query_offset=0)
-        bucket, queries, cursor = yd.next_queries(connect=app.connect, bucket_size=3)
-        self.assertEqual(bucket, yd.QUERY_BUCKETS[0])
-        self.assertEqual(len(queries), 3)
-        self.assertEqual(cursor["bucket_cursor"], 1)
-        bucket2, _, _ = yd.next_queries(connect=app.connect, bucket_size=3)
-        self.assertEqual(bucket2, yd.QUERY_BUCKETS[1])
+        # Rotation advances the persisted cursor. 09D: default is ONE query/cycle and the
+        # priority selector (news/candidates) precedes the static bucket rotation.
+        yd.update_checkpoint(connect=app.connect, bucket_cursor=0, query_offset=0, pending_trigger=None)
+        with app.connect() as connection:
+            connection.execute("DELETE FROM discovery_signals WHERE source_id='ntv'")
+        bucket, queries, cursor = yd.next_queries(connect=app.connect, bucket_size=1)
+        self.assertEqual(len(queries), 1)
+        # The static rotation is reachable when no higher-priority signal exists.
+        self.assertIn(bucket, yd.QUERY_BUCKETS + ("recent_news_entities", "active_candidate", "cross_source_trigger"))
+        # Explicit single-query default: never more than 1.
+        _, more, _ = yd.next_queries(connect=app.connect, bucket_size=1)
+        self.assertLessEqual(len(more), 1)
 
     def test_youtube_channel_class_recency_and_normalization(self):
         import youtube_discovery as yd
@@ -4664,6 +4668,232 @@ class WorkflowTests(unittest.TestCase):
         finally:
             if saved is not None:
                 os.environ["YOUTUBE_API_KEY"] = saved
+
+    def test_youtube_quota_defaults_and_one_search_per_cycle(self):
+        import youtube_discovery as yd
+        import os
+        os.environ["YOUTUBE_API_KEY"] = "test-key"
+        os.environ["YOUTUBE_DISCOVERY_ENABLED"] = "1"
+        try:
+            # Defaults: 1 search/cycle, 900s interval, 7000 discovery budget.
+            self.assertEqual(yd.discovery_interval_seconds(), 900)
+            self.assertEqual(yd.discovery_budget(), 7000)
+            _today = datetime.now(timezone.utc).isoformat()[:10]
+            yd.update_checkpoint(connect=app.connect, quota_date=_today, quota_used=0,
+                                 searches_today=0, videos_today=0, errors_today=0, pending_trigger=None)
+            with app.connect() as connection:
+                connection.execute("DELETE FROM youtube_query_cache")
+                connection.execute("DELETE FROM youtube_video_cache")
+            calls = []
+            def fake_http(url):
+                if "/search" in url:
+                    calls.append(url)
+                    return {"items": [{"id": {"videoId": "VID00000001"}, "snippet": {
+                        "title": "Chandrababu Naidu event", "channelTitle": "NTV Telugu",
+                        "channelId": "c", "publishedAt": "2026-10-03T09:00:00Z"}}]}
+                return {"items": [{"id": "VID00000001", "snippet": {"title": "x", "channelTitle": "NTV Telugu",
+                        "publishedAt": "2026-10-03T09:00:00Z"}, "statistics": {"viewCount": "10"}}]}
+            result = yd.run_youtube_cycle(connect=app.connect, http=fake_http, queries=["Chandrababu Naidu"])
+            self.assertEqual(result["searches"], 1)
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(result["quota_used"], 101)  # 100 search + 1 video
+        finally:
+            os.environ.pop("YOUTUBE_API_KEY", None)
+            os.environ.pop("YOUTUBE_DISCOVERY_ENABLED", None)
+
+    def test_youtube_query_rotation_priorities_and_cooldown(self):
+        import youtube_discovery as yd
+        yd.update_checkpoint(connect=app.connect, pending_trigger=None, bucket_cursor=0, query_offset=0)
+        # Priority 1: recent news entities (non-YouTube) coalesced into ONE query.
+        with app.connect() as connection:
+            connection.execute("DELETE FROM discovery_signals WHERE source_id='ntv'")
+            connection.execute(
+                "INSERT INTO discovery_signals(id,source_id,source_family,publisher,title,text,url,canonical_url,"
+                "published_at,first_seen_at,entities_json,location,language,engagement_metrics_json,"
+                "raw_metadata_json,content_hash,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                ("DS-TEST-1", "ntv", "NTV Telugu", "NTV", "Anant Ambani at Madanapalle", "Global Horticulture Hub",
+                 "u", "u", "2026-10-03T09:00:00Z", "2026-10-03T09:00:00Z", '["anant ambani","madanapalle"]',
+                 "madanapalle", "en", "{}", "{}", "hash-test-1", "2026-10-03T09:00:00Z"))
+        query, reason = yd.select_query(connect=app.connect)
+        self.assertEqual(reason, "recent_news_entities")
+        self.assertIn("anant ambani", query.lower())
+        self.assertIn("madanapalle", query.lower())
+        # Coalescing combines entities into one expression, not three searches.
+        self.assertEqual(yd.coalesce_entities(["a b", "c d"], location="madanapalle"), "a b c d madanapalle")
+        # Duplicate query cooldown: same query within 60m is skipped/cached.
+        yd.query_cache_store("Nara Lokesh", ["x"], connect=app.connect, now=lambda: "2026-10-03T10:00:00Z")
+        self.assertTrue(yd.query_in_cooldown("Nara Lokesh", connect=app.connect, now=lambda: "2026-10-03T10:30:00Z"))
+        self.assertFalse(yd.query_in_cooldown("Nara Lokesh", connect=app.connect, now=lambda: "2026-10-03T11:01:00Z"))
+        # Cross-source trigger wins priority.
+        yd.queue_cross_source_trigger("Anant Ambani Madanapalle", connect=app.connect)
+        self.assertEqual(yd.select_query(connect=app.connect), ("Anant Ambani Madanapalle", "cross_source_trigger"))
+        yd.update_checkpoint(connect=app.connect, pending_trigger=None)
+
+    def test_youtube_video_cache_avoids_repeat_lookup(self):
+        import youtube_discovery as yd
+        import os
+        os.environ["YOUTUBE_API_KEY"] = "test-key"
+        os.environ["YOUTUBE_DISCOVERY_ENABLED"] = "1"
+        try:
+            with app.connect() as connection:
+                connection.execute("DELETE FROM youtube_video_cache")
+            fetched = []
+            def fake_http(url):
+                fetched.append(url)
+                return {"items": [{"id": "VID00000009", "snippet": {"title": "cached", "channelTitle": "NTV",
+                        "publishedAt": "2026-10-03T09:00:00Z"}, "statistics": {"viewCount": "5"}}]}
+            resolved, missing, err = yd.resolve_videos(["VID00000009"], connect=app.connect, key="k",
+                                                       http=fake_http, now=lambda: "2026-10-03T10:00:00Z")
+            self.assertEqual(missing, 1 and len(fetched) == 1)
+            # Second resolve is served from cache: no new lookup.
+            resolved2, missing2, _ = yd.resolve_videos(["VID00000009"], connect=app.connect, key="k",
+                                                       http=fake_http, now=lambda: "2026-10-03T10:05:00Z")
+            self.assertEqual(missing2, 0)
+            self.assertEqual(len(fetched), 1)
+            self.assertEqual(resolved2["VID00000009"]["title"], "cached")
+        finally:
+            os.environ.pop("YOUTUBE_API_KEY", None)
+            os.environ.pop("YOUTUBE_DISCOVERY_ENABLED", None)
+
+    def test_youtube_quota_conservation_and_adaptive_polling(self):
+        import youtube_discovery as yd
+        # Thresholds: 70% CONSERVATION, 85% HIGH_PRIORITY_ONLY, 95% STOPPED (budget 7000).
+        self.assertEqual(yd.quota_mode(used=4900, budget=7000)[0], "CONSERVATION")
+        self.assertEqual(yd.quota_mode(used=5950, budget=7000)[0], "HIGH_PRIORITY_ONLY")
+        self.assertEqual(yd.quota_mode(used=6650, budget=7000)[0], "STOPPED")
+        # Adaptive intervals.
+        self.assertEqual(yd.poll_interval_for_mode("NORMAL"), 900)
+        self.assertEqual(yd.poll_interval_for_mode("ACTIVE_EVENT"), 300)
+        self.assertEqual(yd.poll_interval_for_mode("QUIET"), 1800)
+        self.assertEqual(yd.poll_interval_for_mode("CONSERVATION"), 3600)
+        self.assertIsNone(yd.poll_interval_for_mode("STOPPED"))
+        # No hard exhaustion: at STOPPED the cycle refuses to search.
+        import os
+        os.environ["YOUTUBE_API_KEY"] = "test-key"
+        os.environ["YOUTUBE_DISCOVERY_ENABLED"] = "1"
+        try:
+            yd.update_checkpoint(connect=app.connect, quota_date=datetime.now(timezone.utc).isoformat()[:10], quota_used=6800)
+            result = yd.run_youtube_cycle(connect=app.connect)
+            self.assertEqual(result["status"], "QUOTA_EXHAUSTED")
+            self.assertEqual(result["searches"], 0)
+            yd.update_checkpoint(connect=app.connect, quota_used=0)
+        finally:
+            os.environ.pop("YOUTUBE_API_KEY", None)
+            os.environ.pop("YOUTUBE_DISCOVERY_ENABLED", None)
+
+    def test_youtube_cross_source_trigger_from_cycle(self):
+        import youtube_discovery as yd
+        import live_discovery
+        yd.update_checkpoint(connect=app.connect, pending_trigger=None)
+        cycle = {"_signals": [
+            {"source_id": "ntv", "source_family": "NTV Telugu", "title": "Anant Ambani at Madanapalle hub",
+             "text": "Global Horticulture Hub", "entities": ["anant ambani", "madanapalle"], "location": "madanapalle"},
+        ]}
+        query = live_discovery.queue_youtube_trigger_from_cycle(cycle, connect=app.connect)
+        self.assertIsNotNone(query)
+        self.assertIn("anant ambani", query.lower())
+        self.assertEqual(yd.pending_cross_source_trigger(connect=app.connect), query)
+        yd.update_checkpoint(connect=app.connect, pending_trigger=None)
+
+    def test_youtube_high_priority_override_allows_second_search(self):
+        import youtube_discovery as yd
+        import os
+        os.environ["YOUTUBE_API_KEY"] = "test-key"
+        os.environ["YOUTUBE_DISCOVERY_ENABLED"] = "1"
+        try:
+            _today = datetime.now(timezone.utc).isoformat()[:10]
+            # 85-95% band -> HIGH_PRIORITY_ONLY (dynamic/high-priority permitted).
+            yd.update_checkpoint(connect=app.connect, quota_date=_today, quota_used=6000,
+                                 searches_today=0, videos_today=0, errors_today=0, pending_trigger=None)
+            self.assertEqual(yd.quota_status(connect=app.connect)["mode"], "HIGH_PRIORITY_ONLY")
+            allowed, reason = yd._should_search(connect=app.connect)
+            self.assertTrue(allowed)
+            # ACTIVE_EVENT (open candidates/trigger) allows an event-specific burst of 2.
+            yd.update_checkpoint(connect=app.connect, quota_used=0, pending_trigger="Anant Ambani Madanapalle")
+            self.assertEqual(yd.current_mode(connect=app.connect), "ACTIVE_EVENT")
+            calls = []
+            def fake_http(url):
+                if "/search" in url:
+                    calls.append(url)
+                    return {"items": []}
+                return {"items": []}
+            yd.run_youtube_cycle(connect=app.connect, http=fake_http)
+            # Exactly the trigger query (single) ran.
+            self.assertEqual(len(calls), 1)
+            yd.update_checkpoint(connect=app.connect, pending_trigger=None, quota_used=0)
+        finally:
+            os.environ.pop("YOUTUBE_API_KEY", None)
+            os.environ.pop("YOUTUBE_DISCOVERY_ENABLED", None)
+
+    def test_youtube_recall_qa_still_passes_with_youtube_family(self):
+        import fast_discovery
+        # The permanent Madanapalle fixture (including a YouTube family) still yields a candidate.
+        signals = [
+            {"source_family": "YouTube", "url": "https://youtube.example/recall-1",
+             "title": "Anant Ambani speech at Global Horticulture Hub, Madanapalle",
+             "text": "Anant Ambani addressed the Indian School of Agriculture in Madanapalle.",
+             "published_at": "2026-10-02T09:30:00+00:00", "is_primary": False, "location": "Madanapalle"},
+            {"source_family": "NTV Telugu", "url": "https://ntv.example/recall-1",
+             "title": "పవన్ కల్యాణ్, చంద్రబాబు నాయుడు స్పందన",
+             "text": "Pawan Kalyan and Chandrababu Naidu at the Madanapalle horticulture hub.",
+             "published_at": "2026-10-02T10:15:00+00:00", "is_primary": False, "location": "Madanapalle"},
+            {"source_family": "PIB", "url": "https://pib.example/recall-1",
+             "title": "Indian School of Agriculture at Madanapalle", "text": "Global Horticulture Hub, Madanapalle.",
+             "published_at": "2026-10-02T11:00:00+00:00", "is_primary": True, "location": "Madanapalle"},
+        ]
+        candidate = fast_discovery.discover(signals, connect=app.connect, now=lambda: "2026-10-02T11:05:00+00:00")
+        self.assertIsNotNone(candidate)
+        self.assertIn("YouTube", candidate["source_families"])
+        qa = fast_discovery.discovery_recall_qa(connect=app.connect)
+        self.assertEqual(qa["status"], "PASS", qa["errors"])
+
+    def test_verification_independent_of_youtube_popularity(self):
+        import youtube_discovery as yd
+        import fast_discovery
+        # A high-view YouTube clip still produces a MENTIONS_ONLY relationship, never DIRECT_SUPPORT.
+        popular = yd.normalize_video({
+            "video_id": "POPULARVID1", "title": "Viral: Anant Ambani Madanapalle",
+            "description": "trending", "channel_title": "Random Trending Channel",
+            "channel_id": "c", "published_at": "2026-10-02T09:00:00Z",
+            "url": "https://www.youtube.com/watch?v=POPULARVID1",
+            "statistics": {"view_count": 5_000_000, "like_count": 900_000}},
+            now=lambda: "2026-10-02T10:00:00Z")
+        # Popularity is stored as a discovery signal only.
+        self.assertEqual(popular["engagement_metrics"]["views"], 5_000_000)
+        self.assertEqual(popular["raw_metadata"]["rights_status"], "UNKNOWN")
+        classification = app.classify_claim_evidence(
+            "Anant Ambani spoke at the Global Horticulture Hub, Madanapalle.",
+            "Viral clip of the event with millions of views")
+        self.assertNotEqual(classification, "DIRECT_SUPPORT")
+        # YouTube alone (unknown channel) cannot create a candidate even if popular.
+        self.assertIsNone(fast_discovery.discover([popular], connect=app.connect))
+
+    def test_youtube_unknown_rights_cannot_enter_reel_production(self):
+        import youtube_discovery as yd
+        import media_discovery
+        # Every YouTube signal carries rights_status UNKNOWN and is discovery-only.
+        signal = yd.normalize_video({
+            "video_id": "RIGHTSVID01", "title": "Anant Ambani Madanapalle", "description": "",
+            "channel_title": "NTV Telugu", "channel_id": "c", "published_at": "2026-10-02T09:00:00Z",
+            "url": "https://www.youtube.com/watch?v=RIGHTSVID01"}, now=lambda: "2026-10-02T10:00:00Z")
+        self.assertEqual(signal["raw_metadata"]["rights_status"], "UNKNOWN")
+        # UNKNOWN rights are not eligible, and approval is refused.
+        self.assertFalse(media_discovery.rights_eligible("UNKNOWN"))
+        with app.connect() as connection:
+            candidate_id = "MC-YTRIGHTS-1"
+            connection.execute(
+                "INSERT OR REPLACE INTO media_candidates(id,source_url,publisher,asset_type,title,license_status,"
+                "license_text,attribution_required,usage_scope,content_hash,lifecycle_state,created_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                (candidate_id, signal["url"], signal["publisher"], "video_footage",
+                 "YouTube discovery clip", "UNKNOWN", None, 1,
+                 "contextual", "yt-rights-hash-1", "RIGHTS_CHECK", "2026-10-02T10:00:00Z"))
+        with self.assertRaises(Exception):
+            media_discovery.approve_for_use(candidate_id, connect=app.connect, reviewer="test")
+        with app.connect() as connection:
+            state = connection.execute("SELECT lifecycle_state FROM media_candidates WHERE id=?",
+                                       (candidate_id,)).fetchone()["lifecycle_state"]
+        self.assertNotEqual(state, "APPROVED_FOR_USE")
 
     def test_new_shell_has_five_destinations_and_no_publish(self):
         html = Path(app.__file__).with_name("index.html").read_text(encoding="utf-8")

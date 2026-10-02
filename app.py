@@ -175,6 +175,7 @@ PRODUCTION_TRANSITIONS = {
 AUTO_REEL_PIPELINE_ENABLED = os.environ.get("AUTO_REEL_PIPELINE", "0").strip().lower() in ("1", "true", "yes", "on")
 LIVE_DISCOVERY_ENABLED = os.environ.get("LIVE_DISCOVERY_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
 LIVE_DISCOVERY_INTERVAL_SECONDS = max(60, int(os.environ.get("LIVE_DISCOVERY_INTERVAL_SECONDS", "300")))
+YOUTUBE_DISCOVERY_INTERVAL_SECONDS = max(60, int(os.environ.get("YOUTUBE_DISCOVERY_INTERVAL_SECONDS", "900")))
 RENDER_POLICY_VERSION = os.environ.get("RENDER_POLICY_VERSION", "media-render-policy-v1")
 RENDERER_CONFIG_VERSION = os.environ.get("RENDERER_CONFIG_VERSION", "live-renderer-config-v1")
 RENDER_STORAGE_ROOT = Path(os.environ.get("RENDER_STORAGE_ROOT", ROOT / ".context" / "generated_media"))
@@ -890,7 +891,7 @@ def ingest_signal(
     *, url, title, text, source_name, source_type="manual", source_id=None,
     publication_time=None, event_time=None, detected_at=None, source_metadata=None,
     priority="NORMAL", content_role="reference", item_type=None, author=None,
-    source_class="official_primary",
+    source_class="official_primary", link_event_id=None,
 ):
     if not title or not str(title).strip():
         raise ValueError("signal title is required")
@@ -924,31 +925,42 @@ def ingest_signal(
         event_id = None
         cluster_score = 0.0
         cluster_method = "not_clustered_reference"
-        if item_kind == "event":
-            cluster = _find_cluster(connection, clean_title, clean_text, classified_event_time)
-        if item_kind == "event" and cluster:
-            event_id, cluster_score = cluster
-            cluster_method = "time_entities_text_v1"
-            connection.execute(
-                "UPDATE events SET updated_at=?,last_seen_at=? WHERE id=?",
-                (detected_at, detected_at, event_id),
-            )
+        if item_kind == "event" and link_event_id:
+            # Explicitly bind discovery evidence to an existing event (e.g. a candidate that
+            # already handed off). Immutability is preserved: event_id is set at insert time.
+            existing_event = connection.execute("SELECT id FROM events WHERE id=?", (link_event_id,)).fetchone()
+            if existing_event:
+                event_id = link_event_id
+                cluster_method = "handoff_link"
+                connection.execute(
+                    "UPDATE events SET updated_at=?,last_seen_at=? WHERE id=?",
+                    (detected_at, detected_at, event_id),
+                )
         elif item_kind == "event":
-            event_id = "EV-" + uuid.uuid4().hex[:10].upper()
-            cluster_method = "new_event"
-            connection.execute(
-                "INSERT INTO events(id,title,source,source_url,status,priority,created_at,updated_at,first_seen_at,last_seen_at,workspace_key,event_time) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-                (
-                    event_id, clean_title, source_name, url, "DETECTED", priority,
-                    detected_at, detected_at, detected_at, detected_at,
-                    workspace_identity()["workspace_key"], classified_event_time,
-                ),
-            )
-            connection.execute(
-                "INSERT INTO transitions(event_id,from_state,to_state,at) VALUES(?,?,?,?)",
-                (event_id, None, "DETECTED", detected_at),
-            )
+            cluster = _find_cluster(connection, clean_title, clean_text, classified_event_time)
+            if cluster:
+                event_id, cluster_score = cluster
+                cluster_method = "time_entities_text_v1"
+                connection.execute(
+                    "UPDATE events SET updated_at=?,last_seen_at=? WHERE id=?",
+                    (detected_at, detected_at, event_id),
+                )
+            else:
+                event_id = "EV-" + uuid.uuid4().hex[:10].upper()
+                cluster_method = "new_event"
+                connection.execute(
+                    "INSERT INTO events(id,title,source,source_url,status,priority,created_at,updated_at,first_seen_at,last_seen_at,workspace_key,event_time) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        event_id, clean_title, source_name, url, "DETECTED", priority,
+                        detected_at, detected_at, detected_at, detected_at,
+                        workspace_identity()["workspace_key"], classified_event_time,
+                    ),
+                )
+                connection.execute(
+                    "INSERT INTO transitions(event_id,from_state,to_state,at) VALUES(?,?,?,?)",
+                    (event_id, None, "DETECTED", detected_at),
+                )
 
         signal_id = "SIG-" + uuid.uuid4().hex[:12].upper()
         try:
@@ -6891,12 +6903,22 @@ def run_youtube_discovery_cycle(*, now=None, queries=None):
 
 
 def run_live_discovery_cycle(*, handoff=True):
-    """One LIVE_DISCOVERY_V1 polling cycle using the built-in no-key adapters."""
+    """One LIVE_DISCOVERY_V1 polling cycle using the built-in no-key adapters.
+
+    After the news cycle, a high-value signal (NTV/TV9/Sakshi/PIB/APGov) queues an on-demand
+    YouTube query that replaces the next scheduled generic search (09D section 4).
+    """
     live_discovery.sync_sources(connect=connect, now=now)
     adapters = live_discovery.default_adapters()
-    return live_discovery.run_discovery_cycle(
+    cycle = live_discovery.run_discovery_cycle(
         connect=connect, adapters=adapters, now=now, handoff=handoff,
         handoff_fn=handoff_candidate_to_verification if handoff else None)
+    try:
+        import youtube_discovery
+        live_discovery.queue_youtube_trigger_from_cycle(cycle, connect=connect, now=now)
+    except Exception as error:  # noqa: BLE001 - trigger is best-effort, never blocks the cycle
+        log_error("youtube_trigger_queue_failed", error)
+    return cycle
 
 
 def start_live_discovery_scheduler():
@@ -6917,6 +6939,28 @@ def start_live_discovery_scheduler():
     return True
 
 
+def start_youtube_discovery_scheduler():
+    """Poll YouTube on its own (longer) cadence with adaptive modes. Never crashes the app."""
+    import youtube_discovery
+    if not LIVE_DISCOVERY_ENABLED or not youtube_discovery.youtube_enabled():
+        return None
+    def loop():
+        while True:
+            try:
+                cycle = run_youtube_discovery_cycle()
+                log_error("youtube_discovery_cycle", RuntimeError("cycle complete"), **{
+                    "status": cycle["status"], "bucket": cycle["bucket"],
+                    "searches": cycle["searches"], "signals": cycle["signals_produced"],
+                    "quota_used": cycle["quota_used"], "mode": cycle["mode"]})
+            except Exception as error:  # noqa: BLE001
+                log_error("youtube_discovery_cycle_failed", error)
+            import youtube_discovery as _yd
+            interval = _yd.next_poll_status(connect=connect)["interval_seconds"]
+            time.sleep(interval if interval is not None else YOUTUBE_DISCOVERY_INTERVAL_SECONDS)
+    threading.Thread(target=loop, name="youtube-discovery", daemon=True).start()
+    return True
+
+
 def discovered_candidates_overview():
     """Minimal Discovered queue for Stories/System: candidates, not verified events."""
     items = fast_discovery.list_candidates(connect=connect)
@@ -6928,6 +6972,37 @@ def discovered_candidates_overview():
         "verification_status": c["state"], "event_id": c["event_id"],
         "discovery_latency_seconds": c["discovery_latency_seconds"],
     } for c in items]
+
+
+def _link_candidate_signals_to_event(candidate, event_id):
+    """Copy a candidate's discovery signals into the event signal ledger (09D).
+
+    Discovery leads become research evidence — nothing is verified here. Source class is
+    derived from the signal family (PIB/AP Govt/CMO/Akashvani = official_primary; established
+    newsrooms = independent_reporting; YouTube/unknown = independent_reporting) so the strict
+    verification gates downstream remain in force.
+    """
+    official_families = {"PIB", "AP Government", "CMO Andhra Pradesh", "Akashvani/NewsOnAIR"}
+    linked = []
+    for signal in candidate.get("signals") or []:
+        url = signal.get("url")
+        title = signal.get("title")
+        text = signal.get("text") or signal.get("title")
+        if not url or not title:
+            continue
+        source_class = "official_primary" if signal.get("source_family") in official_families else "independent_reporting"
+        try:
+            outcome = ingest_signal(
+                url=url, title=title, text=text, source_name=signal.get("source_family") or "Discovery",
+                source_type="discovery", publication_time=signal.get("published_at"),
+                event_time=signal.get("published_at"), priority="NORMAL",
+                content_role="item", item_type="news", source_class=source_class,
+                link_event_id=event_id,
+            )
+            linked.append(outcome["signal_id"])
+        except (ValueError, KeyError, TypeError):
+            continue
+    return linked
 
 
 def handoff_candidate_to_verification(candidate_id):
@@ -6956,6 +7031,11 @@ def handoff_candidate_to_verification(candidate_id):
                            (event_id, None, "VERIFYING", timestamp))
         connection.execute(
             "UPDATE event_candidates SET state='HANDED_OFF',event_id=? WHERE id=?", (event_id, candidate_id))
+    # Link the discovery evidence so strict research/verification can run. Leads only.
+    try:
+        _link_candidate_signals_to_event(candidate, event_id)
+    except Exception as error:  # noqa: BLE001 - linking must never block the handoff
+        log_error("candidate_signal_link_failed", error, candidate_id=candidate_id)
     return {"candidate_id": candidate_id, "event_id": event_id, "handed_off": True}
 
 
@@ -8442,6 +8522,15 @@ class Handler(SimpleHTTPRequestHandler):
             if path == "/api/discovery/youtube/run":
                 self.send_json({"cycle": run_youtube_discovery_cycle(queries=body.get("queries"))})
                 return
+            if path == "/api/discovery/youtube/trigger":
+                import youtube_discovery
+                query = body.get("query")
+                if not query:
+                    self.send_json({"error": "query is required"}, 400)
+                    return
+                youtube_discovery.queue_cross_source_trigger(query, connect=connect, now=now)
+                self.send_json({"queued": query}, 201)
+                return
             match = re.fullmatch(r"/api/discovered/([^/]+)/handoff", path)
             if match:
                 self.send_json(handoff_candidate_to_verification(match.group(1)), 201)
@@ -8541,6 +8630,7 @@ if __name__ == "__main__":
     start_publish_scheduler()
     start_scheduled_post_scheduler()
     start_live_discovery_scheduler()
+    start_youtube_discovery_scheduler()
     port = int(os.environ.get("PORT", "8000"))
     host = os.environ.get("HOST", "127.0.0.1")
     print(f"ReachOut dashboard: http://{host}:{port}", flush=True)

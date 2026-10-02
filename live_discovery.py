@@ -147,6 +147,23 @@ def load_registry(path=None):
     return json.loads(Path(path or REGISTRY_PATH).read_text(encoding="utf-8"))["sources"]
 
 
+def queue_youtube_trigger_from_cycle(cycle, *, connect, now=None):
+    """Queue an on-demand YouTube query from a high-value signal in a news cycle (09D s.4).
+
+    Uses signals already fetched by the cycle; never adds unlimited searches — the trigger
+    replaces the next scheduled generic query.
+    """
+    import youtube_discovery
+    signals = (cycle or {}).get("_signals") or []
+    if not signals:
+        # Reconstruct from the stored fetch runs when the cycle did not carry them.
+        return None
+    query = youtube_discovery.high_value_trigger_from_signals(signals, connect=connect, now=now)
+    if query:
+        youtube_discovery.queue_cross_source_trigger(query, connect=connect, now=now)
+    return query
+
+
 def adapter_key(source):
     """Map a registry entry to its adapter function key."""
     if source.get("parser_name") == "youtube_api" or source.get("family") == "YouTube":
@@ -370,6 +387,7 @@ def run_discovery_cycle(*, connect, adapters, now=None, cold_start=False, handof
             entry["health"] = health.get(entry["family"], {}).get("status")
 
     dedupe_detail = dedupe_report(all_signals)
+    cycle["_signals"] = all_signals
     unique = dedupe_detail["unique_signals"]
     cycle["signals_deduped"] = dedupe_detail["duplicates"]
     cycle["dedupe_report"] = {k: v for k, v in dedupe_detail.items()
