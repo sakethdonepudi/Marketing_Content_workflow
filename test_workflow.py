@@ -4195,6 +4195,78 @@ class WorkflowTests(unittest.TestCase):
         overview = app.overview()
         self.assertEqual(overview["reel_standard"]["version"], "REEL_PRODUCTION_STANDARD_V1")
 
+    def test_production_control_plane_approval_and_revision(self):
+        import reel_control
+        _, asset_id = self.approved_meta_video()
+        reel = self._final_reel_fixture(asset_id)
+        # Approval is version-exact and immutable; a duplicate is rejected.
+        approval = reel_control.approve_reel(reel["id"], reviewer="Editor", connect=app.connect)
+        self.assertIsNotNone(reel_control.valid_approval(reel["id"], connect=app.connect))
+        with self.assertRaisesRegex(reel_control.ControlError, "already approved"):
+            reel_control.approve_reel(reel["id"], reviewer="Editor", connect=app.connect)
+        # A change request spawns a new version path and never mutates the reel.
+        revision = reel_control.request_revision(reel["id"], categories=["Visuals", "Narration"],
+                                                 comment="swap the map", connect=app.connect)
+        self.assertEqual(set(revision["categories"]), {"Visuals", "Narration"})
+        with self.assertRaises(reel_control.ControlError):
+            reel_control.request_revision(reel["id"], categories=["Nonsense"], comment="x", connect=app.connect)
+        # Regeneration invalidates the prior approval.
+        reel_control.invalidate_approvals(reel["id"], connect=app.connect)
+        self.assertIsNone(reel_control.valid_approval(reel["id"], connect=app.connect))
+        self.assertEqual(reel_control.queue_state({"status": "READY_FOR_REVIEW"}), "READY_FOR_REVIEW")
+        self.assertEqual(reel_control.queue_state({"status": "NEEDS_ATTENTION"}), "NEEDS_ATTENTION")
+
+    def test_scheduling_requires_approval_and_fail_closed_switches(self):
+        import reel_control
+        _, asset_id = self.approved_meta_video()
+        reel = self._final_reel_fixture(asset_id)
+        # No approval yet -> scheduling is blocked.
+        with self.assertRaisesRegex(ValueError, "not validly approved"):
+            app.schedule_reel_post(reel["id"], "INSTAGRAM_REELS", "2030-01-01T00:00:00+00:00")
+        reel_control.approve_reel(reel["id"], reviewer="Editor", connect=app.connect)
+        post = app.schedule_reel_post(reel["id"], "INSTAGRAM_REELS", "2030-01-01T00:00:00+00:00")
+        self.assertEqual(post["status"], "SCHEDULED")
+        # Duplicate scheduling is blocked.
+        with self.assertRaisesRegex(ValueError, "already scheduled"):
+            app.schedule_reel_post(reel["id"], "INSTAGRAM_REELS", "2030-01-02T00:00:00+00:00")
+        # The scheduler must fail closed with kill switches off (no post).
+        results = app.run_due_scheduled_posts(now_at="2031-01-01T00:00:00+00:00")
+        self.assertTrue(results)
+        self.assertTrue(all(item["blocked"] for item in results))
+        with app.connect() as connection:
+            self.assertEqual(connection.execute(
+                "SELECT COUNT(*) FROM scheduled_posts WHERE status='PUBLISHED'").fetchone()[0], 0)
+
+    def test_retry_policy_and_provider_health(self):
+        import reel_control
+        self.assertTrue(reel_control.is_retryable("Response timed out"))
+        self.assertTrue(reel_control.is_retryable("network error"))
+        self.assertFalse(reel_control.is_retryable("FACTUAL_QA failure"))
+        self.assertFalse(reel_control.is_retryable("UNKNOWN-rights media"))
+        self.assertEqual(reel_control.failure_category("factual_qa did not pass"), "FACTUAL_QA")
+        self.assertLessEqual(reel_control.backoff_seconds(10), 60)
+        health = app.production_health()
+        self.assertIn("providers", health)
+        for name in ("grok", "claude", "edge_tts", "xai_image", "xai_video", "instagram", "facebook"):
+            self.assertIn(health["providers"][name], ("HEALTHY", "DEGRADED", "UNCONFIGURED", "FAILED"))
+
+    def test_cost_unknown_stays_unknown_and_notifications_dedupe(self):
+        import reel_control
+        with app.connect() as connection:
+            reel_control.notify(connection, "media_rights", "WARNING", "Media rights unavailable for EV-1",
+                                dedupe_key="rights:EV-1")
+            reel_control.notify(connection, "media_rights", "WARNING", "Media rights unavailable for EV-1",
+                                dedupe_key="rights:EV-1")
+            count = connection.execute("SELECT COUNT(*) FROM notifications WHERE dedupe_key='rights:EV-1'").fetchone()[0]
+        self.assertEqual(count, 1)
+        rg = app.connect
+        with app.connect() as connection:
+            self.assertEqual(connection.execute(
+                "SELECT COUNT(*) FROM reel_pipeline_runs WHERE cost_status='known' AND total_known_cost_usd IS NULL"
+            ).fetchone()[0], 0)
+        health = app.production_health()
+        self.assertIn("unknown_cost_runs", health)
+
     def test_new_shell_has_five_destinations_and_no_publish(self):
         html = Path(app.__file__).with_name("index.html").read_text(encoding="utf-8")
         for page in ("home", "stories", "review", "media", "system"):

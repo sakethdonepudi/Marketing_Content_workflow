@@ -78,14 +78,18 @@ async function fetchJson(url, opts) {
 
 async function refresh() {
   try {
-    const [overview, pipelines, uploads] = await Promise.all([
+    const [overview, pipelines, uploads, production] = await Promise.all([
       fetchJson('/api/overview'),
       fetchJson('/api/pipelines').catch(() => ({pipelines: []})),
       fetchJson('/api/uploads').catch(() => ({assets: []})),
+      fetchJson('/api/production').catch(() => ({})),
     ]);
     state.overview = overview;
     state.pipelines = pipelines.pipelines || [];
     state.uploads = uploads.assets || [];
+    state.health = production.health || null;
+    state.queue = production.queue || [];
+    state.notifications = production.notifications || [];
     document.getElementById('clock').textContent = `Updated ${fmt(overview.updated_at)}`;
     document.getElementById('standard-tag').textContent = overview.reel_standard?.version || 'Standard';
     renderLeader(overview);
@@ -179,10 +183,21 @@ function renderHome(root) {
   const generating = events.filter(e => ['PRODUCING','VERIFYING','RESEARCHING'].includes(eventUiStatus(e)));
   const attention = state.pipelines.filter(p => p.ui_status === 'NEEDS_ATTENTION');
 
+  const cta = el('button', 'btn primary', `Review reels${ready.length ? ` (${ready.length})` : ''}`);
+  cta.type = 'button'; cta.onclick = () => setPage('review');
   root.append(el('header', 'home-head',
     el('div', 'greeting', 'N. Chandrababu Naidu · Andhra Pradesh'),
-    el('h1', '', 'What needs your attention'),
-    el('p', 'summary-line', `${ready.length} ready for review · ${generating.length} generating · ${attention.length} needs attention`)));
+    el('h1', '', `${ready.length} ready for review`),
+    el('p', 'summary-line', `${generating.length} generating · ${attention.length} needs attention`),
+    el('div', 'f-actions', cta)));
+
+  const t = state.health?.today;
+  if (t) root.append(el('div', 'section', el('div', 'section-title', el('h2', '', 'Today')),
+    el('div', 'pipeline-strip',
+      el('div', 'pstage', el('div', 'n', String(t.reels_generated)), el('div', 'l', 'Generated')),
+      el('div', 'pstage', el('div', 'n', String(t.approved)), el('div', 'l', 'Approved')),
+      el('div', `pstage ${t.needs_attention ? 'active' : ''}`, el('div', 'n', String(t.needs_attention)), el('div', 'l', 'Needs attention')),
+    )));
 
   const featured = ready[0];
   if (featured) {
@@ -234,11 +249,23 @@ function renderStories(root) {
 /* ---------- Review list ---------- */
 
 function renderReviewList(root) {
-  const ready = readyStories();
-  root.append(el('header', 'page-head', el('div', '', el('div', 'eyebrow', 'Editorial queue'), el('h1', '', 'Review'),
-    el('p', 'lede', 'Reels awaiting a human decision. Approval never publishes.'))));
+  const ready = readyStories().slice().sort((a, b) => (a.event_time || '').localeCompare(b.event_time || ''));
+  root.append(el('header', 'page-head', el('div', '', el('div', 'eyebrow', 'Editorial queue'),
+    el('h1', '', `Review (${ready.length})`),
+    el('p', 'lede', 'Oldest first. Press J for next, K for previous. Approval never publishes.'))));
   root.append(ready.length ? el('div', 'story-grid', ready.map(e => storyCard(e)))
     : empty('No reels to review', 'Finished reels appear here once automated QA passes.'));
+  // Keyboard inbox navigation (J next / K previous).
+  document.onkeydown = event => {
+    if (state.page !== 'review' || event.metaKey || event.ctrlKey || event.target.matches('input, textarea')) return;
+    const key = event.key.toLowerCase();
+    if (key !== 'j' && key !== 'k') return;
+    state.reviewIndex = state.reviewIndex || 0;
+    state.reviewIndex = key === 'j'
+      ? Math.min(ready.length - 1, state.reviewIndex + 1)
+      : Math.max(0, state.reviewIndex - 1);
+    if (ready[state.reviewIndex]) setPage('story', ready[state.reviewIndex].id, 'reel');
+  };
 }
 
 /* ---------- Story workspace (Story + Reel review) ---------- */
@@ -328,7 +355,7 @@ function simpleQa(reel) {
 }
 
 function changeRequestForm(reel, onDone) {
-  const options = ['Narration', 'Visuals', 'Subtitles', 'Audio', 'Facts', 'Other'];
+  const options = ['Narration', 'Visuals', 'Subtitles', 'Audio', 'Sources', 'Other'];
   const checks = options.map(o => { const i = el('input'); i.type = 'checkbox'; i.value = o;
     return el('label', '', i, o); });
   const comment = el('textarea'); comment.placeholder = 'Optional comment';
@@ -338,9 +365,9 @@ function changeRequestForm(reel, onDone) {
     const picked = checks.map((l, i) => l.querySelector('input').checked ? options[i] : null).filter(Boolean);
     const reviewer = window.prompt('Reviewer name'); if (!reviewer?.trim()) return;
     submit.disabled = true;
-    fetchJson(`/api/final-reels/${encodeURIComponent(reel.id)}/review`, {
+    fetchJson(`/api/final-reels/${encodeURIComponent(reel.id)}/revision`, {
       method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({action: 'CHANGES_REQUIRED', reviewer, comment: `${picked.join(', ')}${comment.value ? ' — ' + comment.value : ''}`}),
+      body: JSON.stringify({categories: picked, comment: comment.value, reviewer}),
     }).then(() => { onDone(); refresh(); }).catch(e => { submit.disabled = false; window.alert(e.message); });
   };
   return form;
@@ -486,6 +513,24 @@ function renderSystem(root) {
     ['Instagram', switches.INSTAGRAM_PUBLISHING_ENABLED ? 'ON' : 'OFF'],
     ['Facebook', switches.FACEBOOK_PUBLISHING_ENABLED ? 'ON' : 'OFF'],
   ])));
+
+  const health = state.health || {};
+  if (health.today) grid.append(card('', cardHead('Production health'),
+    facts([
+      ['Generated today', health.today.reels_generated], ['Ready for review', health.today.ready_for_review],
+      ['Approved today', health.today.approved], ['Needs attention', health.today.needs_attention],
+      ['Avg generation', health.average_generation_seconds != null ? `${health.average_generation_seconds}s` : '—'],
+      ['Avg cost/reel', health.average_cost_per_reel != null ? money(health.average_cost_per_reel) : 'Unknown'],
+      ['Failure rate', `${Math.round((health.failure_rate || 0) * 100)}%`],
+      ['Unknown-cost runs', health.unknown_cost_runs],
+    ])));
+
+  if (health.providers) grid.append(card('', cardHead('Provider health'),
+    el('ul', 'provider-list', Object.entries(health.providers).map(([name, status]) =>
+      el('li', '', el('span', '', label(name)), el('small', '', status))))));
+
+  if (state.notifications?.length) grid.append(card('', cardHead('Notifications'),
+    el('ul', 'list', state.notifications.slice(0, 8).map(n => el('li', '', n.message)))));
 
   root.append(grid);
 }

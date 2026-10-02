@@ -74,6 +74,7 @@ from visual_qa import visual_qa_provider_for
 import final_reel_composer
 import reel_standard
 import reel_pipeline
+import reel_control
 import media_discovery
 from meta_distribution import (
     COPY_POLICY_VERSION as DISTRIBUTION_COPY_POLICY_VERSION,
@@ -353,6 +354,9 @@ def transition(event_id, state):
             "INSERT INTO transitions(event_id,from_state,to_state,at) VALUES(?,?,?,?)",
             (event_id, old, state, timestamp),
         )
+    # Automatic pipeline trigger: reaching VERIFIED can make an event eligible.
+    if state == "VERIFIED":
+        maybe_trigger_auto_reel(event_id)
 
 
 def load_source_config(path=None):
@@ -4247,6 +4251,10 @@ def run_content_decision_job(run_id, provider=None):
             "INSERT INTO content_decision_run_history(run_id,from_status,to_status,message,changed_at) VALUES(?,?,?,?,?)",
             (run_id, "RUNNING", final_status, message, now()),
         )
+        event_id = run["event_id"]
+    # A CREATE decision can complete eligibility; trigger the automated reel factory.
+    if final_status == "COMPLETED":
+        maybe_trigger_auto_reel(event_id)
 
 
 def content_decision_run(run_id):
@@ -6653,6 +6661,124 @@ def final_reel_asset(final_reel_id):
     return decoded
 
 
+def schedule_reel_post(reel_id, platform, scheduled_at, *, timezone_name="UTC", connect_override=None):
+    """Schedule an approved reel. Approval + platform package QA are required; switches gate sending."""
+    if platform not in META_PLATFORMS:
+        raise ValueError("Platform must be INSTAGRAM_REELS or FACEBOOK_REELS.")
+    approval = reel_control.valid_approval(reel_id, connect=connect)
+    if not approval:
+        raise ValueError("Scheduling blocked: this reel version is not validly approved.")
+    with connect() as connection:
+        if connection.execute("SELECT 1 FROM scheduled_posts WHERE reel_id=? AND status IN ('SCHEDULED','PROCESSING')",
+                              (reel_id,)).fetchone():
+            raise ValueError("This reel is already scheduled or processing.")
+        schedule_id = "SP-" + uuid.uuid4().hex[:12].upper()
+        timestamp = now()
+        connection.execute(
+            "INSERT INTO scheduled_posts(id,reel_id,platform,scheduled_at,timezone,status,approval_id,created_at,updated_at) "
+            "VALUES(?,?,?,?,?,'SCHEDULED',?,?,?)",
+            (schedule_id, reel_id, platform, scheduled_at, timezone_name, approval["id"], timestamp, timestamp),
+        )
+        row = connection.execute("SELECT * FROM scheduled_posts WHERE id=?", (schedule_id,)).fetchone()
+    return dict(row)
+
+
+def _publishing_ready():
+    switches = meta_publishing_switches()
+    return switches["SOCIAL_PUBLISHING_ENABLED"]
+
+
+def run_due_scheduled_posts(now_at=None):
+    """Local scheduler tick. Publishing is a no-op unless switches+credentials are configured."""
+    now_at = now_at or datetime.now(timezone.utc).isoformat()
+    with connect() as connection:
+        due = [row["id"] for row in connection.execute(
+            "SELECT id FROM scheduled_posts WHERE status='SCHEDULED' AND scheduled_at<=? ORDER BY scheduled_at", (now_at,))]
+    results = []
+    for schedule_id in due:
+        with connect() as connection:
+            claimed = connection.execute(
+                "UPDATE scheduled_posts SET status='PROCESSING',updated_at=? WHERE id=? AND status='SCHEDULED'",
+                (now(), schedule_id)).rowcount
+        if not claimed:
+            continue
+        with connect() as connection:
+            row = connection.execute("SELECT * FROM scheduled_posts WHERE id=?", (schedule_id,)).fetchone()
+        # Fail closed: no post without an approval and ON switches.
+        approval = reel_control.valid_approval(row["reel_id"], connect=connect)
+        blockers = []
+        if not approval:
+            blockers.append("approval is no longer valid")
+        if not _publishing_ready():
+            blockers.append("SOCIAL_PUBLISHING_ENABLED is off")
+        with connect() as connection:
+            connection.execute(
+                "UPDATE scheduled_posts SET status=?,attempt_count=attempt_count+1,last_error=?,updated_at=? WHERE id=?",
+                ("FAILED" if blockers else "PROCESSING", ("; ".join(blockers) if blockers else None), now(), schedule_id))
+        results.append({"schedule_id": schedule_id, "blocked": bool(blockers), "blockers": blockers})
+    return results
+
+
+def start_scheduled_post_scheduler():
+    def loop():
+        while True:
+            try:
+                run_due_scheduled_posts()
+            except Exception as error:  # noqa: BLE001
+                log_error("scheduler_failed", error)
+            time.sleep(30)
+    threading.Thread(target=loop, name="reel-scheduler", daemon=True).start()
+
+
+def _provider_health_config():
+    media = renderer_configuration("IMAGE"), renderer_configuration("VIDEO")
+    switches = meta_publishing_switches()
+    instagram = meta_platform_configuration("INSTAGRAM_REELS")
+    facebook = meta_platform_configuration("FACEBOOK_REELS")
+    return {
+        "grok": bool(os.environ.get("XAI_API_KEY")),
+        "claude": production_configuration()["live"],
+        "edge_tts": True,
+        "xai_image": media[0]["live"],
+        "xai_video": media[1]["live"],
+        "instagram": not instagram["missing"],
+        "facebook": not facebook["missing"],
+    }
+
+
+def production_health():
+    """Today's production health + cost/observability summary, for the System page."""
+    today = datetime.now(timezone.utc).date().isoformat()
+    with connect() as connection:
+        def count(query, *params):
+            return connection.execute(query, params).fetchone()[0]
+        events = count("SELECT COUNT(*) FROM events WHERE date(first_seen_at)=?", today)
+        verified = count("SELECT COUNT(*) FROM events WHERE verification_status='VERIFIED' AND date(updated_at)=?", today)
+        reels = count("SELECT COUNT(*) FROM final_reel_assets WHERE date(created_at)=?", today)
+        ready = count("SELECT COUNT(*) FROM final_reel_assets WHERE status='READY_FOR_REVIEW'")
+        approved = count("SELECT COUNT(*) FROM reel_approvals WHERE revoked_at IS NULL AND date(approved_at)=?", today)
+        published = count("SELECT COUNT(*) FROM scheduled_posts WHERE status='PUBLISHED' AND date(published_at)=?", today)
+        attention = count("SELECT COUNT(*) FROM reel_pipeline_runs WHERE status='NEEDS_ATTENTION'")
+        runs = [dict(r) for r in connection.execute(
+            "SELECT total_known_cost_usd,cost_status,started_at,completed_at,status FROM reel_pipeline_runs")]
+    known = [r["total_known_cost_usd"] for r in runs if r["total_known_cost_usd"] is not None]
+    durations = [
+        (datetime.fromisoformat(r["completed_at"]) - datetime.fromisoformat(r["started_at"])).total_seconds()
+        for r in runs if r.get("completed_at") and r.get("started_at")
+    ]
+    failed = sum(1 for r in runs if r["status"] in ("NEEDS_ATTENTION", "HALTED"))
+    return {
+        "today": {"events_discovered": events, "events_verified": verified, "reels_generated": reels,
+                  "ready_for_review": ready, "approved": approved, "published": published, "needs_attention": attention},
+        "average_generation_seconds": round(sum(durations) / len(durations), 1) if durations else None,
+        "average_cost_per_reel": round(sum(known) / len(known), 4) if known else None,
+        "unknown_cost_runs": sum(1 for r in runs if r["cost_status"] == "unknown"),
+        "failure_rate": round(failed / len(runs), 3) if runs else 0.0,
+        "runs": len(runs),
+        "providers": reel_control.provider_health(connect=connect, configuration=_provider_health_config()),
+    }
+
+
 def _auto_reel_stage_handler(stage, run):
     """Perform one AUTO_REEL_PIPELINE_V1 stage using the existing app functions.
 
@@ -6677,7 +6803,9 @@ def _auto_reel_stage_handler(stage, run):
     if stage == "NARRATION":
         return {"narration_ready": True}
     if stage == "MEDIA_DISCOVERY":
-        approved = media_discovery.approved_candidates(connect=connect)
+        # Approved candidates may already be past APPROVED_FOR_USE into INGESTED.
+        approved = [c for c in media_discovery.list_candidates(connect=connect)
+                    if c["lifecycle_state"] in ("APPROVED_FOR_USE", "INGESTED")]
         if not approved:
             raise reel_pipeline.PipelineError(
                 "No rights-cleared media available.", retryable=False,
@@ -6730,6 +6858,45 @@ def run_auto_reel_pipeline(event_id, *, now=None):
     """Drive the automated reel factory one run for one event. Never publishes."""
     run = reel_pipeline.open_or_resume(event_id, connect=connect, now=now or globals()["now"])
     return reel_pipeline.advance(run["id"], handler=_auto_reel_stage_handler, connect=connect)
+
+
+def maybe_trigger_auto_reel(event_id):
+    """Enqueue AUTO_REEL_PIPELINE_V1 automatically once an event becomes eligible.
+
+    Idempotent: one run per event, no duplicate reel, restart-safe, no duplicate paid calls.
+    Returns the run dict when triggered, or None when not eligible or already running.
+    """
+    if not AUTO_REEL_PIPELINE_ENABLED:
+        return None
+    with connect() as connection:
+        existing = connection.execute(
+            "SELECT * FROM reel_pipeline_runs WHERE event_id=?", (event_id,)).fetchone()
+    if existing:
+        return dict(existing)
+    check = reel_pipeline.eligibility(connect, event_id)
+    if not check["eligible"]:
+        return None
+    return run_auto_reel_pipeline(event_id)
+
+
+def production_queue():
+    """User-facing production queue: one simple state per pipeline run, plus approval/publish."""
+    with connect() as connection:
+        runs = [dict(r) for r in connection.execute(
+            "SELECT * FROM reel_pipeline_runs ORDER BY updated_at DESC")]
+        for run in runs:
+            reel_id = run.get("reel_id")
+            run["approved"] = bool(connection.execute(
+                "SELECT 1 FROM reel_approvals WHERE reel_id=? AND revoked_at IS NULL", (reel_id,)).fetchone()
+            ) if reel_id else False
+            run["scheduled_count"] = connection.execute(
+                "SELECT COUNT(*) FROM scheduled_posts WHERE reel_id=? AND status IN ('SCHEDULED','PROCESSING')",
+                (reel_id,)).fetchone()[0] if reel_id else 0
+            run["published_at"] = (connection.execute(
+                "SELECT published_at FROM scheduled_posts WHERE reel_id=? AND status='PUBLISHED' LIMIT 1",
+                (reel_id,)).fetchone() or {"published_at": None})["published_at"] if reel_id else None
+            run["ui_state"] = reel_control.queue_state(run)
+    return runs
 
 
 def recover_auto_reel_pipelines():
@@ -6852,7 +7019,25 @@ def review_final_reel(final_reel_id, action, reviewer, comment=None):
             "INSERT INTO final_reel_reviews(id,final_reel_asset_id,action,reviewer,comment,created_at) VALUES(?,?,?,?,?,?)",
             (review_id, final_reel_id, action, reviewer, comment, now()),
         )
+    # APPROVED also creates an immutable, version-exact approval record (Architecture 08).
+    if action == "APPROVED":
+        reel_control.approve_reel(final_reel_id, reviewer=reviewer, connect=connect, now=now)
+        with connect() as connection:
+            reel_control.notify(connection, "reel_approved", "INFO", f"Reel {final_reel_id} approved",
+                                dedupe_key=f"approve:{final_reel_id}", link={"reel_id": final_reel_id})
     return final_reel_asset(final_reel_id)
+
+
+def request_reel_revision(final_reel_id, categories, comment, reviewer):
+    """Record a change request; the pipeline then produces a NEW immutable reel version."""
+    result = reel_control.request_revision(final_reel_id, categories=categories, comment=comment, connect=connect, now=now)
+    # Mark the reel's latest review as CHANGES_REQUIRED and open a new generation step.
+    review_final_reel(final_reel_id, "CHANGES_REQUIRED", reviewer, comment)
+    return result
+
+
+def production_health_dashboard():
+    return production_health()
 
 
 def _final_reel_distribution_blockers(connection, final_reel_id):
@@ -7997,6 +8182,13 @@ class Handler(SimpleHTTPRequestHandler):
         if path == "/api/uploads":
             self.send_json({"assets": list_uploaded_media_assets(dict(parse_qsl(urlparse(self.path).query)).get("type"))})
             return
+        if path == "/api/production":
+            self.send_json({"health": production_health(), "queue": production_queue(),
+                            "notifications": reel_control.notifications(connect=connect)})
+            return
+        if path == "/api/notifications":
+            self.send_json({"notifications": reel_control.notifications(connect=connect)})
+            return
         if path == "/api/pipelines":
             with connect() as connection:
                 runs = [dict(row) for row in connection.execute(
@@ -8158,6 +8350,18 @@ class Handler(SimpleHTTPRequestHandler):
                 )
                 self.send_json({"asset": asset}, 201)
                 return
+            match = re.fullmatch(r"/api/final-reels/([^/]+)/revision", path)
+            if match:
+                result = request_reel_revision(
+                    match.group(1), body.get("categories"), body.get("comment"), body.get("reviewer"))
+                self.send_json({"revision_request": result}, 201)
+                return
+            match = re.fullmatch(r"/api/final-reels/([^/]+)/schedule", path)
+            if match:
+                post = schedule_reel_post(match.group(1), body.get("platform"), body.get("scheduled_at"),
+                                          timezone_name=body.get("timezone", "UTC"))
+                self.send_json({"scheduled_post": post}, 201)
+                return
             match = re.fullmatch(r"/api/final-reels/([^/]+)/distribution-packages", path)
             if match:
                 package = create_final_reel_distribution_package(
@@ -8210,6 +8414,7 @@ if __name__ == "__main__":
     init()
     recover_interrupted_publish_jobs()
     start_publish_scheduler()
+    start_scheduled_post_scheduler()
     port = int(os.environ.get("PORT", "8000"))
     host = os.environ.get("HOST", "127.0.0.1")
     print(f"ReachOut dashboard: http://{host}:{port}", flush=True)
