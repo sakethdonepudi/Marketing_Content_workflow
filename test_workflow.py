@@ -4384,12 +4384,15 @@ class WorkflowTests(unittest.TestCase):
     def test_real_publisher_parsers_use_saved_fixtures(self):
         import live_discovery as ld
         fixtures = Path(app.__file__).parent / "test_fixtures"
-        # RSS parsers (NTV, TV9, Sakshi) parse titles + dates from saved fixtures.
+        # Exercise the PRODUCTION fetch+parse path (_rss_items) with a fixture transport.
         for name, min_items in (("ntv_feed.xml", 10), ("tv9_feed.xml", 10), ("sakshi_feed.xml", 3)):
-            items = ld._parse_rss_text((fixtures / name).read_text(encoding="utf-8"))
+            text = (fixtures / name).read_text(encoding="utf-8")
+            items = ld._rss_items("http://fixture", user_agent="test", http=lambda url, body=text: body)
             self.assertGreaterEqual(len(items), min_items, name)
+            # Titles and URLs must be populated (regression: falsy ElementTree leaf lookups).
             self.assertTrue(items[0]["title"], name)
             self.assertTrue(items[0]["url"].startswith("http"), name)
+            self.assertTrue(any(i["title"] for i in items), name)
         # PIB listing parses to raw items or fails closed (never fabricates).
         pib = ld.parse_pib_listing((fixtures / "pib_listing.html").read_text(encoding="utf-8"))
         self.assertIsInstance(pib, list)

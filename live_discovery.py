@@ -387,47 +387,23 @@ def detect_bursts(signals, *, window_minutes=30, min_families=3):
 
 # ---------- built-in no-key adapters ----------
 
-def _rss_items(feed_url, *, user_agent, timeout=20, retries=2, sleep=None):
-    """Fetch and parse an RSS/Atom feed into raw items. Honors 429 with bounded backoff."""
-    import time as _time
-    from urllib.error import HTTPError
-    from urllib.request import Request, build_opener
-    import xml.etree.ElementTree as ET
-    pause = sleep or _time.sleep
-    for attempt in range(1, retries + 1):
-        try:
-            request = Request(feed_url, headers={"User-Agent": user_agent, "Accept": "application/rss+xml, application/xml"})
-            with build_opener().open(request, timeout=timeout) as response:
-                payload = response.read()
-            break
-        except HTTPError as error:
-            if error.code != 429 or attempt == retries:
-                raise
-            pause(backoff_delay(attempt) / 30.0)  # keep tests fast; real scheduler uses the full delay
-    else:  # pragma: no cover
-        return []
-    root = ET.fromstring(payload)
-    items = []
-    for item in root.iter():
-        if item.tag.split("}")[-1] not in ("item", "entry"):
-            continue
-        def _text(name):
-            node = item.find(name) or item.find("{http://www.w3.org/2005/Atom}" + name)
-            return (node.text or "").strip() if node is not None and node.text else ""
-        link_node = item.find("{http://www.w3.org/2005/Atom}link")
-        url = _text("link") or (link_node.get("href") if link_node is not None else "")
-        items.append({"title": _text("title"), "text": _text("description") or _text("summary"),
-                      "url": url, "published_at": _text("pubDate") or _text("updated")})
-    return items
+def _rss_items(feed_url, *, user_agent, timeout=20, retries=2, sleep=None, http=None):
+    """Fetch and parse an RSS/Atom feed into raw items. Honors 429 with bounded backoff.
+
+    Delegates parsing to `_parse_rss_text` so the live and fixture paths share one parser.
+    """
+    text = _fetch_text(feed_url, user_agent=user_agent, timeout=timeout, attempts=retries,
+                       sleep=sleep, http=http)
+    return _parse_rss_text(text)
 
 
-def make_rss_adapter(feed_url, *, user_agent="ReachOut-OS/0.4 (live discovery)"):
+def make_rss_adapter(feed_url, *, user_agent="ReachOut-OS/0.5 (live discovery)"):
     def adapter(source):
         return _rss_items(feed_url, user_agent=user_agent)
     return adapter
 
 
-def _fetch_text(url, *, user_agent, timeout=20, http=None):
+def _fetch_text(url, *, user_agent, timeout=20, http=None, attempts=2, sleep=None):
     """Fetch a URL as text; honors 429 with bounded backoff. `http` overrides for tests."""
     if http is not None:
         result = http(url)
@@ -435,15 +411,18 @@ def _fetch_text(url, *, user_agent, timeout=20, http=None):
     import time as _time
     from urllib.error import HTTPError
     from urllib.request import Request, build_opener
-    for attempt in range(1, 3):
+    pause = sleep or _time.sleep
+    for attempt in range(1, attempts + 1):
         try:
-            request = Request(url, headers={"User-Agent": user_agent, "Accept": "application/rss+xml, application/xml, text/html"})
+            request = Request(url, headers={"User-Agent": user_agent,
+                                            "Accept": "application/rss+xml, application/xml, text/html"})
             with build_opener().open(request, timeout=timeout) as response:
                 return response.read().decode("utf-8", "replace")
         except HTTPError as error:
-            if error.code != 429 or attempt == 2:
+            if error.code != 429 or attempt == attempts:
                 raise
-            _time.sleep(backoff_delay(attempt) / 30.0)
+            pause(backoff_delay(attempt) / 30.0)  # keep tests fast; real scheduler uses the full delay
+    return ""  # pragma: no cover - loop always returns or raises
 
 
 def _parse_rss_text(text):
@@ -487,9 +466,7 @@ def default_adapters(*, user_agent="ReachOut-OS/0.5 (live discovery)", http=None
         url = source.get("feed_url")
         if not url:
             return []
-        if http is not None:
-            return _parse_rss_text(http(url))
-        return _rss_items(url, user_agent=user_agent)
+        return _rss_items(url, user_agent=user_agent, http=http)
 
     def pib(source):
         url = source.get("feed_url") or "https://www.pib.gov.in/RssMain.aspx?reg=48&lang=2"
