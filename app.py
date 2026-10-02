@@ -262,11 +262,12 @@ def news_escape(value):
 
 
 def connect():
-    DB.parent.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(DB, timeout=15)
-    connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA foreign_keys=ON")
-    return connection
+    """Open the configured backend (SQLite in dev/tests; PostgreSQL in staging/production).
+
+    Business code is unchanged: callers keep using `with connect() as c: c.execute(...)`.
+    """
+    import persistence
+    return persistence.open_connection(sqlite_path=DB)
 
 
 def init():

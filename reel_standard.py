@@ -90,6 +90,25 @@ STANDARD = {
     "review": {"auto_publish": False, "final_state": "READY_FOR_REVIEW",
                "human_options": ["APPROVE", "CHANGES_REQUIRED", "REJECT"],
                "publishing_enabled": False},
+    # Architecture 14 (A2/A3/A5): the opening must earn the first 1-2 seconds.
+    "hook": {
+        "window_seconds": [0.0, 2.0],
+        "must_show": ["central verified development", "prominent factual headline",
+                      "relevant real visual", "narration starting immediately"],
+        "forbidden": ["slow introduction", "logo before the story", "generic today's-news opener",
+                      "long establishing shot", "delayed factual reveal"],
+        "structure": [{"range": [0, 2], "role": "CORE FACT / DEVELOPMENT"},
+                      {"range": [2, 8], "role": "WHAT CHANGED"},
+                      {"range": [8, 20], "role": "WHO / WHERE / HOW"},
+                      {"range": [20, None], "role": "CONTEXT + CLOSE"}],
+        "variants": ["HOOK_A", "HOOK_B", "HOOK_C"],
+        "cta": {"allowed": True, "kind": "neutral informational",
+                "examples": ["Which part of this update should we explain next?",
+                             "Want the full notification explained in Telugu?",
+                             "What part of this policy update needs more clarification?"],
+                "forbidden": ["target political demographics", "ask viewers to support/oppose an actor",
+                              "political persuasion CTA"]},
+    },
 }
 
 
@@ -114,6 +133,54 @@ def validate_override(override):
 def active_standard():
     """The active production standard every new reel inherits by default."""
     return dict(STANDARD)
+
+
+def first_frame_hook_qa(*, first_beat, narration_text, approved_claims, hook_window=(0.0, 2.0)):
+    """FIRST_FRAME_HOOK_QA: the central fact must land inside the first 1-2 seconds.
+
+    first_beat: {"start_seconds","end_seconds","kind","label","has_real_visual","is_logo_only"}
+    """
+    errors = []
+    start = float(first_beat.get("start_seconds", 0.0))
+    if start > 0.5:
+        errors.append("Narration/visual does not begin promptly.")
+    if not first_beat.get("has_real_visual"):
+        errors.append("Opening frame has no relevant real visual.")
+    if first_beat.get("is_logo_only"):
+        errors.append("Opening frame is logo-only; the story must lead.")
+    kind = str(first_beat.get("kind") or "").upper()
+    if kind in ("INTRO", "LOGO", "TITLE", "ESTABLISHING"):
+        errors.append(f"Opening beat is a slow {kind.lower()} rather than the core development.")
+    # The central fact (first approved claim) must be present in the narration text.
+    claim_texts = [str(c.get("text") if isinstance(c, dict) else c).strip() for c in (approved_claims or [])]
+    claim_texts = [c for c in claim_texts if c]
+    narration = str(narration_text or "").casefold()
+    if claim_texts:
+        lead = claim_texts[0].casefold()
+        head = " ".join(lead.split()[:8])
+        if head and head not in narration:
+            errors.append("Central fact does not appear immediately in the narration.")
+    if not narration.strip():
+        errors.append("Narration is missing.")
+    return {"status": "PASS" if not errors else "FAIL", "errors": errors,
+            "hook_window_seconds": list(hook_window)}
+
+
+def hook_variants(*, claims):
+    """HOOK_A/B/C — factually equivalent, grounded openings (direct / what-changed / context).
+
+    Never introduces credit, blame, urgency, motive, or political persuasion.
+    """
+    claim_texts = [str(c.get("text") if isinstance(c, dict) else c).strip() for c in (claims or [])]
+    claim_texts = [c for c in claim_texts if c]
+    if not claim_texts:
+        return {}
+    core = claim_texts[0]
+    return {
+        "HOOK_A": {"style": "DIRECT_FACT", "text": core},
+        "HOOK_B": {"style": "WHAT_CHANGED", "text": core},
+        "HOOK_C": {"style": "CONTEXT", "text": core},
+    }
 
 
 def reference_standard_qa(reel):

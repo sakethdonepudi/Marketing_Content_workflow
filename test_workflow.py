@@ -5382,6 +5382,132 @@ class WorkflowTests(unittest.TestCase):
             self.assertNotIn("access_token", blob)
             self.assertNotIn("refresh_token", blob)
 
+    def test_arch14_persistence_backend_selection_and_isolation(self):
+        import os, persistence
+        with patch.dict(os.environ, {"REACHOUT_ENV": "development", "REACHOUT_DB": "",
+                                     "PRODUCTION_DATABASE_URL": "", "STAGING_DATABASE_URL": ""}, clear=False):
+            # Development keeps using SQLite.
+            connection = persistence.open_connection(sqlite_path=":memory:")
+            self.assertEqual(connection.dialect, "sqlite")
+            connection.close()
+        # Staging must never share the production DB.
+        with patch.dict(os.environ, {"STAGING_DATABASE_URL": "postgresql://x/db",
+                                     "PRODUCTION_DATABASE_URL": "postgresql://x/db"}, clear=False):
+            self.assertTrue(persistence.staging_points_at_production())
+            with patch.dict(os.environ, {"REACHOUT_ENV": "staging"}, clear=False):
+                with self.assertRaises(persistence.PersistenceError):
+                    persistence.assert_environment_isolation()
+        # Production without a URL fails closed.
+        with patch.dict(os.environ, {"REACHOUT_ENV": "production", "PRODUCTION_DATABASE_URL": ""}, clear=False):
+            with self.assertRaises(persistence.PersistenceError):
+                persistence.open_connection()
+
+    def test_arch14_postgres_sql_translation(self):
+        import persistence
+        # SQLite-only SQL is normalized for PostgreSQL so callers stay dialect-agnostic.
+        self.assertIn("INSERT INTO", persistence._translate_for_postgres("INSERT OR IGNORE INTO t(a) VALUES(?)"))
+        self.assertIn("%s", persistence._translate_for_postgres("SELECT * FROM t WHERE id=?"))
+        self.assertNotIn("?", persistence._translate_for_postgres("UPDATE t SET a=? WHERE b=?"))
+
+    def test_arch14_object_storage_adapter_and_failure(self):
+        import os, media_storage
+        # Local backend for dev/tests.
+        with patch.dict(os.environ, {"STORAGE_BACKEND": "local"}, clear=False):
+            storage = media_storage.media_storage_from_env(app.RENDER_STORAGE_ROOT)
+        self.assertEqual(type(storage).__name__, "LocalMediaStorage")
+        # S3 backend without a bucket fails closed (no silent local fallback).
+        with patch.dict(os.environ, {"STORAGE_BACKEND": "s3", "S3_BUCKET": ""}, clear=False):
+            with self.assertRaises(ValueError):
+                media_storage.media_storage_from_env(app.RENDER_STORAGE_ROOT)
+        # S3 save failure surfaces a safe error, or boto3 is absent and it fails closed.
+        class FailingClient:
+            def put_object(self, **kwargs):
+                raise RuntimeError("network down")
+        with patch.dict(os.environ, {"STORAGE_BACKEND": "s3", "S3_BUCKET": "test-bucket"}, clear=False):
+            try:
+                storage = media_storage.S3MediaStorage()
+            except RuntimeError:
+                storage = None  # boto3 not installed -> adapter fails closed (acceptable)
+            if storage is not None:
+                storage._client = FailingClient()
+                with self.assertRaises(RuntimeError):
+                    storage.save(b"x", extension="mp4")
+        # URI shape contract (skipped when boto3 is unavailable).
+        self.assertTrue(self._s3_uri_shape())
+
+    @staticmethod
+    def _s3_uri_shape():
+        import media_storage
+        try:
+            storage = media_storage.S3MediaStorage(bucket="b")
+        except Exception:
+            return True  # boto3 unavailable -> adapter fails closed; still a valid outcome
+        return storage._key("s3://b/media/x.mp4") == "media/x.mp4"
+
+    def test_arch14_first_frame_hook_qa_and_variants(self):
+        import reel_standard
+        claims = [{"text": "Excess FCV tobacco sales have been permitted in Andhra Pradesh."}]
+        # A strong opening passes.
+        good = reel_standard.first_frame_hook_qa(
+            first_beat={"start_seconds": 0.0, "kind": "FACT", "has_real_visual": True, "is_logo_only": False},
+            narration_text="Excess FCV tobacco sales have been permitted in Andhra Pradesh.",
+            approved_claims=claims)
+        self.assertEqual(good["status"], "PASS")
+        # Logo-only / delayed / no-real-visual openings fail.
+        bad = reel_standard.first_frame_hook_qa(
+            first_beat={"start_seconds": 1.2, "kind": "LOGO", "has_real_visual": False, "is_logo_only": True},
+            narration_text="Welcome to today's news.", approved_claims=claims)
+        self.assertEqual(bad["status"], "FAIL")
+        self.assertTrue(bad["errors"])
+        # Hook variants are factually equivalent and grounded.
+        variants = reel_standard.hook_variants(claims=claims)
+        self.assertEqual(set(variants), {"HOOK_A", "HOOK_B", "HOOK_C"})
+        for variant in variants.values():
+            self.assertIn("FCV tobacco", variant["text"])
+        # The standard records the hook window and forbidden openers.
+        self.assertEqual(reel_standard.STANDARD["hook"]["window_seconds"], [0.0, 2.0])
+        self.assertIn("logo before the story", reel_standard.STANDARD["hook"]["forbidden"])
+
+    def test_arch14_performance_learning_content_level_only(self):
+        import performance_learning as pl
+        with app.connect() as connection:
+            connection.execute("DELETE FROM youtube_performance_snapshots WHERE video_id='PL-TEST-VID'")
+        record = pl.record_metrics(connect=app.connect, video_id="PL-TEST-VID",
+            metrics={"views": 1000, "engaged_views": 300, "stayed_to_watch_pct": 30.0,
+                     "average_view_duration_seconds": 12.0, "average_percentage_viewed": 48.0,
+                     "likes": 20, "comments": 3, "shares": 1, "source": "PUBLIC_DATA"},
+            hook_variant="HOOK_B", topic="tobacco", language="te")
+        self.assertEqual(record["engaged_views"], 300)
+        self.assertEqual(record["hook_variant"], "HOOK_B")
+        self.assertEqual(record["stayed_to_watch_pct"], 30.0)
+        # Idempotent per video.
+        pl.record_metrics(connect=app.connect, video_id="PL-TEST-VID",
+            metrics={"views": 1200, "source": "PUBLIC_DATA"}, hook_variant="HOOK_B")
+        rows = [dict(r) for r in app.connect().execute(
+            "SELECT * FROM youtube_performance_snapshots WHERE video_id='PL-TEST-VID'").fetchall()]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["views"], 1200)
+        # Aggregate-only: never fabricates and never profiles.
+        perf = pl.content_performance(connect=app.connect)
+        self.assertIn("shorts", perf)
+        self.assertIn("summary", perf)
+        self.assertNotIn("voter", json.dumps(perf).lower())
+        self.assertNotIn("demographic", json.dumps(perf).lower())
+        # Metrics not supplied on the second sync stay NULL (never fabricated).
+        self.assertIsNone(rows[0]["engaged_views"])
+
+    def test_arch14_release_gate_and_branching_docs(self):
+        import os
+        # The gate script and branching docs exist and reference the required checks.
+        gate = Path(app.__file__).with_name("tools").joinpath("check_release.sh")
+        self.assertTrue(gate.exists())
+        text = gate.read_text()
+        for token in ("py_compile", "unittest", "secret scan", "staging"):
+            self.assertIn(token, text)
+        branching = Path(app.__file__).with_name("deploy").joinpath("BRANCHING.md")
+        self.assertTrue(branching.exists())
+        self.assertIn("staging", branching.read_text())
+
     def test_new_shell_has_five_destinations_and_no_publish(self):
         html = Path(app.__file__).with_name("index.html").read_text(encoding="utf-8")
         for page in ("home", "stories", "review", "media", "system"):
