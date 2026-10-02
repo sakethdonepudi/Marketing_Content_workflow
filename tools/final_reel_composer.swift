@@ -295,15 +295,8 @@ func figureLayer(imagePath: String, start: Double, end: Double, size: CGSize) ->
     photo.masksToBounds = true
     photo.contentsScale = 2
     layer.addSublayer(photo)
+    windowLayer(layer, start: start, end: end, fade: 0.0)
     let visible = max(0.1, end - start)
-    let opacity = CAKeyframeAnimation(keyPath: "opacity")
-    opacity.values = [0, 1, 1, 0]
-    opacity.keyTimes = [0, 0.12, 0.88, 1]
-    opacity.beginTime = AVCoreAnimationBeginTimeAtZero + start
-    opacity.duration = visible
-    opacity.fillMode = .both
-    opacity.isRemovedOnCompletion = false
-    layer.add(opacity, forKey: "figure-opacity")
     // Slow 103-106% push only; the likeness is never altered or duplicated.
     let transform = CAKeyframeAnimation(keyPath: "transform")
     transform.values = [CATransform3DMakeScale(1.0, 1.0, 1.0), CATransform3DMakeScale(1.05, 1.05, 1.0)]
@@ -404,13 +397,35 @@ func vignetteLayer(size: CGSize) -> CALayer {
     return layer
 }
 
+/// Make a full-frame layer visible only inside [start, end], opaque for the whole window.
+///
+/// A beat is hidden before it starts and never fades to 0, so the frame is always filled by
+/// the current scene (the next beat is added later and covers this one at the boundary). When
+/// `fade > 0`, B fades in from 0 to 1 over A, which stays opaque beneath — a pure A+B
+/// dissolve with no third/background asset. No layer ever drops to 0 mid-timeline.
+func windowLayer(_ layer: CALayer, start: Double, end: Double, fade: Double) {
+    let visible = max(0.1, end - start)
+    if start <= 0.05 {
+        layer.opacity = 1
+        return
+    }
+    layer.opacity = 0
+    let opacity = CAKeyframeAnimation(keyPath: "opacity")
+    opacity.values = [0, 1, 1]
+    opacity.keyTimes = [0, NSNumber(value: fade > 0 ? min(0.5, fade / visible) : 0.0001), 1]
+    opacity.beginTime = AVCoreAnimationBeginTimeAtZero + start
+    opacity.duration = visible
+    opacity.fillMode = .both
+    opacity.isRemovedOnCompletion = false
+    layer.add(opacity, forKey: "window-opacity")
+}
+
 /// A full-frame still beat (generated scene or map/document graphic) with a subtle
-/// Ken Burns move and a soft crossfade in/out so cuts never feel static.
+/// Ken Burns move. Cuts are hard by default; a short A->B dissolve is used only when asked.
 func stillLayer(imagePath: String, start: Double, end: Double, motion: String?, size: CGSize,
-                fade: Double = 0.35) -> CALayer {
+                fade: Double = 0.0) -> CALayer {
     let layer = CALayer()
     layer.frame = CGRect(origin: .zero, size: size)
-    layer.opacity = 0
     layer.masksToBounds = true
     guard let image = NSImage(contentsOfFile: imagePath),
           let cg = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
@@ -423,16 +438,8 @@ func stillLayer(imagePath: String, start: Double, end: Double, motion: String?, 
     photo.masksToBounds = true
     photo.contentsScale = 2
     layer.addSublayer(photo)
+    windowLayer(layer, start: start, end: end, fade: fade)
     let visible = max(0.1, end - start)
-    let opacity = CAKeyframeAnimation(keyPath: "opacity")
-    opacity.values = [0, 1, 1, 0]
-    opacity.keyTimes = [NSNumber(value: 0), NSNumber(value: min(0.2, fade / visible)),
-                        NSNumber(value: max(0.0, 1 - fade / visible)), NSNumber(value: 1)]
-    opacity.beginTime = AVCoreAnimationBeginTimeAtZero + start
-    opacity.duration = visible
-    opacity.fillMode = .both
-    opacity.isRemovedOnCompletion = false
-    layer.add(opacity, forKey: "still-opacity")
     // Subtle push or pan; never a static hold.
     let scale = CAKeyframeAnimation(keyPath: "transform.scale")
     let pan = CAKeyframeAnimation(keyPath: "transform.translation.x")
@@ -461,7 +468,6 @@ func mapGraphicLayer(start: Double, end: Double, size: CGSize) -> CALayer {
     let layer = CALayer()
     layer.frame = CGRect(origin: .zero, size: size)
     layer.backgroundColor = NSColor(calibratedRed: 0.97, green: 0.98, blue: 0.96, alpha: 1).cgColor
-    layer.opacity = 0
     // Point path approximating the Andhra Pradesh outline (stylized, non-survey).
     let unitPoints: [(CGFloat, CGFloat)] = [
         (0.30, 0.14), (0.52, 0.10), (0.70, 0.16), (0.80, 0.30), (0.74, 0.46),
@@ -489,12 +495,7 @@ func mapGraphicLayer(start: Double, end: Double, size: CGSize) -> CALayer {
     label.contentsGravity = .resize
     label.contentsScale = 2
     layer.addSublayer(label)
-    let visible = max(0.1, end - start)
-    let opacity = CAKeyframeAnimation(keyPath: "opacity")
-    opacity.values = [0, 1, 1, 0]; opacity.keyTimes = [0, 0.12, 0.9, 1]
-    opacity.beginTime = AVCoreAnimationBeginTimeAtZero + start
-    opacity.duration = visible; opacity.fillMode = .both; opacity.isRemovedOnCompletion = false
-    layer.add(opacity, forKey: "map-opacity")
+    windowLayer(layer, start: start, end: end, fade: 0.0)
     return layer
 }
 
@@ -536,12 +537,7 @@ func documentGraphicLayer(start: Double, end: Double, size: CGSize) -> CALayer {
     label.contentsGravity = .resize
     label.contentsScale = 2
     layer.addSublayer(label)
-    let visible = max(0.1, end - start)
-    let opacity = CAKeyframeAnimation(keyPath: "opacity")
-    opacity.values = [0, 1, 1, 0]; opacity.keyTimes = [0, 0.12, 0.9, 1]
-    opacity.beginTime = AVCoreAnimationBeginTimeAtZero + start
-    opacity.duration = visible; opacity.fillMode = .both; opacity.isRemovedOnCompletion = false
-    layer.add(opacity, forKey: "doc-opacity")
+    windowLayer(layer, start: start, end: end, fade: 0.0)
     return layer
 }
 
@@ -745,6 +741,11 @@ func compose(_ config: ComposerConfig) throws -> ComposerReceipt {
     parentLayer.isGeometryFlipped = false
     let videoLayer = CALayer()
     videoLayer.frame = parentLayer.frame
+    // The base video track is only a render target; it must never be visible. Each scene
+    // fills the full canvas itself, so the underlying source footage can never show through
+    // between beats (that was the tobacco interstitial). It is fully transparent.
+    videoLayer.opacity = 0
+    parentLayer.backgroundColor = NSColor.black.cgColor
     parentLayer.addSublayer(videoLayer)
     // Cinematic vignette and a thin gold progress bar across the runtime.
     parentLayer.addSublayer(vignetteLayer(size: renderSize))

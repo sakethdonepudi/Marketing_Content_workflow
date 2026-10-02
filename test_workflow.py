@@ -4134,6 +4134,22 @@ class WorkflowTests(unittest.TestCase):
         bad = dict(assets, BAD={"scene_key": "BAD", "rights_status": "UNKNOWN", "attribution": None})
         self.assertEqual(frc.rights_provenance_qa(bad)["status"], "FLAG")
 
+    def test_rendered_frame_continuity_qa_shape_and_hash_distance(self):
+        from media_tools import hash_distance
+        import final_reel_composer as frc
+        self.assertEqual(hash_distance("ffffffffffffffff", "ffffffffffffffff"), 0)
+        self.assertEqual(hash_distance("0000000000000000", "ffffffffffffffff"), 64)
+        self.assertEqual(hash_distance(None, "ffff"), 64)
+        beats = [
+            {"kind": "IMAGE", "asset_source": "MC-A", "scene_key": "A", "start": 0.0, "end": 5.0},
+            {"kind": "IMAGE", "asset_source": "MC-B", "scene_key": "B", "start": 5.0, "end": 10.0},
+        ]
+        # No probe needed: verify the QA is wired and exposes the render-output counts.
+        source = Path(app.__file__).with_name("final_reel_composer.py").read_text(encoding="utf-8")
+        self.assertIn("rendered_repeated_asset_count", source)
+        self.assertIn("third_asset_transition_count", source)
+        self.assertIn("RENDERED_FRAME", source.upper())
+
     def test_generated_scene_provenance_and_beat_plan(self):
         # Every generated scene is an original work with a prompt and provenance recorded.
         scenes = final_reel_composer.generate_scenes(

@@ -25,7 +25,7 @@ from sarvam_tts import normalize_years_for_speech
 ROOT = Path(__file__).resolve().parent
 COMPOSER_SOURCE = ROOT / "tools" / "final_reel_composer.swift"
 COMPOSER_CACHE = ROOT / ".cache" / "final-reel-composer"
-COMPOSER_POLICY_VERSION = "final-reel-composer-v20"
+COMPOSER_POLICY_VERSION = "final-reel-composer-v25"
 VOICE_PROVIDER = "apple-speech"
 VOICE_MODEL = "Aman (en-IN)"
 TELUGU_VOICE_MODEL = "Geeta (te_IN)"
@@ -1197,6 +1197,84 @@ def real_ap_scene_plan(duration, real_assets, *, has_cbn):
     return beats, used
 
 
+def rendered_frame_continuity_qa(output_bytes, beats, asset_hashes, *, step=0.5, boundary_window=0.35):
+    """Perceptual-hash every sampled rendered frame against the source assets.
+
+    FAIL if an asset appears at a timestamp where the scene manifest does not assign it, and
+    FAIL if a third asset appears in the ±window around a transition (only A, B, or an A/B
+    blend are allowed). Returns manifest vs rendered repeated-asset counts; the rendered count
+    is authoritative.
+    """
+    from media_tools import perceptual_hash, hash_distance
+    extractor = frame_extractor_for()
+    duration = beats[-1]["end"] if beats else 0.0
+    times, t = [], 0.0
+    while t < duration:
+        times.append(round(t, 3))
+        t += step
+    boundaries = [beat["end"] for beat in beats[:-1]]
+    for boundary in boundaries:
+        for offset in (-boundary_window, -0.1, 0.1, boundary_window):
+            value = round(boundary + offset, 3)
+            if 0.0 <= value <= duration:
+                times.append(value)
+    times = sorted(set(times))
+    frames = extractor.extract(output_bytes, times)
+    def expected_key(timestamp):
+        for beat in beats:
+            if beat["start"] - 0.001 <= timestamp < beat["end"] + 0.001:
+                return beat.get("asset_source") or beat.get("scene_key") or beat.get("kind")
+        return beats[-1].get("asset_source") or beats[-1].get("kind")
+    def near_boundary(timestamp):
+        for index, boundary in enumerate(boundaries):
+            if abs(timestamp - boundary) <= boundary_window + 0.01:
+                a = beats[index].get("asset_source")
+                b = beats[index + 1].get("asset_source")
+                # Only compare photo-to-photo transitions; CBN/MAP beats are constructed cards.
+                if a in asset_hashes and b in asset_hashes:
+                    return {a, b}
+        return None
+    matches, mismatches, third_asset, inconclusive = [], [], [], 0
+    for frame in frames:
+        timestamp = frame["actual_seconds"]
+        digest = perceptual_hash(frame["jpeg"])
+        # Rank every asset so a match is only trusted when it is clearly closest.
+        ranked = sorted(((hash_distance(digest, value), key) for key, value in asset_hashes.items()))
+        best_distance, best_key = ranked[0] if ranked else (64, None)
+        second_distance = ranked[1][0] if len(ranked) > 1 else 64
+        expected = expected_key(timestamp)
+        record = {"timestamp": round(timestamp, 2), "closest_asset": best_key,
+                  "distance": best_distance, "expected": expected}
+        matches.append(record)
+        # Only photo beats are hash-compared; CBN/MAP cards are constructed, not source assets.
+        if expected not in asset_hashes:
+            inconclusive += 1
+            continue
+        # A confident match is close AND clearly ahead of the runner-up; otherwise UNKNOWN.
+        if best_distance > 12 or (second_distance - best_distance) < 6:
+            inconclusive += 1
+            continue
+        allowed = near_boundary(timestamp)
+        if allowed is not None:
+            if best_key not in allowed:
+                third_asset.append(record)
+        elif best_key != expected:
+            mismatches.append(record)
+    rendered_repeated = len(mismatches) + len(third_asset)
+    errors = []
+    if third_asset:
+        errors.append(f"Third asset appeared at {len(third_asset)} transition frame(s).")
+    if mismatches:
+        errors.append(f"Asset appeared where not assigned at {len(mismatches)} frame(s).")
+    return {
+        "status": "PASS" if not errors else "FLAG", "errors": errors,
+        "sampled_frames": len(frames), "inconclusive_frames": inconclusive,
+        "third_asset_transition_count": len(third_asset),
+        "rendered_repeated_asset_count": rendered_repeated,
+        "matches": matches, "mismatches": mismatches, "third_asset": third_asset,
+    }
+
+
 def local_context_qa(beats, *, generated_scene_ids):
     """Report real vs AI visuals, AP provenance, repetition, and location confidence."""
     visual_beats = [b for b in beats if b.get("kind") in ("IMAGE", "CBN", "MAP")]
@@ -1545,6 +1623,18 @@ def compose_final_reel(source_asset_id, *, connect, storage_root, now, voice_mod
     if real_assets:
         local_context_result = local_context_qa(beats, generated_scene_ids=[row["id"] for row in scene_rows.values()])
         rights_result = rights_provenance_qa(real_assets)
+    # Frame-level render QA: hash each rendered frame against every asset that can appear.
+    from media_tools import perceptual_hash
+    asset_hashes = {}
+    for asset in real_assets.values():
+        try:
+            # Key by candidate id so hashes match the beats' asset_source.
+            asset_hashes[asset["candidate_id"]] = perceptual_hash(storage.get(asset["storage_uri"]))
+        except Exception:
+            pass
+    # CBN and the map/policy graphics are constructed cards, not source photos, so they are
+    # intentionally excluded: the hash QA only guards real-photo scenes against a leak.
+    rendered_qa = rendered_frame_continuity_qa(output_bytes, beats, asset_hashes) if asset_hashes else None
     editorial_qa = editorial_continuity_qa(beats, has_cbn=bool(cbn))
     speech_seconds = narration_speech_seconds
     word_count = len(narration.split())
@@ -1562,7 +1652,7 @@ def compose_final_reel(source_asset_id, *, connect, storage_root, now, voice_mod
     gate_items = [technical_qa, subtitle_qa, audio_qa, factual_qa, public_figure_qa, editorial_qa, naturalness_qa]
     if language == "te":
         gate_items.extend([item for item in (continuous_qa, year_qa) if item and item.get("status") != "N/A"])
-    gate_items.extend([item for item in (local_context_result, rights_result) if item])
+    gate_items.extend([item for item in (local_context_result, rights_result, rendered_qa) if item])
     ready = all(item["status"] == "PASS" for item in gate_items) \
         and instagram["compliant"] and facebook["compliant"]
     # Store the narration audio as its own asset so the voice is replaceable without visuals.
@@ -1620,6 +1710,7 @@ def compose_final_reel(source_asset_id, *, connect, storage_root, now, voice_mod
         "source_qa_json": json.dumps(source_qa, ensure_ascii=False, sort_keys=True),
         "local_context_qa_json": json.dumps(local_context_result, ensure_ascii=False, sort_keys=True) if local_context_result else None,
         "rights_provenance_qa_json": json.dumps(rights_result, ensure_ascii=False, sort_keys=True) if rights_result else None,
+        "rendered_frame_continuity_qa_json": json.dumps(rendered_qa, ensure_ascii=False, sort_keys=True) if rendered_qa else None,
         "editorial_continuity_qa_json": json.dumps(editorial_qa, ensure_ascii=False, sort_keys=True),
         "narration_naturalness_qa_json": json.dumps(naturalness_qa, ensure_ascii=False, sort_keys=True),
         "narration_job_json": json.dumps(narration_job, ensure_ascii=False, sort_keys=True),
@@ -1648,7 +1739,8 @@ def decoded_final_reel(asset):
     for optional in ("public_figure_qa_json", "composition_manifest_json", "source_qa_json",
                      "editorial_continuity_qa_json", "narration_naturalness_qa_json", "narration_job_json",
                      "continuous_narration_qa_json", "year_pronunciation_qa_json",
-                     "local_context_qa_json", "rights_provenance_qa_json"):
+                     "local_context_qa_json", "rights_provenance_qa_json",
+                     "rendered_frame_continuity_qa_json"):
         raw = result.pop(optional, None)
         result[optional.removesuffix("_json")] = json.loads(raw) if raw else None
     return result

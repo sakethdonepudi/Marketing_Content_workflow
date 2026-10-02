@@ -64,6 +64,27 @@ func glyph(_ path: String, _ zoneJSON: String) {
           "bright": bright, "total": total, "bright_ratio": Double(bright) / Double(max(1, total))])
 }
 
+// 64-bit average hash (aHash) of an image, for rendered-frame continuity QA.
+func phash(_ path: String) {
+    guard let image = NSImage(contentsOfFile: path),
+          let cg = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else { fail("unreadable image") }
+    let w = 8, h = 8
+    var pixels = [UInt8](repeating: 0, count: w * h)
+    let space = CGColorSpaceCreateDeviceGray()
+    pixels.withUnsafeMutableBytes { buffer in
+        if let ctx = CGContext(data: buffer.baseAddress, width: w, height: h, bitsPerComponent: 8,
+                               bytesPerRow: w, space: space, bitmapInfo: CGImageAlphaInfo.none.rawValue) {
+            ctx.draw(cg, in: CGRect(x: 0, y: 0, width: w, height: h))
+        }
+    }
+    let mean = pixels.reduce(0) { $0 + Int($1) } / pixels.count
+    var bits: UInt64 = 0
+    for (index, value) in pixels.enumerated() where Int(value) > mean {
+        bits |= (UInt64(1) << UInt64(63 - index))
+    }
+    emit(["engine": "phash", "hash": String(bits, radix: 16), "width": cg.width, "height": cg.height])
+}
+
 func frames(_ path: String, _ outDir: String, _ times: [Double]) {
     let asset = AVURLAsset(url: URL(fileURLWithPath: path))
     let generator = AVAssetImageGenerator(asset: asset)
@@ -93,6 +114,7 @@ case "ocr": ocr(args[2])
 case "glyph":
     guard args.count >= 4 else { fail("glyph needs <image> <zone-json>") }
     glyph(args[2], args[3])
+case "phash": phash(args[2])
 case "frames":
     guard args.count >= 5 else { fail("frames needs <video> <out-dir> <t,...>") }
     frames(args[2], args[3], args[4].split(separator: ",").compactMap { Double($0) })

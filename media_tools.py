@@ -125,6 +125,27 @@ def glyph_bright_ratio(image_bytes, safe_zone=None):
     return float(result.get("bright_ratio", 0.0)), int(result.get("total", 0))
 
 
+def perceptual_hash(image_bytes):
+    """64-bit average hash of an image, for rendered-frame continuity QA."""
+    if platform.system() != "Darwin" or not PROBE_SOURCE.exists() or not shutil.which("swiftc"):
+        raise MediaToolUnavailable("No local perceptual-hash tool is available on this host.")
+    with tempfile.NamedTemporaryFile(suffix=".img") as handle:
+        handle.write(image_bytes)
+        handle.flush()
+        result = _run_probe(["phash", handle.name], timeout=60)
+    return result.get("hash")
+
+
+def hash_distance(left, right):
+    """Hamming distance between two hex aHash values (lower = more similar)."""
+    if not left or not right:
+        return 64
+    try:
+        return bin(int(left, 16) ^ int(right, 16)).count("1")
+    except (TypeError, ValueError):
+        return 64
+
+
 def ocr_provider_for(name=None):
     name = (name if name is not None else os.environ.get("OCR_PROVIDER", "auto")).strip().lower()
     if name in ("", "none", "off"):
