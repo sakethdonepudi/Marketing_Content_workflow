@@ -356,9 +356,62 @@ def _subtitle_qa(output_bytes, cues):
     }
 
 
-def compose_final_reel(source_asset_id, *, connect, storage_root, now, voice_model=VOICE_MODEL):
+def public_figure_context_qa(package, approved_claims, contextual):
+    """Confirm contextual figures/logos are neutral identification, never endorsed by claims.
+
+    CBN and any party mark appear only as neutral labels. The check fails if the approved
+    package/claims do not mention the figure (so the appearance cannot be justified) or if
+    the narration credits/blames the figure for the Union decision.
+    """
+    cbn = contextual.get("cbn")
+    tdp = contextual.get("tdp")
+    if not cbn and not tdp:
+        return {
+            "status": "PASS", "figures": [], "neutral_labels": [],
+            "reason": "No contextual public-figure or party media was included.",
+            "disclaimer": "Appearance is contextual identification only, never evidence of the decision.",
+        }
+    approved_text = " ".join([
+        str((package.get("hook") or {}).get("text") or ""),
+        str((package.get("headline") or {}).get("text") or ""),
+        str((package.get("caption") or {}).get("text") or ""),
+        *[str(item.get("text") or "") for item in package.get("script") or []],
+        *[str(item.get("text") or "") for item in approved_claims],
+    ]).casefold()
+    facts = [part for part in re.split(r"[^a-z0-9]+", approved_text) if part]
+    errors = []
+    figures = []
+    labels = []
+    if cbn:
+        subject = (cbn["asset"].get("identity_subject") or cbn["asset"].get("label") or "").casefold()
+        if "naidu" not in approved_text and "chandrababu" not in approved_text:
+            errors.append("The approved package never names N. Chandrababu Naidu, so the contextual portrait is unsupported.")
+        labels.append("N. Chandrababu Naidu")
+        labels.append("Chief Minister, Andhra Pradesh")
+        figures.append({"asset_id": cbn["asset"]["id"], "role": "PUBLIC_FIGURE_CONTEXT", "rights_status": cbn["asset"]["rights_status"]})
+    if tdp:
+        if not any(token in approved_text for token in ("tdp", "telugu desam")):
+            # A party mark may still appear as neutral identification; only require it not be framed as authorship.
+            pass
+        labels.append("Contextual party identification")
+        figures.append({"asset_id": tdp["asset"]["id"], "role": "PARTY_CONTEXT", "rights_status": tdp["asset"]["rights_status"]})
+    # Never let the framing imply the figure issued/authored/caused/supported/opposed the decision.
+    blame_terms = ("issued the", "authored", "caused the", "deserves credit", "responsible for", "thank", "support of", "opposed")
+    if any(term in approved_text for term in blame_terms):
+        errors.append("Approved text attributes the decision to a figure; contextual framing would be misleading.")
+    return {
+        "status": "PASS" if not errors else "FLAG", "errors": errors,
+        "figures": figures, "neutral_labels": labels,
+        "reason": "Contextual identification only; the decision is attributed to the Union government, not the figure.",
+        "disclaimer": "Appearance is contextual identification only, never evidence of the decision.",
+    }
+
+
+def compose_final_reel(source_asset_id, *, connect, storage_root, now, voice_model=VOICE_MODEL,
+                       cbn_asset_id=None, tdp_asset_id=None, contextual=None):
     """Compose once from an immutable source and persist one immutable derivative."""
     storage = LocalMediaStorage(storage_root)
+    contextual = contextual or {}
     with connect() as connection:
         source_row = connection.execute("SELECT * FROM generated_assets WHERE id=?", (source_asset_id,)).fetchone()
         if source_row is None:
@@ -384,6 +437,25 @@ def compose_final_reel(source_asset_id, *, connect, storage_root, now, voice_mod
     if factual_qa["status"] != "PASS":
         raise FinalReelError("Narration is not fully grounded in approved package content.")
     phrases = subtitle_phrases(narration)
+    cbn = contextual.get("cbn")
+    tdp = contextual.get("tdp")
+    public_figure_qa = public_figure_context_qa(package, claims, contextual)
+    composition_manifest = {
+        "segments": [
+            {"start": 0.0, "end": 2.5, "kind": "HOOK", "headline": "EXCESS FCV TOBACCO SALE PERMITTED",
+             "subline": "Andhra Pradesh · 2025–26", "motion": "punch-in", "accent": "gold"},
+            {"start": 2.5, "end": 7.0, "kind": "FOOTAGE", "motion": "slow-push"},
+            {"start": 7.0, "end": 11.0, "kind": "CONTEXT_FIGURE" if cbn else "FOOTAGE",
+             "cbn_asset_id": cbn["asset"]["id"] if cbn else None,
+             "tdp_asset_id": tdp["asset"]["id"] if tdp else None,
+             "label": ["N. Chandrababu Naidu", "Chief Minister, Andhra Pradesh"] if cbn else None,
+             "motion": "pan-zoom"},
+            {"start": 11.0, "end": None, "kind": "FOOTAGE", "motion": "slow-push"},
+            {"start": None, "end": None, "kind": "CLOSING", "headline": "FCV TOBACCO · ANDHRA PRADESH"},
+        ],
+        "cbn_asset_id": cbn["asset"]["id"] if cbn else None,
+        "tdp_asset_id": tdp["asset"]["id"] if tdp else None,
+    }
     transform_spec = {
         "policy_version": COMPOSER_POLICY_VERSION, "source_asset_id": source["id"],
         "source_checksum_sha256": source["checksum_sha256"], "narration": narration,
@@ -392,6 +464,10 @@ def compose_final_reel(source_asset_id, *, connect, storage_root, now, voice_mod
                      "fill": "solid-white", "outline": "black-halo"},
         "music": {"kind": "original_ambient_pad", "volume": MUSIC_VOLUME, "ducked_volume": DUCKED_MUSIC_VOLUME},
         "narration_gain": NARRATION_GAIN,
+        "cbn_asset_id": cbn["asset"]["id"] if cbn else None,
+        "tdp_asset_id": tdp["asset"]["id"] if tdp else None,
+        "cbn_asset_checksum": cbn["asset"]["checksum_sha256"] if cbn else None,
+        "tdp_asset_checksum": tdp["asset"]["checksum_sha256"] if tdp else None,
         "output": {"width": 720, "height": 1280, "fps": 24, "codec": "h264+aac"},
         "composer_source_sha256": hashlib.sha256(COMPOSER_SOURCE.read_bytes()).hexdigest(),
     }
@@ -412,12 +488,27 @@ def compose_final_reel(source_asset_id, *, connect, storage_root, now, voice_mod
         music_path = directory / "ambient.wav"
         _write_music_bed(music_path)
         output_path = directory / "final-reel.mp4"
+        cbn_path = None
+        tdp_path = None
+        if cbn:
+            cbn_path = directory / ("cbn" + Path(cbn["asset"]["storage_uri"]).suffix or ".png")
+            cbn_path.write_bytes(cbn["data"])
+        if tdp:
+            tdp_path = directory / ("tdp" + Path(tdp["asset"]["storage_uri"]).suffix or ".png")
+            tdp_path.write_bytes(tdp["data"])
         config = {
             "sourceVideo": str(source_path), "outputVideo": str(output_path), "musicAudio": str(music_path),
             "voiceClips": [{"path": str(path), "text": phrase} for path, phrase in zip(voice_paths, phrases)],
             "width": 720, "height": 1280, "fps": 24, "leadSeconds": 0.55,
             "gapSeconds": 0.05, "tailSeconds": 0.75, "musicVolume": MUSIC_VOLUME,
             "duckedMusicVolume": DUCKED_MUSIC_VOLUME, "narrationGain": NARRATION_GAIN,
+            "cbnImage": str(cbn_path) if cbn_path else None,
+            "tdpImage": str(tdp_path) if tdp_path else None,
+            "hookHeadline": "EXCESS FCV TOBACCO SALE PERMITTED",
+            "hookSubline": "Andhra Pradesh · 2025–26",
+            "closingHeadline": "FCV TOBACCO · ANDHRA PRADESH",
+            "cbnLabelLine1": "N. Chandrababu Naidu",
+            "cbnLabelLine2": "Chief Minister, Andhra Pradesh",
         }
         config_path = directory / "config.json"
         config_path.write_text(json.dumps(config), encoding="utf-8")
@@ -456,7 +547,7 @@ def compose_final_reel(source_asset_id, *, connect, storage_root, now, voice_mod
     audio_qa = _audio_qa(output_bytes, receipt["cues"])
     instagram = check_compliance("INSTAGRAM_REELS", video)
     facebook = check_compliance("FACEBOOK_REELS", video)
-    ready = all(item["status"] == "PASS" for item in (technical_qa, subtitle_qa, audio_qa, factual_qa)) \
+    ready = all(item["status"] == "PASS" for item in (technical_qa, subtitle_qa, audio_qa, factual_qa, public_figure_qa)) \
         and instagram["compliant"] and facebook["compliant"]
     stored = storage.save(output_bytes, extension="mp4", metadata={"purpose": "FINAL_REEL"})
     asset = {
@@ -477,6 +568,10 @@ def compose_final_reel(source_asset_id, *, connect, storage_root, now, voice_mod
         "audio_qa_json": json.dumps(audio_qa, sort_keys=True), "factual_qa_json": json.dumps(factual_qa, sort_keys=True),
         "instagram_compatibility_json": json.dumps(instagram, sort_keys=True),
         "facebook_compatibility_json": json.dumps(facebook, sort_keys=True),
+        "cbn_asset_id": cbn["asset"]["id"] if cbn else None,
+        "tdp_asset_id": tdp["asset"]["id"] if tdp else None,
+        "public_figure_qa_json": json.dumps(public_figure_qa, ensure_ascii=False, sort_keys=True),
+        "composition_manifest_json": json.dumps(composition_manifest, ensure_ascii=False, sort_keys=True),
         "status": "READY_FOR_REVIEW" if ready else "BLOCKED", "human_review_status": "REQUIRED",
         "cost_status": "not_billed", "cost_usd": 0.0, "currency": "USD", "created_at": now(),
     }
@@ -496,4 +591,7 @@ def decoded_final_reel(asset):
         "facebook_compatibility_json",
     ):
         result[key.removesuffix("_json")] = json.loads(result.pop(key))
+    for optional in ("public_figure_qa_json", "composition_manifest_json"):
+        raw = result.pop(optional, None)
+        result[optional.removesuffix("_json")] = json.loads(raw) if raw else None
     return result

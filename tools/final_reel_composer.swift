@@ -28,6 +28,14 @@ struct ComposerConfig: Codable {
     let duckedMusicVolume: Float?
     /// Narration gain applied during the mix to reach a phone-audible level.
     let narrationGain: Float?
+    /// Optional rights-cleared contextual images (already validated in the app layer).
+    let cbnImage: String?
+    let tdpImage: String?
+    let hookHeadline: String?
+    let hookSubline: String?
+    let closingHeadline: String?
+    let cbnLabelLine1: String?
+    let cbnLabelLine2: String?
 }
 
 struct CueReceipt: Codable {
@@ -159,6 +167,185 @@ func captionLayer(text: String, start: Double, end: Double, total: Double, size:
     return layer
 }
 
+/// Draw a card of text lines into a bitmap with an optional gold accent bar.
+func cardBitmap(lines: [(String, CGFloat, Bool)], size: CGSize, accent: Bool) -> CGImage {
+    guard let bitmap = NSBitmapImageRep(
+        bitmapDataPlanes: nil, pixelsWide: Int(size.width * 2), pixelsHigh: Int(size.height * 2),
+        bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+        colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0
+    ) else { fail("card bitmap allocation failed") }
+    bitmap.size = size
+    NSGraphicsContext.saveGraphicsState()
+    NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: bitmap)
+    NSColor.clear.setFill()
+    NSRect(origin: .zero, size: size).fill()
+    let paragraph = NSMutableParagraphStyle()
+    paragraph.alignment = .center
+    paragraph.lineBreakMode = .byWordWrapping
+    let measuredHeights: [CGFloat] = lines.map { text, fontSize, _ in
+        let font = NSFont.systemFont(ofSize: fontSize, weight: .heavy)
+        return (text as NSString).boundingRect(
+            with: NSSize(width: size.width - 24, height: size.height),
+            options: [.usesLineFragmentOrigin, .usesFontLeading],
+            attributes: [.font: font, .paragraphStyle: paragraph]).height
+    }
+    let totalHeight = measuredHeights.reduce(0, +) + CGFloat(max(0, lines.count - 1)) * 6
+    var cursorY = (size.height + totalHeight) / 2
+    for (index, line) in lines.enumerated() {
+        let (text, fontSize, bold) = line
+        let font = NSFont.systemFont(ofSize: fontSize, weight: bold ? .heavy : .semibold)
+        let baseAttributes: [NSAttributedString.Key: Any] = [.font: font, .paragraphStyle: paragraph]
+        let value = text as NSString
+        let bounds = value.boundingRect(with: NSSize(width: size.width - 24, height: size.height),
+                                        options: [.usesLineFragmentOrigin, .usesFontLeading], attributes: baseAttributes)
+        let rect = NSRect(x: 12, y: cursorY - bounds.height, width: size.width - 24, height: bounds.height + 2)
+        // Outline pass then fill pass, exactly like the captions, so glyphs stay solid.
+        let outline: [NSAttributedString.Key: Any] = [
+            .font: font, .paragraphStyle: paragraph, .foregroundColor: NSColor.clear,
+            .strokeColor: NSColor.black, .strokeWidth: 6.0,
+        ]
+        value.draw(with: rect, options: [.usesLineFragmentOrigin, .usesFontLeading], attributes: outline)
+        let fill: [NSAttributedString.Key: Any] = [.font: font, .paragraphStyle: paragraph, .foregroundColor: NSColor.white]
+        value.draw(with: rect, options: [.usesLineFragmentOrigin, .usesFontLeading], attributes: fill)
+        cursorY -= bounds.height + 6
+    }
+    if accent {
+        NSColor(calibratedRed: 0.93, green: 0.77, blue: 0.28, alpha: 1).setFill()
+        NSRect(x: size.width / 2 - 46, y: 0, width: 92, height: 8).fill()
+    }
+    NSGraphicsContext.restoreGraphicsState()
+    guard let image = bitmap.cgImage else { fail("card bitmap encode failed") }
+    return image
+}
+
+/// A full-width overlay card that punches in and out over a time window.
+func cardLayer(lines: [(String, CGFloat, Bool)], accent: Bool, start: Double, end: Double, size: CGSize) -> CALayer {
+    let layer = CALayer()
+    let height = size.height * 0.34
+    layer.frame = CGRect(x: 0, y: size.height * 0.30, width: size.width, height: height)
+    layer.backgroundColor = NSColor.black.withAlphaComponent(0.55).cgColor
+    layer.opacity = 0
+    let textLayer = CALayer()
+    textLayer.frame = layer.bounds
+    textLayer.contents = cardBitmap(lines: lines, size: layer.bounds.size, accent: accent)
+    textLayer.contentsGravity = .resize
+    textLayer.contentsScale = 2
+    layer.addSublayer(textLayer)
+    let visible = max(0.1, end - start)
+    let opacity = CAKeyframeAnimation(keyPath: "opacity")
+    opacity.values = [0, 1, 1, 0]
+    opacity.keyTimes = [0, 0.14, 0.9, 1]
+    opacity.beginTime = AVCoreAnimationBeginTimeAtZero + start
+    opacity.duration = visible
+    opacity.fillMode = .both
+    opacity.isRemovedOnCompletion = false
+    layer.add(opacity, forKey: "card-opacity")
+    // Punch-in: scale down to rest for a clean modern news feel.
+    let scale = CAKeyframeAnimation(keyPath: "transform.scale")
+    scale.values = [1.12, 1.0, 1.0]
+    scale.keyTimes = [0, 0.25, 1]
+    scale.beginTime = AVCoreAnimationBeginTimeAtZero + start
+    scale.duration = visible
+    scale.fillMode = .both
+    scale.isRemovedOnCompletion = false
+    layer.add(scale, forKey: "card-scale")
+    return layer
+}
+
+/// A contextual figure layer: the rights-cleared portrait with a restrained pan/zoom.
+func figureLayer(imagePath: String, start: Double, end: Double, size: CGSize) -> CALayer {
+    let layer = CALayer()
+    layer.frame = CGRect(origin: .zero, size: size)
+    layer.opacity = 0
+    guard let image = NSImage(contentsOfFile: imagePath), let cg = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
+        return layer
+    }
+    let photoHeight = size.height * 0.62
+    let photoWidth = size.width
+    let photo = CALayer()
+    photo.frame = CGRect(x: 0, y: size.height * 0.16, width: photoWidth, height: photoHeight)
+    photo.contents = cg
+    photo.contentsGravity = .resizeAspectFill
+    photo.masksToBounds = true
+    photo.contentsScale = 2
+    layer.addSublayer(photo)
+    let visible = max(0.1, end - start)
+    let opacity = CAKeyframeAnimation(keyPath: "opacity")
+    opacity.values = [0, 1, 1, 0]
+    opacity.keyTimes = [0, 0.1, 0.9, 1]
+    opacity.beginTime = AVCoreAnimationBeginTimeAtZero + start
+    opacity.duration = visible
+    opacity.fillMode = .both
+    opacity.isRemovedOnCompletion = false
+    layer.add(opacity, forKey: "figure-opacity")
+    // Slow Ken Burns push and pan; the portrait likeness itself is never altered.
+    let transform = CAKeyframeAnimation(keyPath: "transform")
+    transform.values = [
+        CATransform3DMakeScale(1.0, 1.0, 1.0),
+        CATransform3DMakeScale(1.08, 1.08, 1.0),
+    ]
+    transform.keyTimes = [0, 1]
+    transform.beginTime = AVCoreAnimationBeginTimeAtZero + start
+    transform.duration = visible
+    transform.fillMode = .both
+    transform.isRemovedOnCompletion = false
+    photo.add(transform, forKey: "figure-kenburns")
+    return layer
+}
+
+/// A small neutral label strip for the contextual figure.
+func figureLabelLayer(line1: String, line2: String, start: Double, end: Double, size: CGSize) -> CALayer {
+    let layer = CALayer()
+    let height = size.height * 0.11
+    layer.frame = CGRect(x: 0, y: size.height * 0.05, width: size.width, height: height)
+    layer.backgroundColor = NSColor.black.withAlphaComponent(0.6).cgColor
+    layer.opacity = 0
+    let textLayer = CALayer()
+    textLayer.frame = layer.bounds
+    textLayer.contents = cardBitmap(lines: [(line1, size.width * 0.052, true), (line2, size.width * 0.04, false)],
+                                    size: layer.bounds.size, accent: false)
+    textLayer.contentsGravity = .resize
+    textLayer.contentsScale = 2
+    layer.addSublayer(textLayer)
+    let visible = max(0.1, end - start)
+    let opacity = CAKeyframeAnimation(keyPath: "opacity")
+    opacity.values = [0, 1, 1, 0]
+    opacity.keyTimes = [0, 0.1, 0.9, 1]
+    opacity.beginTime = AVCoreAnimationBeginTimeAtZero + start
+    opacity.duration = visible
+    opacity.fillMode = .both
+    opacity.isRemovedOnCompletion = false
+    layer.add(opacity, forKey: "figure-label-opacity")
+    return layer
+}
+
+/// A small contextual party mark in the corner.
+func logoLayer(imagePath: String, start: Double, end: Double, size: CGSize) -> CALayer {
+    let layer = CALayer()
+    let side = size.width * 0.16
+    layer.frame = CGRect(x: size.width - side - size.width * 0.06, y: size.height * 0.62, width: side, height: side)
+    layer.opacity = 0
+    guard let image = NSImage(contentsOfFile: imagePath), let cg = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
+        return layer
+    }
+    let mark = CALayer()
+    mark.frame = layer.bounds
+    mark.contents = cg
+    mark.contentsGravity = .resizeAspect
+    mark.contentsScale = 2
+    layer.addSublayer(mark)
+    let visible = max(0.1, end - start)
+    let opacity = CAKeyframeAnimation(keyPath: "opacity")
+    opacity.values = [0, 1, 1, 0]
+    opacity.keyTimes = [0, 0.1, 0.9, 1]
+    opacity.beginTime = AVCoreAnimationBeginTimeAtZero + start
+    opacity.duration = visible
+    opacity.fillMode = .both
+    opacity.isRemovedOnCompletion = false
+    layer.add(opacity, forKey: "logo-opacity")
+    return layer
+}
+
 func compose(_ config: ComposerConfig) throws -> ComposerReceipt {
     guard !config.voiceClips.isEmpty else { fail("at least one voice clip is required") }
     let voiceDurations = config.voiceClips.map { audioDuration($0.path) }
@@ -262,6 +449,27 @@ func compose(_ config: ComposerConfig) throws -> ComposerReceipt {
     let videoLayer = CALayer()
     videoLayer.frame = parentLayer.frame
     parentLayer.addSublayer(videoLayer)
+    // Contextual figure (rights-cleared) with a restrained pan/zoom and neutral label.
+    if let cbnImage = config.cbnImage, !cbnImage.isEmpty {
+        let contextEnd = min(targetDuration, 11.0)
+        parentLayer.addSublayer(figureLayer(imagePath: cbnImage, start: 7.0, end: contextEnd, size: renderSize))
+        parentLayer.addSublayer(figureLabelLayer(line1: config.cbnLabelLine1 ?? "", line2: config.cbnLabelLine2 ?? "",
+                                                 start: 7.0, end: contextEnd, size: renderSize))
+        if let tdpImage = config.tdpImage, !tdpImage.isEmpty {
+            parentLayer.addSublayer(logoLayer(imagePath: tdpImage, start: 7.0, end: contextEnd, size: renderSize))
+        }
+    }
+    // Hook card and closing card.
+    if let headline = config.hookHeadline, !headline.isEmpty {
+        parentLayer.addSublayer(cardLayer(lines: [(headline, renderSize.width * 0.072, true),
+                                                  (config.hookSubline ?? "", renderSize.width * 0.046, false)],
+                                          accent: true, start: 0.1, end: 2.5, size: renderSize))
+    }
+    if let closing = config.closingHeadline, !closing.isEmpty {
+        let closingStart = max(2.6, targetDuration - 2.2)
+        parentLayer.addSublayer(cardLayer(lines: [(closing, renderSize.width * 0.055, true)],
+                                          accent: true, start: closingStart, end: targetDuration, size: renderSize))
+    }
     for cue in cues {
         parentLayer.addSublayer(captionLayer(text: cue.text, start: cue.start, end: cue.end,
                                             total: targetDuration, size: renderSize))

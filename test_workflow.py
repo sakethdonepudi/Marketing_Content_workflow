@@ -3829,7 +3829,17 @@ class WorkflowTests(unittest.TestCase):
 
     # ---------- Final Reel Composer integration ----------
 
-    def _final_reel_fixture(self, source_asset_id, *, duration=14.0, qa_pass=True):
+    def _reference_asset(self, asset_type, label, rights="VERIFIED", reviewer="Rights Reviewer"):
+        image = deterministic_png(64, 64, f"{asset_type}-{label}")
+        return app.ingest_reference_media(
+            data=image, filename=f"{label.lower().replace(' ', '-')}.png", asset_type=asset_type, label=label,
+            source_name="Government of Andhra Pradesh", source_url="https://ap.gov.in/example",
+            license_note="Official government media, reuse permitted with attribution.",
+            rights_status=rights, uploader="Uploader One", reviewer=reviewer,
+            identity_subject="N. Chandrababu Naidu" if asset_type == "PUBLIC_FIGURE_PHOTO" else None,
+        )["asset"]
+
+    def _final_reel_fixture(self, source_asset_id, *, duration=14.0, qa_pass=True, cbn_asset_id=None, tdp_asset_id=None):
         with app.connect() as connection:
             source = dict(connection.execute("SELECT * FROM generated_assets WHERE id=?", (source_asset_id,)).fetchone())
             package_row = connection.execute(
@@ -3860,7 +3870,9 @@ class WorkflowTests(unittest.TestCase):
             "instagram_compatibility_json": json.dumps({"compliant": True, "errors": []}),
             "facebook_compatibility_json": json.dumps({"compliant": True, "errors": []}),
             "status": "READY_FOR_REVIEW" if qa_pass else "BLOCKED", "cost_status": "not_billed", "cost_usd": 0.0,
-            "currency": "USD", "created_at": app.now(),
+            "currency": "USD", "created_at": app.now(), "cbn_asset_id": cbn_asset_id, "tdp_asset_id": tdp_asset_id,
+            "public_figure_qa_json": json.dumps({"status": "PASS", "figures": [], "neutral_labels": []}),
+            "composition_manifest_json": json.dumps({"segments": []}),
         }
         with app.connect() as connection:
             connection.execute(
@@ -3945,6 +3957,104 @@ class WorkflowTests(unittest.TestCase):
         for phrase in ("Create final Reel", "final-reels", "Narration (approved package text only)", "Subtitle QA",
                        "Audio QA", "Instagram compatibility", "Facebook compatibility", "Final Reel review",
                        "CHANGES_REQUIRED", "REJECTED", "Lineage & technical details"):
+            self.assertIn(phrase, source)
+
+    def test_reference_media_ingest_requires_verified_rights_and_types(self):
+        asset = self._reference_asset("PUBLIC_FIGURE_PHOTO", "CBN Portrait")
+        self.assertEqual(asset["rights_status"], "VERIFIED")
+        self.assertTrue(asset["checksum_sha256"])
+        # Duplicate bytes reuse the existing registered asset rather than duplicating it.
+        duplicate = app.ingest_reference_media(
+            data=deterministic_png(64, 64, "PUBLIC_FIGURE_PHOTO-CBN Portrait"), filename="cbn.png",
+            asset_type="PUBLIC_FIGURE_PHOTO", label="CBN Portrait",
+            source_name="Government of Andhra Pradesh", license_note="Official government media.",
+            rights_status="VERIFIED", uploader="Uploader One")
+        self.assertTrue(duplicate["duplicate"])
+        self.assertEqual(duplicate["asset"]["id"], asset["id"])
+        with self.assertRaisesRegex(ValueError, "asset_type"):
+            app.ingest_reference_media(
+                data=deterministic_png(8, 8, "bad-type"), filename="x.png", asset_type="POSTER", label="x",
+                source_name="s", license_note="l", rights_status="VERIFIED", uploader="u")
+        with self.assertRaisesRegex(ValueError, "rights_status"):
+            app.ingest_reference_media(
+                data=deterministic_png(8, 8, "bad-rights"), filename="x.png", asset_type="PARTY_LOGO", label="x",
+                source_name="s", license_note="l", rights_status="MAYBE", uploader="u")
+        with self.assertRaisesRegex(ValueError, "Only JPG, PNG, or WebP"):
+            app.ingest_reference_media(
+                data=b"gif", filename="x.gif", asset_type="PARTY_LOGO", label="x",
+                source_name="s", license_note="l", rights_status="VERIFIED", uploader="u")
+        # Only VERIFIED assets can enter a Reel.
+        restricted = self._reference_asset("PARTY_LOGO", "TDP Cycle", rights="RESTRICTED")
+        with app.connect() as connection:
+            with self.assertRaisesRegex(ValueError, "not rights-verified"):
+                app._reference_asset_for_reel(connection, restricted["id"], "PARTY_LOGO")
+            self.assertEqual(app._reference_asset_for_reel(connection, asset["id"], "PUBLIC_FIGURE_PHOTO")["id"], asset["id"])
+            with self.assertRaisesRegex(ValueError, "not a PARTY_LOGO"):
+                app._reference_asset_for_reel(connection, asset["id"], "PARTY_LOGO")
+
+    def test_final_reel_binds_verified_context_assets_and_public_figure_qa(self):
+        _, asset_id = self.approved_meta_video()
+        cbn = self._reference_asset("PUBLIC_FIGURE_PHOTO", "CBN Portrait")
+        tdp = self._reference_asset("PARTY_LOGO", "TDP Cycle")
+        captured = {}
+
+        def composer(source_asset_id, **kwargs):
+            captured.update(kwargs)
+            return self._final_reel_fixture(source_asset_id, duration=14.2,
+                                            cbn_asset_id=kwargs.get("cbn_asset_id"), tdp_asset_id=kwargs.get("tdp_asset_id"))
+
+        result = app.create_final_reel(asset_id, cbn_asset_id=cbn["id"], tdp_asset_id=tdp["id"], composer=composer)
+        self.assertEqual((captured["cbn_asset_id"], captured["tdp_asset_id"]), (cbn["id"], tdp["id"]))
+        self.assertEqual((result["cbn_asset_id"], result["tdp_asset_id"]), (cbn["id"], tdp["id"]))
+        self.assertIn("Chandrababu Naidu", result["narration_text"])
+        # An unregistered or unverified contextual asset is rejected before composing.
+        with self.assertRaisesRegex(ValueError, "not registered"):
+            app.create_final_reel(asset_id, cbn_asset_id="MA-NOPE", composer=composer)
+        restricted = self._reference_asset("PUBLIC_FIGURE_PHOTO", "Blog Portrait", rights="RESTRICTED")
+        with self.assertRaisesRegex(ValueError, "not rights-verified"):
+            app.create_final_reel(asset_id, cbn_asset_id=restricted["id"], composer=composer)
+
+    def test_public_figure_context_qa_flags_unsupported_or_attributing_framing(self):
+        cbn = {"asset": {"id": "MA-CBN", "rights_status": "VERIFIED", "identity_subject": "N. Chandrababu Naidu", "label": "CBN"}}
+        contextual = {"cbn": cbn}
+        named = {"hook": {"text": "Chief Minister N. Chandrababu Naidu discussed the market situation."}, "script": []}
+        passed = final_reel_composer.public_figure_context_qa(named, [], contextual)
+        self.assertEqual(passed["status"], "PASS")
+        unsupported = {"hook": {"text": "Farmers can sell excess FCV tobacco."}, "script": []}
+        self.assertEqual(final_reel_composer.public_figure_context_qa(unsupported, [], contextual)["status"], "FLAG")
+        attributing = {"hook": {"text": "N. Chandrababu Naidu issued the notification."}, "script": []}
+        self.assertEqual(final_reel_composer.public_figure_context_qa(attributing, [], contextual)["status"], "FLAG")
+        self.assertEqual(final_reel_composer.public_figure_context_qa(named, [], {})["status"], "PASS")
+
+    def test_reference_media_http_routes_and_schema(self):
+        with app.connect() as connection:
+            tables = {row[0] for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='uploaded_media_assets'"
+            )}
+            cols = {row[1] for row in connection.execute("PRAGMA table_info(final_reel_assets)")}
+        self.assertEqual(tables, {"uploaded_media_assets"})
+        self.assertTrue({"cbn_asset_id", "tdp_asset_id", "public_figure_qa_json", "composition_manifest_json"} <= cols)
+        server = ThreadingHTTPServer(("127.0.0.1", 0), app.Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.shutdown)
+        connection = HTTPConnection("127.0.0.1", server.server_address[1], timeout=5)
+        import base64
+        payload = {
+            "data": base64.b64encode(deterministic_png(32, 32, "cbn-http")).decode(), "filename": "cbn.png",
+            "asset_type": "PUBLIC_FIGURE_PHOTO", "label": "CBN Portrait", "source_name": "AP Government",
+            "license_note": "Reuse permitted with attribution.", "rights_status": "VERIFIED",
+            "uploader": "Dashboard", "reviewer": "Editor",
+        }
+        connection.request("POST", "/api/uploads", body=json.dumps(payload), headers={"Content-Type": "application/json"})
+        response = connection.getresponse()
+        created = json.loads(response.read())
+        self.assertEqual((response.status, created["asset"]["rights_status"]), (201, "VERIFIED"))
+        connection.request("GET", "/api/uploads?type=PUBLIC_FIGURE_PHOTO")
+        listed = json.loads(connection.getresponse().read())
+        self.assertTrue(any(item["id"] == created["asset"]["id"] for item in listed["assets"]))
+        source = Path(app.__file__).with_name("app.js").read_text(encoding="utf-8")
+        for phrase in ("Reference media", "CBN portrait", "Party logo", "Rights-verified only",
+                       "License / permission note", "cbn_asset_id", "tdp_asset_id", "Public-figure QA"):
             self.assertIn(phrase, source)
 
     def test_final_reel_subtitles_render_filled_glyphs_and_audio_mix_is_measured(self):

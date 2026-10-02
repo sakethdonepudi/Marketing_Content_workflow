@@ -12,6 +12,7 @@ const state = {
   contentProvider: 'test',
   messages: {},
   busy: {},
+  reelInputs: {cbn: null, tdp: null},
 };
 
 const TABS = ['overview', 'evidence', 'verification', 'decision', 'package', 'media', 'distribution', 'activity'];
@@ -431,7 +432,8 @@ function renderActionBar(data) {
     );
     const reelSource = data.final_reel_source_asset_id;
     const newReel = actionButton('Create final Reel', 'final-reel', () => post(
-      `/api/generated-assets/${encodeURIComponent(reelSource)}/final-reels`, {}, 'final-reel',
+      `/api/generated-assets/${encodeURIComponent(reelSource)}/final-reels`,
+      {cbn_asset_id: state.reelInputs.cbn, tdp_asset_id: state.reelInputs.tdp}, 'final-reel',
       'Composing 9:16 Reel (narration + burned-in subtitles + quiet music)…',
       () => 'Final Reel composed — human review required', 'media',
     ), {primary: false, disabled: !reelSource, allowDuringActive: true});
@@ -758,14 +760,21 @@ function finalReelCard(reel) {
   ));
   side.append(el('div', 'review-workflow', el('strong', '', 'Final Reel review'), reelReviewActions(reel),
     el('span', 'secondary-text', 'Approval is per exact Final Reel version and is never inherited.')));
+  const figureQa = reel.public_figure_qa || {};
   side.append(facts([
     ['Source video', `${reel.source_asset_id} v${reel.source_asset_version}`],
+    ['CBN asset', reel.cbn_asset_id || 'Not included'],
+    ['TDP asset', reel.tdp_asset_id || 'Not included'],
+    ['Public-figure QA', figureQa.status || 'UNKNOWN'],
     ['Source render job', reel.source_render_job_id],
     ['Content package', `${reel.content_package_id} v${reel.content_package_version}`],
     ['Voice', `${reel.voice_provider} · ${reel.voice_model}`],
     ['Cost', reel.cost_status === 'known' ? money(reel.cost_usd) : label(reel.cost_status)],
     ['Created', fmt(reel.created_at)],
   ]));
+  if (figureQa.figures?.length) side.append(callout('info', 'Contextual figures',
+    bullets(figureQa.figures.map(figure => `${figure.asset_id} · ${label(figure.role)} · rights ${figure.rights_status}`)),
+    el('p', 'secondary-text', figureQa.disclaimer || '')));
 
   const details = [facts([
     ['Final Reel', reel.id], ['Transform hash', `${(reel.transform_hash || '').slice(0, 24)}…`],
@@ -777,6 +786,13 @@ function finalReelCard(reel) {
   ])];
   if (reel.subtitle_qa?.checks?.length) details.push(el('h3', '', 'Subtitle OCR checks'), bullets(
     reel.subtitle_qa.checks.map(check => `“${check.cue || check.text}” · coverage ${check.token_coverage}`)));
+  if (reel.public_figure_qa && reel.public_figure_qa.status) details.push(el('h3', '', 'Public-figure context QA'), facts([
+    ['Status', label(reel.public_figure_qa.status)],
+    ['Neutral labels', (reel.public_figure_qa.neutral_labels || []).join(' · ') || 'None'],
+    ['Reason', reel.public_figure_qa.reason || '—'],
+  ]), reel.public_figure_qa.errors?.length ? bullets(reel.public_figure_qa.errors) : null);
+  if (reel.composition_manifest?.segments?.length) details.push(el('h3', '', 'Composition plan'), bullets(
+    reel.composition_manifest.segments.map(segment => `${label(segment.kind)}${segment.start != null ? ` · ${segment.start}–${segment.end ?? 'end'}s` : ''}${segment.headline ? ` · ${segment.headline}` : ''}${segment.motion ? ` · ${segment.motion}` : ''}`)));
   if (reel.instagram_compatibility || reel.facebook_compatibility) details.push(facts([
     ['Spec version', instagram.spec_api_version || facebook.spec_api_version || '—'],
   ]));
@@ -787,12 +803,94 @@ function finalReelCard(reel) {
   return card('reel-card', el('div', 'media-layout', left, el('div', '', side, disclosure('Lineage & technical details', details))));
 }
 
+function uploadReferenceMedia(kind, assetType, form, status) {
+  const fileInput = form.querySelector('input[type=file]');
+  const fields = name => form.querySelector(`[name=${name}]`)?.value.trim() || '';
+  const file = fileInput?.files?.[0];
+  if (!file) { status.textContent = 'Choose an image file first.'; return; }
+  const rights = fields('rights_status') || 'VERIFIED';
+  if (!fields('label') || !fields('source_name') || !fields('license_note') || !fields('uploader')) {
+    status.textContent = 'Label, source, license note, and uploader are required.';
+    return;
+  }
+  status.textContent = 'Uploading…';
+  const reader = new FileReader();
+  reader.onload = () => {
+    fetch('/api/uploads', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        data: reader.result, filename: file.name, asset_type: assetType, label: fields('label'),
+        source_name: fields('source_name'), source_url: fields('source_url'),
+        license_note: fields('license_note'), rights_status: rights, uploader: fields('uploader'),
+        reviewer: fields('reviewer'), identity_subject: fields('identity_subject'),
+      }),
+    }).then(response => response.json().then(result => ({ok: response.ok, result})))
+      .then(({ok, result}) => {
+        if (!ok) throw new Error(result.error || 'Upload failed');
+        status.textContent = result.duplicate ? `Already registered · ${result.asset.id}` : `Registered ${result.asset.id} · ${label(result.asset.rights_status)}`;
+        loadRoom();
+      })
+      .catch(error => { status.textContent = error.message; });
+  };
+  reader.onerror = () => { status.textContent = 'The file could not be read.'; };
+  reader.readAsDataURL(file);
+}
+
+function referenceMediaPanel(data) {
+  const ref = data.reference_media || {cbn_options: [], tdp_options: [], all: []};
+  const noneOption = () => el('option', '', 'Not included');
+  const panel = card('', cardHead('Reference media', plainPill('Rights-verified only', 'good')));
+  panel.append(el('p', 'secondary-text', 'Upload a rights-cleared N. Chandrababu Naidu portrait and/or party logo, mark provenance and usage rights, then select them for the next Final Reel. Unverified assets can never enter a Reel.'));
+
+  for (const [kind, assetType, heading] of [['cbn', 'PUBLIC_FIGURE_PHOTO', 'CBN portrait'], ['tdp', 'PARTY_LOGO', 'Party logo']]) {
+    const choices = kind === 'cbn' ? (ref.cbn_options || []) : (ref.tdp_options || []);
+    const block = el('div', 'reference-block', el('h3', '', heading));
+    const select = el('select', '');
+    select.append(noneOption());
+    choices.forEach(asset => {
+      const option = el('option', '', `${asset.label} · ${asset.id} · ${asset.rights_status}`);
+      option.value = asset.id;
+      select.append(option);
+    });
+    select.value = state.reelInputs[kind] || '';
+    select.onchange = () => { state.reelInputs[kind] = select.value || null; renderRoom(); };
+    const img = el('img', 'reference-thumb');
+    const selected = choices.find(asset => asset.id === state.reelInputs[kind]);
+    if (selected) { img.src = `/api/uploads/${encodeURIComponent(selected.id)}/content`; img.alt = selected.label; }
+    else img.hidden = true;
+    block.append(el('div', 'reference-select', el('label', '', 'Selected asset', select), img));
+    if (selected) block.append(facts([
+      ['Source', selected.source_name], ['License', selected.license_note],
+      ['Checksum', `${selected.checksum_sha256.slice(0, 16)}…`],
+    ]));
+
+    const form = el('form', 'reference-upload');
+    const text = (name, placeholder, required = true) => {
+      const input = el('input'); input.name = name; input.placeholder = placeholder; input.required = required; return input;
+    };
+    const fileInput = el('input'); fileInput.type = 'file'; fileInput.accept = 'image/jpeg,image/png,image/webp';
+    const rights = el('select'); rights.name = 'rights_status';
+    for (const value of ['VERIFIED', 'RESTRICTED', 'UNKNOWN']) { const option = el('option', '', label(value)); option.value = value; rights.append(option); }
+    const status = el('p', 'secondary-text');
+    form.append(el('div', 'reference-grid', fileInput, text('label', 'Label'), text('source_name', 'Source name'),
+      text('source_url', 'Source URL (optional)', false), text('license_note', 'License / permission note'),
+      text('uploader', 'Uploader'), text('reviewer', 'Reviewer (optional)', false), rights));
+    const submit = el('button', 'btn', `Upload ${heading}`); submit.type = 'button';
+    submit.onclick = () => uploadReferenceMedia(kind, assetType, form, status);
+    form.append(submit, status);
+    block.append(form);
+    panel.append(block);
+  }
+  return panel;
+}
+
 function renderFinalReels(data, root) {
   const reels = data.final_reels || [];
   const source = data.final_reel_source_asset_id;
   const section = el('div', 'final-reel-section');
   section.append(cardHead(`Final Reels (${reels.length})`,
     source ? plainPill(`Source ready · ${source}`, 'good') : plainPill('No eligible source', 'warn')));
+  section.append(referenceMediaPanel(data));
   if (!reels.length) {
     section.append(empty('No Final Reel yet', 'Create a 9:16 Reel from a QA-passed generated video. Every composition is a new immutable version.'));
   } else {

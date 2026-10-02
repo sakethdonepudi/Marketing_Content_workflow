@@ -1,3 +1,5 @@
+import base64
+import binascii
 import hashlib
 import html
 import ipaddress
@@ -6528,6 +6530,108 @@ def _final_reel_source_blockers(connection, source_asset_id):
     return asset, job, list(dict.fromkeys(blockers))
 
 
+REFERENCE_MEDIA_EXTENSIONS = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".webp": "image/webp"}
+REFERENCE_MEDIA_TYPES = ("PUBLIC_FIGURE_PHOTO", "PARTY_LOGO", "OTHER")
+REFERENCE_RIGHTS = ("VERIFIED", "RESTRICTED", "UNKNOWN")
+MAX_REFERENCE_MEDIA_BYTES = 12_000_000
+
+
+def uploaded_media_asset(asset_id):
+    with connect() as connection:
+        row = connection.execute("SELECT * FROM uploaded_media_assets WHERE id=?", (asset_id,)).fetchone()
+    if row is None:
+        raise KeyError(asset_id)
+    return dict(row)
+
+
+def list_uploaded_media_assets(asset_type=None):
+    with connect() as connection:
+        if asset_type:
+            rows = connection.execute(
+                "SELECT * FROM uploaded_media_assets WHERE asset_type=? ORDER BY uploaded_at DESC,id DESC", (asset_type,)
+            ).fetchall()
+        else:
+            rows = connection.execute(
+                "SELECT * FROM uploaded_media_assets ORDER BY uploaded_at DESC,id DESC"
+            ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def _reference_media_choices(asset_type):
+    """Verified-only options for the Final Reel composer, never exposing storage paths."""
+    return [
+        {
+            "id": asset["id"], "label": asset["label"], "asset_type": asset["asset_type"],
+            "rights_status": asset["rights_status"], "source_name": asset["source_name"],
+            "license_note": asset["license_note"], "checksum_sha256": asset["checksum_sha256"],
+            "width": asset["width"], "height": asset["height"],
+        }
+        for asset in list_uploaded_media_assets(asset_type)
+        if asset["rights_status"] == "VERIFIED"
+    ]
+
+
+def ingest_reference_media(*, data, filename, asset_type, label, source_name, license_note,
+                           rights_status, uploader, source_url=None, reviewer=None,
+                           identity_subject=None, storage=None):
+    """Register a rights-cleared reference asset. Bytes are stored; only the DB row is addressable."""
+    asset_type = str(asset_type or "").upper().strip()
+    if asset_type not in REFERENCE_MEDIA_TYPES:
+        raise ValueError("asset_type must be PUBLIC_FIGURE_PHOTO, PARTY_LOGO, or OTHER.")
+    rights_status = str(rights_status or "").upper().strip()
+    if rights_status not in REFERENCE_RIGHTS:
+        raise ValueError("rights_status must be VERIFIED, RESTRICTED, or UNKNOWN.")
+    label = str(label or "").strip()[:200]
+    source_name = str(source_name or "").strip()[:200]
+    license_note = str(license_note or "").strip()[:2000]
+    uploader = str(uploader or "").strip()[:120]
+    if not label or not source_name or not license_note or not uploader:
+        raise ValueError("label, source_name, license_note, and uploader are required.")
+    if isinstance(data, str):
+        # Accept base64 without a data-URL prefix from the dashboard upload control.
+        candidate = data.split(",", 1)[1] if data.startswith("data:") and "," in data else data
+        try:
+            data = base64.b64decode(candidate, validate=True)
+        except (binascii.Error, ValueError) as error:
+            raise ValueError("The uploaded image data is not valid base64.") from error
+    if not isinstance(data, (bytes, bytearray)) or not data:
+        raise ValueError("An image file is required.")
+    if len(data) > MAX_REFERENCE_MEDIA_BYTES:
+        raise ValueError("The image exceeds the 12 MB reference-media limit.")
+    extension = Path(str(filename or "")).suffix.lower()
+    if extension not in REFERENCE_MEDIA_EXTENSIONS:
+        raise ValueError("Only JPG, PNG, or WebP reference images are accepted.")
+    try:
+        decoded = inspect_image(bytes(data))
+    except ImageDecodeError as error:
+        raise ValueError(f"The uploaded image could not be decoded: {error}") from error
+    storage = storage or LocalMediaStorage(RENDER_STORAGE_ROOT)
+    stored = storage.save(bytes(data), extension=extension.lstrip("."), metadata={"purpose": "REFERENCE_MEDIA"})
+    with connect() as connection:
+        existing = connection.execute(
+            "SELECT id FROM uploaded_media_assets WHERE checksum_sha256=?", (stored.checksum_sha256,)
+        ).fetchone()
+        if existing:
+            row = connection.execute("SELECT * FROM uploaded_media_assets WHERE id=?", (existing["id"],)).fetchone()
+            return {"asset": dict(row), "duplicate": True}
+        asset_id = "MA-" + uuid.uuid4().hex[:12].upper()
+        timestamp = now()
+        reviewed_at = timestamp if rights_status == "VERIFIED" else None
+        connection.execute(
+            "INSERT INTO uploaded_media_assets(id,asset_type,label,identity_subject,storage_uri,mime_type,width,height,"
+            "file_size,checksum_sha256,source_name,source_url,license_note,rights_status,uploader,reviewer,uploaded_at,"
+            "rights_reviewed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                asset_id, asset_type, label, str(identity_subject or "").strip()[:200] or None, stored.storage_uri,
+                REFERENCE_MEDIA_EXTENSIONS[extension], decoded.get("width"), decoded.get("height"), stored.file_size,
+                stored.checksum_sha256, source_name, str(source_url or "").strip()[:2000] or None, license_note,
+                rights_status, uploader, str(reviewer or "").strip()[:120] or None, timestamp, reviewed_at,
+            ),
+        )
+        row = connection.execute("SELECT * FROM uploaded_media_assets WHERE id=?", (asset_id,)).fetchone()
+    return {"asset": dict(row), "duplicate": False}
+
+
 def final_reel_asset(final_reel_id):
     with connect() as connection:
         row = connection.execute("SELECT * FROM final_reel_assets WHERE id=?", (final_reel_id,)).fetchone()
@@ -6543,15 +6647,44 @@ def final_reel_asset(final_reel_id):
     return decoded
 
 
-def create_final_reel(source_asset_id, *, composer=None):
-    """Compose exactly one immutable Final Reel derivative from an eligible source video."""
+def _reference_asset_for_reel(connection, asset_id, asset_type):
+    """Resolve an optional contextual asset, requiring VERIFIED rights and the right type."""
+    if asset_id in (None, ""):
+        return None
+    row = connection.execute("SELECT * FROM uploaded_media_assets WHERE id=?", (asset_id,)).fetchone()
+    if row is None:
+        raise ValueError(f"Reference asset {asset_id} is not registered.")
+    asset = dict(row)
+    if asset["rights_status"] != "VERIFIED":
+        raise ValueError(f"Reference asset {asset_id} is not rights-verified for Reel use.")
+    if asset_type and asset["asset_type"] != asset_type:
+        raise ValueError(f"Reference asset {asset_id} is not a {asset_type}.")
+    return asset
+
+
+def create_final_reel(source_asset_id, *, cbn_asset_id=None, tdp_asset_id=None, composer=None):
+    """Compose exactly one immutable Final Reel derivative from an eligible source video.
+
+    Contextual CBN/TDP assets are optional; when supplied they must be rights-verified
+    rows in uploaded_media_assets, never an arbitrary path or URL.
+    """
     with connect() as connection:
         asset, job, blockers = _final_reel_source_blockers(connection, source_asset_id)
-    if blockers:
-        raise ValueError("Final Reel composition blocked: " + " ".join(blockers))
+        if blockers:
+            raise ValueError("Final Reel composition blocked: " + " ".join(blockers))
+        cbn = _reference_asset_for_reel(connection, cbn_asset_id, "PUBLIC_FIGURE_PHOTO")
+        tdp = _reference_asset_for_reel(connection, tdp_asset_id, "PARTY_LOGO")
+        storage = LocalMediaStorage(RENDER_STORAGE_ROOT)
+        contextual = {}
+        if cbn:
+            contextual["cbn"] = {"asset": cbn, "data": storage.get(cbn["storage_uri"])}
+        if tdp:
+            contextual["tdp"] = {"asset": tdp, "data": storage.get(tdp["storage_uri"])}
     composer = composer or final_reel_composer.compose_final_reel
     try:
-        result = composer(source_asset_id, connect=connect, storage_root=RENDER_STORAGE_ROOT, now=now)
+        result = composer(source_asset_id, connect=connect, storage_root=RENDER_STORAGE_ROOT, now=now,
+                          cbn_asset_id=cbn["id"] if cbn else None, tdp_asset_id=tdp["id"] if tdp else None,
+                          contextual=contextual)
     except final_reel_composer.FinalReelError as error:
         raise ValueError(f"Final Reel composition failed: {error}") from error
     if isinstance(result, dict) and result.get("id"):
@@ -7511,6 +7644,11 @@ def event_room(event_id):
     return {
         "event": dict(event), "signals": signals, "claims": claims, "runs": runs,
         "final_reels": final_reels, "final_reel_source_asset_id": final_reel_eligible,
+        "reference_media": {
+            "cbn_options": _reference_media_choices("PUBLIC_FIGURE_PHOTO"),
+            "tdp_options": _reference_media_choices("PARTY_LOGO"),
+            "all": list_uploaded_media_assets(),
+        },
         "verification_runs": verification_runs, "approved_claim_sets": approved_sets,
         "source_acquisition_runs": acquisition_runs, "official_source_registry": official_source_registry,
         "content_decision_runs": content_runs, "media_assets": media_assets,
@@ -7627,11 +7765,16 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_header("Cache-Control", "private, no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
-        self.wfile.write(data)
+        try:
+            self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError):
+            # The client closed the connection mid-stream (e.g. a paused video preview); not an error.
+            pass
 
     def read_json(self):
         length = int(self.headers.get("Content-Length", "0"))
-        if length > 10_000:
+        # Reference-media uploads carry base64 image bytes; allow up to the 12 MB asset cap.
+        if length > 20_000_000:
             raise ValueError("body too large")
         return json.loads(self.rfile.read(length) or b"{}")
 
@@ -7703,6 +7846,18 @@ class Handler(SimpleHTTPRequestHandler):
                 self.send_json({"error": "stored final reel is unavailable"}, 404)
                 return
             self.send_binary(storage.get(row["storage_uri"]), row["mime_type"])
+            return
+        if path == "/api/uploads":
+            self.send_json({"assets": list_uploaded_media_assets(dict(parse_qsl(urlparse(self.path).query)).get("type"))})
+            return
+        match = re.fullmatch(r"/api/uploads/([^/]+)/content", path)
+        if match:
+            asset = uploaded_media_asset(match.group(1))
+            storage = LocalMediaStorage(RENDER_STORAGE_ROOT)
+            if not storage.exists(asset["storage_uri"]):
+                self.send_json({"error": "stored reference asset is unavailable"}, 404)
+                return
+            self.send_binary(storage.get(asset["storage_uri"]), asset["mime_type"])
             return
         match = re.fullmatch(r"/api/derived-assets/([^/]+)/content", path)
         if match:
@@ -7813,9 +7968,20 @@ class Handler(SimpleHTTPRequestHandler):
                 )
                 self.send_json({"review": review}, 201)
                 return
+            if path == "/api/uploads":
+                self.send_json(ingest_reference_media(
+                    data=body.get("data"), filename=body.get("filename"), asset_type=body.get("asset_type"),
+                    label=body.get("label"), source_name=body.get("source_name"),
+                    source_url=body.get("source_url"), license_note=body.get("license_note"),
+                    rights_status=body.get("rights_status"), uploader=body.get("uploader"),
+                    reviewer=body.get("reviewer"), identity_subject=body.get("identity_subject"),
+                ), 201)
+                return
             match = re.fullmatch(r"/api/generated-assets/([^/]+)/final-reels", path)
             if match:
-                self.send_json({"asset": create_final_reel(match.group(1))}, 201)
+                self.send_json({"asset": create_final_reel(
+                    match.group(1), cbn_asset_id=body.get("cbn_asset_id"), tdp_asset_id=body.get("tdp_asset_id"),
+                )}, 201)
                 return
             match = re.fullmatch(r"/api/final-reels/([^/]+)/review", path)
             if match:

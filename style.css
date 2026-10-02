@@ -300,3 +300,12 @@ blockquote { margin: 6px 0; padding-left: 12px; border-left: 2px solid var(--bor
 .pre-wrap { white-space: pre-wrap; }
 .publish-controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 6px 0; }
 .schedule-input { background: var(--surface); border: 1px solid var(--border-strong); border-radius: var(--radius-sm); padding: 7px 9px; color: var(--text); }
+.final-reel-section { margin-top: 24px; display: grid; gap: 16px; }
+.reel-card { display: block; }
+.reference-block { border-top: 1px solid var(--border); padding: 12px 0; }
+.reference-block h3 { margin: 0 0 8px; font-size: 14px; }
+.reference-select { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 8px; }
+.reference-thumb { width: 72px; height: 72px; object-fit: cover; border-radius: var(--radius-sm); border: 1px solid var(--border-strong); }
+.reference-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 8px; margin-bottom: 8px; }
+.reference-grid input, .reference-grid select { background: var(--surface); border: 1px solid var(--border-strong); border-radius: var(--radius-sm); padding: 7px 9px; color: var(--text); }
+.reference-grid input[type=file] { grid-column: 1 / -1; }
