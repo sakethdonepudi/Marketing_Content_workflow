@@ -8769,6 +8769,19 @@ class Handler(SimpleHTTPRequestHandler):
             # The client closed the connection mid-stream (e.g. a paused video preview); not an error.
             pass
 
+    def send_html(self, html_text, status=200):
+        data = html_text.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        try:
+            self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
     def read_json(self):
         length = int(self.headers.get("Content-Length", "0"))
         # Reference-media uploads carry base64 image bytes; allow up to the 12 MB asset cap.
@@ -8940,6 +8953,46 @@ class Handler(SimpleHTTPRequestHandler):
                     "SELECT * FROM signals WHERE event_id=? ORDER BY detected_at", (match.group(1),)
                 )]
             self.send_json({"signals": signals})
+            return
+        if path == "/oauth/youtube/start":
+            import youtube_publishing as yp
+            # Start only requires the OAuth CLIENT (client_id/secret/redirect); the refresh token
+            # is what this flow is meant to obtain.
+            if not yp.oauth_configuration()["client_configured"]:
+                self.send_html(yp.error_page("OAuth client is not configured; set YOUTUBE_CLIENT_ID, "
+                                             "YOUTUBE_CLIENT_SECRET, YOUTUBE_REDIRECT_URI."), 400)
+                return
+            state = yp.new_csrf_state(connect=connect)
+            self.send_response(302)
+            self.send_header("Location", yp.authorization_url(state=state))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            return
+        if path == "/oauth/youtube/callback":
+            import youtube_publishing as yp
+            params = dict(parse_qsl(urlparse(self.path).query))
+            # 1) provider error -> safe page (no exchange)
+            if params.get("error"):
+                self.send_html(yp.error_page("provider_error"), 400)
+                return
+            # 2-6) validate + atomically consume state BEFORE any token exchange
+            if not yp.consume_csrf_state(params.get("state"), connect=connect):
+                self.send_html(yp.error_page("INVALID_OR_EXPIRED_STATE"), 400)
+                return
+            # 7) code required
+            if not params.get("code"):
+                self.send_html(yp.error_page("missing_code"), 400)
+                return
+            # 8) only now exchange
+            try:
+                result = yp.complete_oauth(params["code"], connect=connect)
+            except Exception as error:  # noqa: BLE001 - safe reason only
+                self.send_html(yp.error_page(yp._safe_error(error)), 400)
+                return
+            if result.get("ok"):
+                self.send_html(yp.success_page(result.get("channel_title"), result.get("channel_id_masked")))
+            else:
+                self.send_html(yp.error_page(result.get("reason") or "connection_failed"), 400)
             return
         super().do_GET()
 
@@ -9144,6 +9197,24 @@ class Handler(SimpleHTTPRequestHandler):
                     timezone_name=body.get("timezone", "Asia/Kolkata"), connect=connect,
                     video_bytes=video_bytes, requested_by=body.get("requested_by"))
                 self.send_json(result, 200 if result["duplicate"] else 201)
+                return
+            match = re.fullmatch(r"/api/youtube/videos/([^/]+)/analytics-sync", path)
+            if match:
+                import youtube_publishing as yp
+                record = yp.sync_analytics(match.group(1), connect=connect, job_id=body.get("job_id"))
+                if record is None:
+                    self.send_json({"error": "video not found"}, 404)
+                    return
+                self.send_json({"analytics": record}, 201)
+                return
+            if path == "/api/youtube/reconnect":
+                import youtube_publishing as yp
+                # Safe reconnect: clears current error state and returns the consent URL if configured.
+                yp.update_oauth_state(connect=connect, token_status="NOT_CONNECTED", clear_last_error=True)
+                url = None
+                if yp.oauth_configuration()["client_configured"]:
+                    url = "/oauth/youtube/start"
+                self.send_json({"status": "REAUTH_REQUIRED", "reconnect_url": url})
                 return
             if path == "/api/youtube/oauth/authorize-url":
                 import youtube_publishing as yp

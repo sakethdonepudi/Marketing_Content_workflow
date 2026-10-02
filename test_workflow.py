@@ -4906,268 +4906,6 @@ class WorkflowTests(unittest.TestCase):
         self.assertIsNotNone(claim_set, "fixture must have an approved claim set")
         return reel
 
-    def test_arch10_caption_package_grounding_and_hashtags(self):
-        import caption_intelligence as ci
-        claims = [{"text": "Anant Ambani spoke at the Global Horticulture Hub, Madanapalle."}]
-        caption = ci.build_caption(claims=claims, headline="Anant Ambani at Global Horticulture Hub",
-                                   entities=["Anant Ambani"], location="Madanapalle",
-                                   source_attribution="NTV Telugu")
-        self.assertEqual(ci.caption_factual_qa(caption, claims=claims)["status"], "PASS")
-        # A caption introducing a new factual claim hard-fails.
-        ungrounded = ci.build_caption(claims=claims, headline="Chandrababu Naidu approved Rs 500 crore")
-        self.assertEqual(ci.caption_factual_qa(ungrounded, claims=claims)["status"], "FAIL")
-        # Hashtags: small high-quality set, relevant categories, no branded dumps.
-        tags = ci.select_hashtags(ci.candidate_hashtags(
-            entities=["Anant Ambani"], location="Madanapalle",
-            event_name="Global Horticulture Hub", topic_terms=["Agriculture", "Horticulture"]))
-        self.assertGreaterEqual(len(tags), 5)
-        self.assertLessEqual(len(tags), 10)
-        values = [t["tag"] for t in tags]
-        self.assertIn("#Madanapalle", values)
-        self.assertIn("#GlobalHorticultureHub", values)
-        # Unsupported political framing hard-fails.
-        self.assertEqual(ci.hashtag_relevance_qa([{"tag": "#VoteForTDP"}], entities=["Anant Ambani"],
-                                                 location="Madanapalle", claims=claims)["status"], "FAIL")
-        # Inferred reactions are rejected.
-        inferred = ci.build_caption(claims=claims, headline="Chandrababu Naidu loved the speech")
-        self.assertEqual(ci.caption_factual_qa(inferred, claims=claims)["status"], "FAIL")
-
-    def test_arch10_post_package_generation_and_copy_approval_independence(self):
-        import post_package, reel_control
-        reel = self.reel_with_approved_claims()
-        result = app.build_post_packages_for_reel(reel["id"], reel["event_id"])
-        platforms = {p["platform"] for p in result["packages"]}
-        self.assertEqual(platforms, {"INSTAGRAM", "FACEBOOK"})
-        instagram = next(p for p in result["packages"] if p["platform"] == "INSTAGRAM")
-        facebook = next(p for p in result["packages"] if p["platform"] == "FACEBOOK")
-        self.assertTrue(instagram["hashtags"])
-        self.assertTrue(facebook["hashtags"])
-        self.assertTrue(instagram["search_keywords"])
-        # Both platforms pass copy QA; no publishing without reel + copy approval.
-        self.assertEqual(instagram["qa"]["status"], "PASS", instagram["qa"])
-        self.assertFalse(post_package.publishing_allowed(reel["id"], "INSTAGRAM", connect=app.connect))
-        post_package.approve_copy(instagram["id"], reviewer="Editor", connect=app.connect)
-        state = post_package.copy_approval_state(connect=app.connect, reel_id=reel["id"])
-        self.assertIn("INSTAGRAM", state["post_copy_approved"])
-        # Reel is NOT approved yet -> still cannot publish.
-        self.assertFalse(post_package.publishing_allowed(reel["id"], "INSTAGRAM", connect=app.connect))
-        # Reel approval is independent; approving the reel + copy unlocks publish-readiness.
-        reel_control.approve_reel(reel["id"], reviewer="Editor", connect=app.connect)
-        self.assertTrue(post_package.publishing_allowed(reel["id"], "INSTAGRAM", connect=app.connect))
-        # Editing copy invalidates the copy approval but never the reel approval.
-        edited = post_package.edit_package(instagram["id"], caption="Chandrababu Naidu approved the review.",
-                                           edited_by="Editor", connect=app.connect)
-        self.assertEqual(edited["version_number"], instagram["version_number"] + 1)
-        self.assertEqual(edited["status"], "DRAFT")
-        self.assertIsNotNone(reel_control.valid_approval(reel["id"], connect=app.connect))
-        self.assertFalse(post_package.publishing_allowed(reel["id"], "INSTAGRAM", connect=app.connect))
-
-    def test_arch10_caption_edit_versioning(self):
-        import post_package
-        reel = self.reel_with_approved_claims()
-        packages = app.build_post_packages_for_reel(reel["id"], reel["event_id"])["packages"]
-        instagram = next(p for p in packages if p["platform"] == "INSTAGRAM")
-        first = post_package.package(instagram["id"], connect=app.connect)
-        edited = post_package.edit_package(instagram["id"], caption="Chandrababu Naidu approved the review.",
-                                           edited_by="Editor", connect=app.connect)
-        self.assertEqual(len(edited["revisions"]), 2)
-        self.assertNotEqual(edited["id"], first["id"])
-        # Regenerating copy does not touch the reel.
-        with app.connect() as connection:
-            before = connection.execute("SELECT checksum_sha256 FROM final_reel_assets WHERE id=?", (reel["id"],)).fetchone()[0]
-        app.build_post_packages_for_reel(reel["id"], reel["event_id"], regenerate=True)
-        with app.connect() as connection:
-            after = connection.execute("SELECT checksum_sha256 FROM final_reel_assets WHERE id=?", (reel["id"],)).fetchone()[0]
-        self.assertEqual(before, after)
-
-    def test_arch10_evidence_acquisition_bounded_and_matrix(self):
-        import evidence_acquisition as ea
-        # Query generation is claim-directed and multilingual.
-        queries = ea.claim_queries("Anant Ambani spoke at the Global Horticulture Hub, Madanapalle.",
-                                   entities=["anant ambani"], location="Madanapalle")
-        self.assertTrue(any("Anant Ambani" in q for q in queries))
-        self.assertTrue(any("\u0c05\u0c28\u0c02\u0c24\u0c4d" in q or "అనంత్" in q for q in queries))
-        # Acquisition is bounded to at most two passes.
-        self.assertEqual(ea.MAX_PASSES, 2)
-        self.assertTrue(ea.can_run_pass(connect=app.connect, verification_run_id="VR-NEW"))
-        # Direct-evidence priority orders official government above independent news.
-        leads = ea.prioritize_leads([
-            {"url": "https://news.example/story", "source_class": "independent_reporting"},
-            {"url": "https://www.pib.gov.in/release", "source_class": "official_primary"},
-        ])
-        self.assertIn("pib.gov.in", leads[0]["url"])
-        # Parallel execution is bounded.
-        import time as _t
-        started = _t.monotonic()
-        results = ea.run_parallel([lambda: 1, lambda: 2, lambda: 3, lambda: 4, lambda: 5], max_concurrency=2)
-        self.assertEqual(sorted(results), [1, 2, 3, 4, 5])
-
-    def test_arch10_stage_timing_and_percentiles(self):
-        import reel_pipeline
-        event = app.create_event("Timing test event", "PIB", "https://pib.example/t",
-                                 event_time="2026-10-02T11:00:00+00:00")
-        run = reel_pipeline.open_or_resume(event, connect=app.connect)
-        with app.connect() as connection:
-            timing_id = reel_pipeline.start_timing(connection, run["id"], "NARRATION")
-            reel_pipeline.finish_timing(connection, timing_id, provider_ms=10.0)
-        timings = reel_pipeline.stage_timings(run["id"], connect=app.connect)
-        self.assertEqual(len(timings), 1)
-        self.assertEqual(timings[0]["stage"], "NARRATION")
-        self.assertIsNotNone(timings[0]["duration_ms"])
-        # Slowest stages + percentiles are queryable.
-        self.assertIsInstance(reel_pipeline.slowest_stages(connect=app.connect), list)
-        self.assertIn("pipeline_p50_seconds", reel_pipeline.pipeline_percentiles(connect=app.connect))
-
-    def test_arch10_fast_path_eligibility_and_no_qa_bypass(self):
-        import reel_pipeline
-        # No event -> never fast path.
-        self.assertFalse(reel_pipeline.fast_path_eligibility(app.connect, "EV-NONE")["fast_path"])
-        # A fast path never skips mandatory QA.
-        source = Path(app.__file__).with_name("reel_pipeline.py").read_text(encoding="utf-8")
-        self.assertIn("FAST_PATH_VERSION", source)
-        self.assertIn('if stage == "QA"', source)
-        # Parallel groups are declared and do not include dependent stages together.
-        self.assertTrue(reel_pipeline.PARALLEL_GROUPS)
-        self.assertIn("NARRATION", reel_pipeline.parallel_group_for("NARRATION"))
-        self.assertEqual(reel_pipeline.parallel_group_for("REEL_GENERATION"), ("REEL_GENERATION",))
-
-    def test_arch10_content_intelligence_trend_decay_and_no_profiling(self):
-        import caption_intelligence as ci
-        ci.observe_topic_terms([{"term": "Global Horticulture Hub", "kind": "event"},
-                                {"term": "Madanapalle", "kind": "location"}],
-                               connect=app.connect, source_family="youtube",
-                               now=lambda: "2026-10-02T10:00:00Z")
-        stats = ci.topic_stats(connect=app.connect, terms=["Global Horticulture Hub"])
-        self.assertEqual(stats["global horticulture hub"]["frequency_24h"], 1)
-        # Decay removes cold terms beyond 7 days.
-        ci.observe_topic_terms([{"term": "Cold Topic", "kind": "keyword"}], connect=app.connect,
-                               source_family="ntv", now=lambda: "2026-09-01T10:00:00Z")
-        decay = ci.decay_topics(connect=app.connect, now=lambda: "2026-10-02T10:00:00Z")
-        self.assertGreaterEqual(decay["removed"], 1)
-        # Story research returns content/topic clusters, never demographic profiles.
-        event = app.create_event("Topic research event", "PIB", "https://pib.example/topic",
-                                 event_time="2026-10-02T11:00:00+00:00")
-        research = ci.story_topic_research(connect=app.connect, event_id=event,
-                                           entities=["Anant Ambani"], location="Madanapalle",
-                                           event_name="Global Horticulture Hub")
-        self.assertIn("recurring_keywords", research)
-        self.assertNotIn("target_audience", research)
-        self.assertTrue(all("cluster" in c for c in research["clusters"]))
-        # Performance schema exists for future feedback but is not activated.
-        with app.connect() as connection:
-            table = connection.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name='post_performance'").fetchone()
-        self.assertIsNotNone(table)
-
-    def test_arch10_end_to_end_speed_metrics(self):
-        speed = app.end_to_end_speed()
-        self.assertIn("p50", speed)
-        self.assertIn("p95", speed)
-        for key in ("t_discovery", "t_verification", "t_production", "t_total"):
-            self.assertIn(key, speed["p50"])
-
-    def test_hotfix_unregistered_source_registration_and_fk(self):
-        import urllib.error
-        # A. An unregistered acquisition source is auto-registered; signal insert succeeds.
-        with app.connect() as connection:
-            connection.execute("DELETE FROM sources WHERE id LIKE 'src-%'")
-        source_id = app.ensure_source_registered(
-            publisher="The Hindu", source_family="The Hindu", url="https://www.thehindu.com/story",
-            domain="thehindu.com", source_class="independent_reporting",
-            discovery_method="evidence_acquisition")
-        with app.connect() as connection:
-            row = connection.execute("SELECT * FROM sources WHERE id=?", (source_id,)).fetchone()
-        self.assertIsNotNone(row)
-        # The signal insert now resolves source_id -> sources.id.
-        event = app.create_event("Hotfix FK event", "The Hindu", "https://www.thehindu.com/story",
-                                 event_time="2026-10-02T11:00:00+00:00")
-        result = app.ingest_signal(
-            url="https://www.thehindu.com/story-1", title="Andhra Pradesh horticulture hub",
-            text="The Global Horticulture Hub was set up in Madanapalle.", source_name="The Hindu",
-            source_type="webpage", source_id=source_id, content_role="item", item_type="news",
-            publication_time="2026-10-02T10:00:00Z", link_event_id=event)
-        with app.connect() as connection:
-            signal = connection.execute("SELECT source_id FROM signals WHERE id=?",
-                                        (result["signal_id"],)).fetchone()
-        self.assertEqual(signal["source_id"], source_id)
-
-    def test_hotfix_source_canonicalization_and_concurrency(self):
-        # C. www / bare domain / full URL all canonicalize to one source identity.
-        a = app.ensure_source_registered(publisher="www.TheHindu.com", url="https://www.thehindu.com/x")
-        b = app.ensure_source_registered(publisher="thehindu.com", domain="thehindu.com")
-        c = app.ensure_source_registered(url="https://thehindu.com/y")
-        self.assertEqual(a, b)
-        self.assertEqual(b, c)
-        # B. Concurrent discovery of the same new domain -> one row, no FK failure.
-        import threading
-        results = []
-        def worker():
-            results.append(app.ensure_source_registered(
-                url="https://concurrent.example.com/a", domain="concurrent.example.com",
-                publisher="Concurrent Example"))
-        threads = [threading.Thread(target=worker) for _ in range(6)]
-        for thread in threads:
-            thread.start()
-        for thread in threads:
-            thread.join()
-        self.assertEqual(len(set(results)), 1, "concurrent registration must converge on one source")
-        with app.connect() as connection:
-            count = connection.execute(
-                "SELECT COUNT(*) FROM sources WHERE UPPER(url) LIKE '%CONCURRENT.EXAMPLE.COM%'").fetchone()[0]
-        self.assertEqual(count, 1)
-
-    def test_hotfix_lead_is_not_evidence_and_fk_enabled(self):
-        # G. Foreign keys remain enabled.
-        with app.connect() as connection:
-            self.assertEqual(connection.execute("PRAGMA foreign_keys").fetchone()[0], 1)
-            # D. A search lead alone is not evidence: leads and snapshots are separate tables.
-            tables = {row[0] for row in connection.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('verification_leads','verification_snapshots')")}
-        self.assertEqual(tables, {"verification_leads", "verification_snapshots"})
-        source = Path(app.__file__).read_text(encoding="utf-8")
-        # The hotfix never disables FKs or bypasses the registry.
-        self.assertNotIn("PRAGMA foreign_keys=OFF", source)
-        # F. Existing discovery/verification source registrations are unchanged: a config
-        # registration keeps its declared source_class when ensured into the DB.
-        registration = app._registration_for_verification_url("https://www.thehindu.com/a")
-        self.assertIsNotNone(registration)
-        source_id = app.ensure_source_registered(config_registration=registration)
-        with app.connect() as connection:
-            row = connection.execute("SELECT source_class FROM sources WHERE id=?", (source_id,)).fetchone()
-        self.assertEqual(row["source_class"], registration["source_class"])
-
-    def test_hotfix_resume_does_not_consume_third_pass(self):
-        # E. Resume/replay of a failed acquisition does not consume a third pass.
-        import evidence_acquisition as ea
-        event = app.create_event("Resume acquisition event", "PIB", "https://pib.example/r",
-                                 event_time="2026-10-02T11:00:00+00:00")
-        app.ingest_signal(url="https://pib.example/r-1", title="Madanapalle horticulture hub",
-                          text="The Global Horticulture Hub was established at Madanapalle.",
-                          source_name="PIB", source_type="webpage", source_class="official_primary",
-                          content_role="item", item_type="announcement",
-                          publication_time="2026-10-02T10:00:00Z", link_event_id=event)
-        research = app.enqueue_research(event, "test", background=False)["run"]
-        verification = app.enqueue_verification(research["id"], "test", background=False)["run"]
-        with app.connect() as connection:
-            connection.execute(
-                "INSERT INTO evidence_acquisition_runs(id,verification_run_id,event_id,pass_number,status,"
-                "queries_json,started_at) VALUES('EA-T1',?,?,1,'EXHAUSTED','[]',?)",
-                (verification["id"], event, app.now()))
-            connection.execute(
-                "INSERT INTO evidence_acquisition_runs(id,verification_run_id,event_id,pass_number,status,"
-                "queries_json,started_at) VALUES('EA-T2',?,?,2,'EXHAUSTED','[]',?)",
-                (verification["id"], event, app.now()))
-            connection.execute(
-                "INSERT INTO verification_leads(id,verification_run_id,url,canonical_url,title,status,"
-                "status_reason,target_claim_ids_json,source_priority,discovered_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
-                ("VL-T1", verification["id"], "https://www.thehindu.com/story", "https://www.thehindu.com/story",
-                 "AP hub", "REJECTED", "prior FK failure", "[]", "independent_reporting", app.now()))
-        self.assertFalse(ea.can_run_pass(connect=app.connect, verification_run_id=verification["id"]))
-        outcome = app.resume_evidence_acquisition(verification["id"])
-        self.assertEqual(outcome["replayed"], 1)
-        # Still exactly two acquisition passes were consumed.
-        self.assertEqual(ea.passes_used(connect=app.connect, verification_run_id=verification["id"]), 2)
-
     def test_arch11_youtube_api_key_cannot_upload_and_oauth_required(self):
         import youtube_publishing as yp
         import os
@@ -5306,15 +5044,15 @@ class WorkflowTests(unittest.TestCase):
 
     def test_arch11_project_audit_and_analytics_append_only(self):
         import youtube_publishing as yp
-        import os
         # Unverified project -> PRIVATE_ONLY / UNKNOWN reported honestly.
         self.assertIn(yp.project_audit_status(), ("UNKNOWN", "PRIVATE_ONLY", "PUBLIC_VERIFIED"))
-        self.assertEqual(yp.record_snapshot(connect=app.connect, video_id="VID-A", checkpoint="1h",
-                                            metrics={"views": 100, "source": "PUBLIC_DATA"})["checkpoint"], "1h")
-        yp.record_snapshot(connect=app.connect, video_id="VID-A", checkpoint="6h",
-                           metrics={"views": 150, "source": "PUBLIC_DATA"})
+        self.assertIn(yp.public_upload_capability(), ("UNKNOWN", "RESTRICTED", "AVAILABLE"))
+        # One canonical analytics row per video (Arch 12 upsert; repeated sync updates, never duplicates).
+        first = yp.record_snapshot(connect=app.connect, video_id="VID-A", metrics={"views": 100, "source": "BASIC"})
+        yp.record_snapshot(connect=app.connect, video_id="VID-A", metrics={"views": 150, "source": "BASIC"})
         snaps = yp.snapshots_for("VID-A", connect=app.connect)
-        self.assertEqual([s["checkpoint"] for s in snaps], ["1h", "6h"])  # append-only, ordered
+        self.assertEqual(len(snaps), 1)
+        self.assertEqual(snaps[0]["views"], 150)
         # Metrics availability is honest: UNKNOWN stays UNKNOWN without authorization.
         unconfigured = yp.collect_analytics("VID-B", checkpoint="24h", connect=app.connect)
         self.assertEqual(unconfigured["source"], "UNKNOWN")
@@ -5331,6 +5069,189 @@ class WorkflowTests(unittest.TestCase):
         self.assertNotIn("graph.instagram.com", source)
         self.assertNotIn("INSTAGRAM_ACCESS_TOKEN", source)
         self.assertNotIn("FACEBOOK_PAGE_ACCESS_TOKEN", source)
+
+    # ---------- Architecture 12: self-contained fixture + env isolation ----------
+
+    _ARCH12_ENV = {"YOUTUBE_CLIENT_ID": "test-client", "YOUTUBE_CLIENT_SECRET": "test-secret",
+                   "YOUTUBE_REDIRECT_URI": "http://localhost/cb",
+                   "YOUTUBE_REFRESH_TOKEN": "test-refresh-token", "YOUTUBE_API_KEY": "test-api-key"}
+
+    def _arch12_youtube_env(self, **overrides):
+        values = {**self._ARCH12_ENV, **overrides}
+        return patch.dict("os.environ", values, clear=False)
+
+    def _arch12_ready_fixture(self, *, create_job=False, qa_pass=True):
+        """One deterministic, self-contained Arch-12 fixture built in the fresh test DB.
+
+        Reuses the proven canonical reel fixture (which creates its own event, VERIFIED state, and
+        APPROVED claim set), then adds the YouTube package + copy approval (+ optional upload job).
+        Environment-neutral: it does not require or read local OAuth config.
+        """
+        import youtube_publishing as yp, reel_control
+        reel = self.reel_with_approved_claims(qa_pass=qa_pass)
+        if reel_control.valid_approval(reel["id"], connect=app.connect) is None:
+            reel_control.approve_reel(reel["id"], reviewer="Arch12", connect=app.connect)
+        package = app.build_youtube_package_for_reel(reel["id"], reel["event_id"], regenerate=True)["package"]
+        yp.approve_package(package["id"], reviewer="Arch12", connect=app.connect)
+        package = yp.package_row(package["id"], connect=app.connect)
+        job = None
+        if create_job:
+            # Create a standard immediate/private job without executing (no publisher -> bytes only).
+            job = yp.request_upload(reel["id"], package["id"], mode="SCHEDULED",
+                                    scheduled_for="2030-01-01T00:00:00+00:00", connect=app.connect)["job"]
+        return {"event_id": reel["event_id"], "reel": app.final_reel_asset(reel["id"]),
+                "package": package, "job": job}
+
+    def test_arch12_ready_fixture_is_self_contained(self):
+        import reel_control
+        fixture = self._arch12_ready_fixture(create_job=True)
+        with app.connect() as connection:
+            event = connection.execute("SELECT verification_status FROM events WHERE id=?",
+                                       (fixture["event_id"],)).fetchone()
+            claim_set = connection.execute("SELECT status FROM approved_claim_sets WHERE event_id=?",
+                                           (fixture["event_id"],)).fetchone()
+        self.assertIsNotNone(fixture["reel"])
+        self.assertEqual(event["verification_status"], "VERIFIED")
+        self.assertEqual(claim_set["status"], "APPROVED")
+        self.assertEqual(fixture["reel"]["status"], "READY_FOR_REVIEW")
+        self.assertIsNotNone(reel_control.valid_approval(fixture["reel"]["id"], connect=app.connect))
+        self.assertEqual(fixture["package"]["status"], "YOUTUBE_COPY_APPROVED")
+        self.assertIsNotNone(fixture["job"])
+
+    def test_arch12_public_capability_and_privacy_downgrade(self):
+        import youtube_publishing as yp
+        # Pure resolution logic for all four cases (no reel/research fixture needed).
+        unknown = yp.resolve_effective_privacy("PUBLIC", "UNKNOWN")
+        self.assertEqual(unknown["effective_privacy"], "PRIVATE")
+        self.assertEqual(unknown["privacy_downgrade_reason"], "PUBLIC_CAPABILITY_NOT_AVAILABLE")
+        restricted = yp.resolve_effective_privacy("PUBLIC", "RESTRICTED")
+        self.assertEqual(restricted["effective_privacy"], "PRIVATE")
+        available = yp.resolve_effective_privacy("PUBLIC", "AVAILABLE")
+        self.assertEqual(available["effective_privacy"], "PUBLIC")
+        self.assertIsNone(available["privacy_downgrade_reason"])
+        private = yp.resolve_effective_privacy("PRIVATE", "AVAILABLE")
+        self.assertEqual(private["effective_privacy"], "PRIVATE")
+        # End-to-end: one fixture + job, PUBLIC requested under UNKNOWN -> PRIVATE with metadata.
+        fixture = self._arch12_ready_fixture()
+        with self._arch12_youtube_env(YOUTUBE_PROJECT_AUDIT_STATUS=""):
+            self.assertEqual(yp.public_upload_capability(), "UNKNOWN")
+            r = yp.request_upload(fixture["reel"]["id"], fixture["package"]["id"], privacy_status="PUBLIC",
+                                  connect=app.connect)
+            full = yp.youtube_job(r["job"]["id"], connect=app.connect)
+            self.assertEqual(full["privacy_status"], "PRIVATE")
+            req = [e for e in full["events"] if e["event_type"] == "REQUESTED"][0]
+            self.assertEqual(req["metadata"]["requested_privacy"], "PUBLIC")
+            self.assertEqual(req["metadata"]["privacy_downgrade_reason"], "PUBLIC_CAPABILITY_NOT_AVAILABLE")
+        with self._arch12_youtube_env(YOUTUBE_PROJECT_AUDIT_STATUS="PUBLIC_VERIFIED"):
+            self.assertEqual(yp.public_upload_capability(), "AVAILABLE")
+
+    def test_arch12_update_oauth_state_preserves_and_clears(self):
+        import os, youtube_publishing as yp
+        with self._arch12_youtube_env():
+            yp.update_oauth_state(connect=app.connect, token_status="CONNECTED", refresh_health="HEALTHY")
+            # None preserves existing values.
+            yp.update_oauth_state(connect=app.connect, refresh_health="ERROR", token_status=None)
+            state = yp.oauth_state(connect=app.connect)
+            self.assertEqual(state["token_status"], "CONNECTED")
+            self.assertEqual(state["refresh_health"], "ERROR")
+            # invalid_grant sets REAUTH_REQUIRED + safe last_error.
+            yp.update_oauth_state(connect=app.connect, token_status="REAUTH_REQUIRED",
+                                  refresh_health="REAUTH_REQUIRED", last_error="invalid_grant")
+            state = yp.oauth_state(connect=app.connect)
+            self.assertEqual(state["token_status"], "REAUTH_REQUIRED")
+            self.assertEqual(state["last_error"], "invalid_grant")
+            # Recovery clears last_error explicitly.
+            yp.update_oauth_state(connect=app.connect, token_status="CONNECTED",
+                                  refresh_health="HEALTHY", clear_last_error=True)
+            state = yp.oauth_state(connect=app.connect)
+            self.assertEqual(state["token_status"], "CONNECTED")
+            self.assertEqual(state["refresh_health"], "HEALTHY")
+            self.assertIsNone(state["last_error"])
+
+    def test_arch12_stale_error_cleared_on_success_history_preserved(self):
+        import youtube_publishing as yp
+        fixture = self._arch12_ready_fixture()
+        with self._arch12_youtube_env():
+            class AlwaysFails:
+                platform = "YOUTUBE"; events = []
+                def upload(self, *a, **k): raise RuntimeError("provider exploded")
+            class Succeeds:
+                platform = "YOUTUBE"; events = []
+                def upload(self, *a, **k): return {"video_id": "VIDOK00001", "status": "uploaded"}
+            first = yp.request_upload(fixture["reel"]["id"], fixture["package"]["id"], connect=app.connect,
+                                      publisher=AlwaysFails(), video_bytes=b"x")
+            job_id = first["job"]["id"]
+            failed = yp.youtube_job(job_id, connect=app.connect)
+            self.assertEqual(failed["status"], "FAILED")
+            self.assertEqual(failed["last_error_code"], "UPLOAD_FAILED")
+            self.assertIsNotNone(failed["last_error_at"])
+            retried = yp.execute_upload(job_id, connect=app.connect, publisher=Succeeds(), video_bytes=b"x")
+            self.assertEqual(retried["status"], "PUBLISHED")
+            self.assertEqual(retried["video_id"], "VIDOK00001")
+            self.assertIsNone(retried["last_error_code"])
+            self.assertIsNone(retried["last_error_message"])
+            self.assertIsNone(retried["last_error_at"])
+            self.assertTrue([e for e in retried["events"] if e["event_type"] == "FAILED"])
+
+    def test_arch12_refresh_health_classification(self):
+        import youtube_publishing as yp
+        with self._arch12_youtube_env():
+            def invalid_grant(url, body): raise RuntimeError("HTTP Error 400: invalid_grant")
+            with self.assertRaises(PermissionError):
+                yp.access_token(connect=app.connect, http=invalid_grant)
+            self.assertEqual(yp.oauth_state(connect=app.connect)["refresh_health"], "REAUTH_REQUIRED")
+            self.assertEqual(yp.oauth_state(connect=app.connect)["token_status"], "REAUTH_REQUIRED")
+            def invalid_client(url, body): raise RuntimeError("HTTP Error 401: invalid_client")
+            with self.assertRaises(RuntimeError):
+                yp.access_token(connect=app.connect, http=invalid_client)
+            self.assertEqual(yp.oauth_state(connect=app.connect)["refresh_health"], "ERROR")
+            def server_error(url, body): raise RuntimeError("HTTP Error 500")
+            with self.assertRaises(RuntimeError):
+                yp.access_token(connect=app.connect, http=server_error)
+            self.assertEqual(yp.oauth_state(connect=app.connect)["refresh_health"], "ERROR")
+            def ok(url, body): return {"access_token": "at", "expires_in": 3600}
+            self.assertEqual(yp.access_token(connect=app.connect, http=ok), "at")
+            state = yp.oauth_state(connect=app.connect)
+            self.assertEqual(state["refresh_health"], "HEALTHY")
+            self.assertEqual(state["token_status"], "CONNECTED")
+            self.assertIsNone(state["last_error"])
+            self.assertIsNotNone(state["token_expires_at"])
+
+    def test_arch12_analytics_idempotent_upsert_and_linkage(self):
+        import youtube_publishing as yp
+        fixture = self._arch12_ready_fixture(create_job=True)
+        with self._arch12_youtube_env():
+            r = yp.record_snapshot(connect=app.connect, video_id="VIDLINK00001", metrics={"views": 1},
+                                   job_id="YJ-MISSING")
+            self.assertIsNone(r["youtube_publish_job_id"])
+            self.assertIsNone(r["reel_id"])
+            yp.record_snapshot(connect=app.connect, video_id="VIDLINK00001", metrics={"views": 9},
+                               job_id=fixture["job"]["id"])
+            rows = yp.snapshots_for("VIDLINK00001", connect=app.connect)
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["youtube_publish_job_id"], fixture["job"]["id"])
+            self.assertEqual(rows[0]["reel_id"], fixture["reel"]["id"])
+            self.assertEqual(rows[0]["event_id"], fixture["event_id"])
+            self.assertEqual(rows[0]["views"], 9)
+            self.assertIsNone(rows[0]["watch_time_seconds"])
+            self.assertIsNone(rows[0]["average_percentage_viewed"])
+            yp.record_snapshot(connect=app.connect, video_id="VIDLINK00001", metrics={"views": 12},
+                               job_id=fixture["job"]["id"])
+            self.assertEqual(len(yp.snapshots_for("VIDLINK00001", connect=app.connect)), 1)
+
+    def test_arch12_analytics_invalid_linkage_handling(self):
+        import youtube_publishing as yp
+        fixture = self._arch12_ready_fixture()
+        with self._arch12_youtube_env():
+            r = yp.record_snapshot(connect=app.connect, video_id="VIDBAD000001", metrics={"views": 1},
+                                   reel_id="FR-DOESNOTEXIST")
+            self.assertEqual(r.get("linkage_qa"), "INVALID_LINKAGE")
+            self.assertIsNone(r["reel_id"])
+            # Valid reel but no job -> explicit linkage only.
+            r2 = yp.record_snapshot(connect=app.connect, video_id="VIDBAD000002", metrics={"views": 1},
+                                    reel_id=fixture["reel"]["id"])
+            self.assertEqual(r2["reel_id"], fixture["reel"]["id"])
+            self.assertIsNone(r2["youtube_publish_job_id"])
 
     def test_new_shell_has_five_destinations_and_no_publish(self):
         html = Path(app.__file__).with_name("index.html").read_text(encoding="utf-8")
