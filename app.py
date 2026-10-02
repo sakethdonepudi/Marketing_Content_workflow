@@ -8903,10 +8903,13 @@ class Handler(SimpleHTTPRequestHandler):
             return
         if path == "/api/health":
             workspace = workspace_identity()
+            import persistence, media_storage
             self.send_json({
                 "ok": True,
                 "workspace_key": workspace["workspace_key"],
                 "grok_configured": bool(os.environ.get("XAI_API_KEY")),
+                **persistence.health_status(),
+                **media_storage.storage_health_status(RENDER_STORAGE_ROOT),
             })
             return
         if path.startswith("/api/") and self._auth_required() and self._current_user() is None:
@@ -8943,14 +8946,6 @@ class Handler(SimpleHTTPRequestHandler):
             return
         if path == "/api/overview":
             self.send_json(overview())
-            return
-        if path == "/api/health":
-            workspace = workspace_identity()
-            self.send_json({
-                "ok": True,
-                "workspace_key": workspace["workspace_key"],
-                "grok_configured": bool(os.environ.get("XAI_API_KEY")),
-            })
             return
         match = re.fullmatch(r"/api/events/([^/]+)", path)
         if match:
@@ -9491,8 +9486,9 @@ class Handler(SimpleHTTPRequestHandler):
 
 if __name__ == "__main__":
     # Fail closed BEFORE serving if the environment is misconfigured (Architecture 14).
-    import persistence
+    import persistence, media_storage
     persistence.assert_environment_isolation()
+    media_storage.assert_storage_configuration()
     init()
     recover_interrupted_publish_jobs()
     start_publish_scheduler()

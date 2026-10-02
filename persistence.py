@@ -51,6 +51,8 @@ def staging_points_at_production():
 def assert_environment_isolation():
     if environment_name() == "staging" and staging_points_at_production():
         raise PersistenceError("staging must not share the production database")
+    if environment_name() == "staging" and not os.environ.get("STAGING_DATABASE_URL"):
+        raise PersistenceError("staging requires STAGING_DATABASE_URL (no silent SQLite fallback)")
     if environment_name() == "production" and not os.environ.get("PRODUCTION_DATABASE_URL"):
         raise PersistenceError("production requires PRODUCTION_DATABASE_URL")
 
@@ -215,3 +217,23 @@ def open_connection(*, sqlite_path=None, environment=None):
     if env in ("staging", "production") and not url:
         raise PersistenceError(f"{env} requires a database URL")
     return SQLiteConnection(sqlite_path or os.environ.get("REACHOUT_DB") or "reachout.sqlite3")
+
+
+def health_status():
+    """Safe backend status for /api/health: backend name + connectivity only (no URLs/secrets)."""
+    env = environment_name()
+    url = database_url(environment=env)
+    backend = "postgres" if url and url.startswith(("postgres://", "postgresql://", "postgresql+", "postgres+")) else "sqlite"
+    connected = False
+    try:
+        if backend == "postgres":
+            assert_environment_isolation()
+        connection = open_connection()
+        try:
+            connection.execute("SELECT 1").fetchone()
+            connected = True
+        finally:
+            connection.close()
+    except Exception:  # noqa: BLE001 - status only, never leak the error text
+        connected = False
+    return {"database_backend": backend, "database_connected": connected, "environment": env}

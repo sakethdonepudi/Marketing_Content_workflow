@@ -5561,6 +5561,76 @@ class WorkflowTests(unittest.TestCase):
                          "STAGING_YOUTUBE_UPLOADS_ENABLED", "DASHBOARD_COOKIE_SECURE"):
             self.assertIn(required, keys)
 
+    def test_arch14_storage_save_at_delete_and_self_test(self):
+        import os, media_storage
+        from tools import storage_self_test
+        # Local adapter: deterministic save_at + read + delete, with traversal protection.
+        with patch.dict(os.environ, {"STORAGE_BACKEND": "local", "APP_ENV": "staging"}, clear=False):
+            storage = media_storage.LocalMediaStorage(app.RENDER_STORAGE_ROOT)
+            uri = "local://staging/self-test/unit-a.txt"
+            storage.save_at(uri, b"exact-bytes")
+            self.assertEqual(storage.get(uri), b"exact-bytes")
+            self.assertTrue(storage.delete(uri))
+            self.assertFalse(storage.delete(uri))  # absent -> False
+            with self.assertRaises(ValueError):
+                storage.save_at("local://../escape.txt", b"x")  # traversal blocked
+            # Self-test prefix is environment-scoped.
+            self.assertEqual(media_storage.self_test_prefix(), "staging/self-test")
+            report = storage_self_test.run(root=str(app.RENDER_STORAGE_ROOT))
+            self.assertEqual(report["write"], "PASS")
+            self.assertEqual(report["read"], "PASS")
+            self.assertEqual(report["byte_verification"], "PASS")
+            self.assertEqual(report["delete"], "PASS")
+            self.assertEqual(report["cleanup_verified"], "PASS")
+
+    def test_arch14_s3_adapter_mocked_and_fail_closed(self):
+        import os, media_storage
+        # Missing S3 config fails closed listing variable NAMES only.
+        with patch.dict(os.environ, {"STORAGE_BACKEND": "s3", "S3_BUCKET": "", "S3_ENDPOINT_URL": "",
+                                     "S3_REGION": "", "S3_ACCESS_KEY_ID": "", "S3_SECRET_ACCESS_KEY": "supersecret"},
+                        clear=False):
+            with self.assertRaises(ValueError) as caught:
+                media_storage.assert_storage_configuration()
+            self.assertIn("S3_BUCKET", str(caught.exception))
+            self.assertNotIn("supersecret", str(caught.exception))
+        # Full config -> PASS.
+        with patch.dict(os.environ, {"STORAGE_BACKEND": "s3", "S3_BUCKET": "b", "S3_ENDPOINT_URL": "https://r2",
+                                     "S3_REGION": "auto", "S3_ACCESS_KEY_ID": "k", "S3_SECRET_ACCESS_KEY": "s"},
+                        clear=False):
+            self.assertEqual(media_storage.assert_storage_configuration()["storage_configured"], True)
+        # Mocked S3 save_at/get/delete round-trip.
+        store = {}
+        class MockClient:
+            def put_object(self, Bucket, Key, Body, **kw): store[Key] = bytes(Body)
+            def get_object(self, Bucket, Key): return {"Body": type("B", (), {"read": lambda self: store[Key]})()}
+            def delete_object(self, Bucket, Key): store.pop(Key, None)
+            def head_object(self, Bucket, Key):
+                if Key not in store: raise RuntimeError("missing")
+        with patch.dict(os.environ, {"STORAGE_BACKEND": "s3", "S3_BUCKET": "b", "S3_ENDPOINT_URL": "https://r2",
+                                     "S3_REGION": "auto", "S3_ACCESS_KEY_ID": "k", "S3_SECRET_ACCESS_KEY": "s"},
+                        clear=False):
+            storage = media_storage.S3MediaStorage()
+            storage._client = MockClient()
+            result = storage.save_at("s3://b/staging/self-test/unit.txt", b"abc")
+            self.assertEqual(result.storage_uri, "s3://b/staging/self-test/unit.txt")
+            self.assertEqual(storage.get("s3://b/staging/self-test/unit.txt"), b"abc")
+            self.assertTrue(storage.delete("s3://b/staging/self-test/unit.txt"))
+            self.assertFalse(storage.exists("s3://b/staging/self-test/unit.txt"))
+
+    def test_arch14_health_reports_safe_backend_status(self):
+        import os, json, persistence, media_storage
+        with patch.dict(os.environ, {"STORAGE_BACKEND": "local"}, clear=False):
+            db = persistence.health_status()
+            st = media_storage.storage_health_status(app.RENDER_STORAGE_ROOT)
+        self.assertIn(db["database_backend"], ("sqlite", "postgres"))
+        self.assertIn("database_connected", db)
+        self.assertEqual(st["storage_backend"], "local")
+        self.assertIn("storage_connected", st)
+        # No secrets or URLs in health fields.
+        blob = json.dumps({**db, **st})
+        for token in ("STAGING_DATABASE_URL", "postgresql://", "S3_SECRET", "access_key"):
+            self.assertNotIn(token, blob)
+
     def test_new_shell_has_five_destinations_and_no_publish(self):
         html = Path(app.__file__).with_name("index.html").read_text(encoding="utf-8")
         for page in ("home", "stories", "review", "media", "system"):
