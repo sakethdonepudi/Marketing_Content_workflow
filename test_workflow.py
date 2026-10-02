@@ -4079,6 +4079,36 @@ class WorkflowTests(unittest.TestCase):
                        "License / permission note", "cbn_asset_id", "tdp_asset_id", "Public-figure QA"):
             self.assertIn(phrase, source)
 
+    def test_media_discovery_rights_gate_and_report(self):
+        import media_discovery
+        with app.connect() as connection:
+            tables = {row[0] for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='media_candidates'")}
+        self.assertEqual(tables, {"media_candidates"})
+        # A CC/GODL candidate is reusable but is never auto-approved.
+        cc = media_discovery.register_candidate(
+            connect=app.connect, source_url="https://commons.example/ap-field.jpg", publisher="Wikimedia (CC)",
+            asset_type="IMAGE", title="AP tobacco field", license_status="ATTRIBUTION_REQUIRED",
+            license_text="CC BY-SA 4.0", attribution_required=True, ap_specific="yes", real_footage=True,
+            recommended_scene="SHOT 2", state="Andhra Pradesh", district="Nellore")
+        self.assertEqual(cc["lifecycle_state"], "DISCOVERED")
+        self.assertTrue(media_discovery.rights_eligible(cc["license_status"]))
+        approved = media_discovery.approve_for_use(cc["id"], connect=app.connect, reviewer="Editor")
+        self.assertEqual(approved["lifecycle_state"], "APPROVED_FOR_USE")
+        # UNKNOWN-rights media can never be approved.
+        unknown = media_discovery.register_candidate(
+            connect=app.connect, source_url="https://news.example/clip", publisher="News",
+            asset_type="VIDEO", title="Random news clip", license_status="UNKNOWN", ap_specific="unknown")
+        self.assertFalse(media_discovery.rights_eligible("UNKNOWN"))
+        with self.assertRaisesRegex(media_discovery.MediaDiscoveryError, "cannot enter production"):
+            media_discovery.approve_for_use(unknown["id"], connect=app.connect, reviewer="Editor")
+        # Report counts only cleared media as approved.
+        report = media_discovery.candidate_report(connect=app.connect)
+        self.assertEqual(report["approved_for_use"], 1)
+        self.assertGreaterEqual(report["unknown"], 1)
+        self.assertTrue(all(item["lifecycle_state"] != "APPROVED_FOR_USE"
+                            for item in report["candidates"] if item["license_status"] == "UNKNOWN"))
+
     def test_generated_scene_provenance_and_beat_plan(self):
         # Every generated scene is an original work with a prompt and provenance recorded.
         scenes = final_reel_composer.generate_scenes(
