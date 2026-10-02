@@ -77,6 +77,8 @@ import reel_pipeline
 import reel_control
 import fast_discovery
 import live_discovery
+import dashboard_auth
+import news_feed
 import media_discovery
 from meta_distribution import (
     COPY_POLICY_VERSION as DISTRIBUTION_COPY_POLICY_VERSION,
@@ -252,6 +254,11 @@ def log_error(event, error, **context):
 
 def now():
     return datetime.now(timezone.utc).isoformat()
+
+
+def news_escape(value):
+    import html
+    return html.escape(str(value if value is not None else ""), quote=True)
 
 
 def connect():
@@ -8789,8 +8796,149 @@ class Handler(SimpleHTTPRequestHandler):
             raise ValueError("body too large")
         return json.loads(self.rfile.read(length) or b"{}")
 
+    # ---------- auth (Architecture 13) ----------
+
+    def _client_key(self):
+        return self.client_address[0] if self.client_address else "unknown"
+
+    def _session_token(self):
+        cookie = self.headers.get("Cookie", "")
+        for part in cookie.split(";"):
+            name, _, value = part.strip().partition("=")
+            if name == dashboard_auth.SESSION_COOKIE:
+                return value
+        return None
+
+    def _current_user(self):
+        if not dashboard_auth.login_enabled():
+            return None  # auth disabled when unconfigured (local dev); deploy requires it
+        return dashboard_auth.session_user(self._session_token(), connect=connect, now=now)
+
+    def _auth_required(self):
+        """True when login is configured. Local dev without credentials stays open."""
+        return dashboard_auth.login_enabled()
+
+    def _deny(self, *, redirect):
+        if redirect:
+            self.send_response(302)
+            self.send_header("Location", "/login")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+        else:
+            self.send_json({"error": "authentication required"}, 401)
+
+    def _send_session_cookie(self, token, *, expires_at):
+        secure = os.environ.get("DASHBOARD_COOKIE_SECURE", "1").strip().lower() not in ("0", "false", "no")
+        cookie = (f"{dashboard_auth.SESSION_COOKIE}={token}; Path=/; HttpOnly; SameSite=Lax; "
+                  f"Max-Age={dashboard_auth.SESSION_TTL_SECONDS}")
+        if secure:
+            cookie += "; Secure"
+        self.send_header("Set-Cookie", cookie)
+
+    def _send_login_page(self, message=None, status=200):
+        error = f"<p class='err'>{news_escape(message)}</p>" if message else ""
+        self.send_html(f"""<!doctype html><html><head><meta charset='utf-8'>
+<meta name='viewport' content='width=device-width, initial-scale=1'>
+<title>ReachOut — Secure Control Center</title>
+<style>
+ :root{{color-scheme:dark}}
+ body{{margin:0;min-height:100vh;display:grid;place-items:center;background:#0b0d0f;color:#e8eaed;
+   font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,sans-serif}}
+ .card{{width:min(92vw,360px);background:#141719;border:1px solid #262b2f;border-radius:16px;padding:28px;
+   box-shadow:0 20px 60px rgba(0,0,0,.5)}}
+ h1{{margin:0 0 2px;font-size:20px;letter-spacing:.2px}}
+ .sub{{margin:0 0 20px;color:#8b9298;font-size:13px}}
+ label{{display:block;font-size:12px;color:#aab1b7;margin:12px 0 4px}}
+ input{{width:100%;box-sizing:border-box;padding:11px 12px;border-radius:10px;border:1px solid #2c3236;
+   background:#0f1214;color:#e8eaed;font-size:14px}}
+ button{{width:100%;margin-top:18px;padding:12px;border:0;border-radius:10px;background:#c9a24a;color:#151006;
+   font-weight:600;font-size:14px;cursor:pointer}}
+ .err{{color:#e5847e;font-size:13px;margin-top:12px}}
+</style></head><body>
+ <form class='card' method='post' action='/login'>
+   <h1>ReachOut</h1><p class='sub'>Secure Control Center</p>
+   <label for='u'>Username</label><input id='u' name='username' autocomplete='username' autofocus>
+   <label for='p'>Password</label><input id='p' name='password' type='password' autocomplete='current-password'>
+   <button type='submit'>Sign In</button>
+   {error}
+ </form></body></html>""", status)
+
+    def _handle_login(self, body):
+        if not dashboard_auth.login_enabled():
+            self.send_json({"error": "login is not configured"}, 503)
+            return
+        result = dashboard_auth.authenticate(body.get("username"), body.get("password"),
+                                             connect=connect, client_key=self._client_key(), now=now)
+        if not result["ok"]:
+            self._send_login_page(result.get("message", "Invalid username or password."),
+                                  429 if result["reason"] == "RATE_LIMITED" else 401)
+            return
+        # Redirect with the session cookie set.
+        self.send_response(302)
+        self.send_header("Location", "/")
+        secure = os.environ.get("DASHBOARD_COOKIE_SECURE", "1").strip().lower() not in ("0", "false", "no")
+        cookie = (f"{dashboard_auth.SESSION_COOKIE}={result['session']['token']}; Path=/; HttpOnly; "
+                  f"SameSite=Lax; Max-Age={dashboard_auth.SESSION_TTL_SECONDS}")
+        if secure:
+            cookie += "; Secure"
+        self.send_header("Set-Cookie", cookie)
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+
     def do_GET(self):
         path = urlparse(self.path).path
+        # Public endpoints: health + login page. Everything else requires a session when configured.
+        if path == "/login":
+            self._send_login_page()
+            return
+        if path == "/logout":
+            dashboard_auth.revoke_session(self._session_token(), connect=connect, now=now)
+            self.send_response(302)
+            self.send_header("Location", "/login")
+            self.send_header("Set-Cookie",
+                             f"{dashboard_auth.SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0")
+            self.end_headers()
+            return
+        if path == "/api/health":
+            workspace = workspace_identity()
+            self.send_json({
+                "ok": True,
+                "workspace_key": workspace["workspace_key"],
+                "grok_configured": bool(os.environ.get("XAI_API_KEY")),
+            })
+            return
+        if path.startswith("/api/") and self._auth_required() and self._current_user() is None:
+            self.send_json({"error": "authentication required"}, 401)
+            return
+        if not path.startswith("/api/") and path not in ("/", "/index.html") and self._auth_required() \
+                and self._current_user() is None:
+            self._deny(redirect=True)
+            return
+        if path in ("/", "/index.html") and self._auth_required() and self._current_user() is None:
+            self._deny(redirect=True)
+            return
+        if path == "/api/latest-updates":
+            self.send_json({"updates": news_feed.latest_updates(connect=connect)})
+            return
+        if path == "/api/private-uploads":
+            self.send_json({"uploads": news_feed.private_uploads(connect=connect)})
+            return
+        if path == "/api/dashboard/home":
+            import youtube_publishing as yp
+            conn_status = yp.connection_status(connect=connect)
+            uploads = [u for u in news_feed.private_uploads(connect=connect) if u["privacy"] == "PRIVATE"]
+            self.send_json({
+                "system": {
+                    "application": "ONLINE",
+                    "youtube_status": conn_status["status"],
+                    "youtube_channel": conn_status.get("channel_name"),
+                    "publishing": "PRIVATE ONLY" if os.environ.get("YOUTUBE_AUTOMATED_PRIVACY", "PRIVATE") != "PUBLIC" else "PUBLIC",
+                    "discovery": "HEALTHY" if LIVE_DISCOVERY_ENABLED else "DISABLED",
+                },
+                "latest_updates": news_feed.latest_updates(connect=connect, limit=12),
+                "private_uploads": uploads,
+            })
+            return
         if path == "/api/overview":
             self.send_json(overview())
             return
@@ -8999,6 +9147,19 @@ class Handler(SimpleHTTPRequestHandler):
     def do_POST(self):
         path = urlparse(self.path).path
         try:
+            if path == "/login":
+                length = int(self.headers.get("Content-Length", "0"))
+                raw = self.rfile.read(length).decode("utf-8", "replace") if length else ""
+                form = dict(parse_qsl(raw))
+                self._handle_login(form)
+                return
+            if path == "/logout":
+                dashboard_auth.revoke_session(self._session_token(), connect=connect, now=now)
+                self.send_json({"ok": True})
+                return
+            if self._auth_required() and self._current_user() is None:
+                self.send_json({"error": "authentication required"}, 401)
+                return
             body = self.read_json()
             if path == "/api/events":
                 self.send_json({"error": "direct event creation is disabled; ingest a dated individual source item"}, 410)

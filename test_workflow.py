@@ -808,6 +808,8 @@ class WorkflowTests(unittest.TestCase):
             "SOCIAL_PUBLISHING_ENABLED": "0", "INSTAGRAM_PUBLISHING_ENABLED": "0", "FACEBOOK_PUBLISHING_ENABLED": "0",
             "INSTAGRAM_USER_ID": "", "INSTAGRAM_ACCESS_TOKEN": "", "FACEBOOK_PAGE_ID": "", "FACEBOOK_PAGE_ACCESS_TOKEN": "",
             "DISTRIBUTION_STATIC_HASHTAGS": "",
+            # Arch 13: dashboard login stays off unless a test opts in (never inherit real local creds).
+            "DASHBOARD_USERNAME": "", "DASHBOARD_PASSWORD_HASH": "", "SESSION_SECRET": "",
         })
         environment.start()
         self.addCleanup(environment.stop)
@@ -5252,6 +5254,133 @@ class WorkflowTests(unittest.TestCase):
                                     reel_id=fixture["reel"]["id"])
             self.assertEqual(r2["reel_id"], fixture["reel"]["id"])
             self.assertIsNone(r2["youtube_publish_job_id"])
+
+    def test_arch13_dashboard_auth_login_logout_and_rate_limit(self):
+        import dashboard_auth as da, os
+        with patch.dict(os.environ, {"DASHBOARD_USERNAME": "admin",
+                                     "DASHBOARD_PASSWORD_HASH": da.hash_password("s3cret-pass")}, clear=False):
+            self.assertTrue(da.login_enabled())
+            result = da.authenticate("admin", "s3cret-pass", connect=app.connect, client_key="c1")
+            self.assertTrue(result["ok"])
+            token = result["session"]["token"]
+            self.assertEqual(da.session_user(token, connect=app.connect), "admin")
+            # wrong password / wrong username are indistinguishable (generic message).
+            wrong_pw = da.authenticate("admin", "nope", connect=app.connect, client_key="c2")
+            wrong_user = da.authenticate("nobody", "s3cret-pass", connect=app.connect, client_key="c3")
+            self.assertFalse(wrong_pw["ok"])
+            self.assertFalse(wrong_user["ok"])
+            self.assertEqual(wrong_pw["message"], wrong_user["message"])
+            self.assertIn("invalid", wrong_pw["message"].lower())
+            self.assertEqual(wrong_pw["message"], "Invalid username or password.")
+            # logout revokes the session.
+            da.revoke_session(token, connect=app.connect)
+            self.assertIsNone(da.session_user(token, connect=app.connect))
+            # 5 failures -> cooldown.
+            for _ in range(da.MAX_FAILED_ATTEMPTS):
+                da.authenticate("admin", "wrong", connect=app.connect, client_key="c4")
+            limited = da.authenticate("admin", "s3cret-pass", connect=app.connect, client_key="c4")
+            self.assertEqual(limited["reason"], "RATE_LIMITED")
+
+    def test_arch13_password_hash_never_exposed_and_no_plaintext(self):
+        import dashboard_auth as da, os, json
+        with patch.dict(os.environ, {"DASHBOARD_USERNAME": "admin",
+                                     "DASHBOARD_PASSWORD_HASH": da.hash_password("top-secret-pw")}, clear=False):
+            status = da.authenticate("admin", "top-secret-pw", connect=app.connect, client_key="z1")
+            self.assertTrue(status["ok"])
+            self.assertNotIn("top-secret-pw", json.dumps(status))
+            self.assertNotIn(os.environ["DASHBOARD_PASSWORD_HASH"], json.dumps(status))
+        # Hashing is salted + verifiable; plaintext never stored.
+        stored = da.hash_password("abc")
+        self.assertTrue(stored.startswith("scrypt$"))
+        self.assertNotIn("abc", stored)
+        self.assertTrue(da.verify_password("abc", stored))
+        self.assertFalse(da.verify_password("xyz", stored))
+
+    def test_arch13_latest_updates_states_and_xss_safe(self):
+        import news_feed
+        # A VERIFIED event with an approved claim set and a hostile headline.
+        with app.connect() as connection:
+            connection.execute(
+                "INSERT INTO events(id,title,source,status,priority,created_at,updated_at,first_seen_at,"
+                "last_seen_at,workspace_key,event_time,verification_status) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                ("EV-XSS", "<script>alert(1)</script> Centre permits FCV tobacco", "PIB", "VERIFIED", "NORMAL",
+                 app.now(), app.now(), app.now(), app.now(), app.workspace_identity()["workspace_key"],
+                 app.now(), "VERIFIED"))
+        app.ingest_signal(url="https://pib.example/xss", title="Hostile headline fixture",
+                          text="Centre permitted sale of excess FCV tobacco.", source_name="PIB",
+                          source_class="official_primary", content_role="item", item_type="announcement",
+                          publication_time="2026-10-02T10:00:00Z", link_event_id="EV-XSS")
+        cards = {c["event_id"]: c for c in news_feed.latest_updates(connect=app.connect)}
+        self.assertIn("EV-XSS", cards)
+        self.assertEqual(cards["EV-XSS"]["state"], "VERIFIED")
+        self.assertNotIn("<script>", app.news_escape(cards["EV-XSS"]["headline"]))
+        # VERIFYING never presented as VERIFIED.
+        with app.connect() as connection:
+            connection.execute(
+                "INSERT INTO events(id,title,source,status,priority,created_at,updated_at,first_seen_at,"
+                "last_seen_at,workspace_key,event_time,verification_status) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                ("EV-VERIFYING", "Committee reviews horticulture hub", "NTV", "VERIFYING", "NORMAL",
+                 app.now(), app.now(), app.now(), app.now(), app.workspace_identity()["workspace_key"],
+                 app.now(), "RUNNING"))
+        states = {c["event_id"]: c["state"] for c in news_feed.latest_updates(connect=app.connect)}
+        self.assertEqual(states["EV-VERIFYING"], "VERIFYING")
+        self.assertNotEqual(states["EV-VERIFYING"], "VERIFIED")
+
+    def test_arch13_private_uploads_only_private_and_fields(self):
+        import news_feed
+        fixture = self._arch12_ready_fixture()
+        reel_id = fixture["reel"]["id"]
+        package_id = fixture["package"]["id"]
+        event_id = fixture["event_id"]
+        with app.connect() as connection:
+            for vid, priv in (("PRIVVID0001", "PRIVATE"), ("PUBVID00001", "PUBLIC")):
+                connection.execute(
+                    "INSERT INTO youtube_publish_jobs(id,reel_id,youtube_package_id,event_id,reel_version,"
+                    "youtube_copy_version,idempotency_key,mode,status,privacy_status,video_id,created_at,"
+                    "updated_at,uploaded_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (f"YJ-{vid}", reel_id, package_id, event_id, f"{reel_id}#c", 1, f"idem-{vid}", "NOW",
+                     "PUBLISHED", priv, vid, app.now(), app.now(), app.now()))
+        uploads = news_feed.private_uploads(connect=app.connect)
+        videos = {u["video_id"] for u in uploads}
+        self.assertIn("PRIVVID0001", videos)
+        self.assertNotIn("PUBVID00001", videos)
+        for upload in uploads:
+            self.assertEqual(upload["privacy"], "PRIVATE")
+            self.assertIn("title", upload)
+            self.assertIn("reel_id", upload)
+
+    def test_arch13_automated_privacy_override(self):
+        import os, youtube_publishing as yp
+        with self._arch12_youtube_env(YOUTUBE_PROJECT_AUDIT_STATUS="PUBLIC_VERIFIED",
+                                      YOUTUBE_AUTOMATED_PRIVACY="PRIVATE"):
+            # Capability is AVAILABLE, but automated uploads stay PRIVATE.
+            fixture = self._arch12_ready_fixture()
+            r = yp.request_upload(fixture["reel"]["id"], fixture["package"]["id"], privacy_status="PUBLIC",
+                                  connect=app.connect)
+            full = yp.youtube_job(r["job"]["id"], connect=app.connect)
+            self.assertEqual(full["privacy_status"], "PRIVATE")
+            req = [e for e in full["events"] if e["event_type"] == "REQUESTED"][0]
+            self.assertEqual(req["metadata"]["privacy_downgrade_reason"], "AUTOMATED_PRIVACY_PRIVATE_ONLY")
+
+    def test_arch13_dashboard_home_payload_has_no_secrets_or_xss(self):
+        import json, os, news_feed
+        # Simulate the home payload assembly and assert no secret/script leakage.
+        import youtube_publishing as yp
+        with patch.dict(os.environ, {"YOUTUBE_CLIENT_SECRET": "shh-secret",
+                                     "YOUTUBE_REFRESH_TOKEN": "shh-refresh"}, clear=False):
+            conn = yp.connection_status(connect=app.connect)
+            payload = {
+                "system": {"application": "ONLINE", "youtube_status": conn["status"],
+                           "youtube_channel": conn.get("channel_name"),
+                           "publishing": "PRIVATE ONLY"},
+                "latest_updates": news_feed.latest_updates(connect=app.connect),
+                "private_uploads": [u for u in news_feed.private_uploads(connect=app.connect) if u["privacy"] == "PRIVATE"],
+            }
+            blob = json.dumps(payload)
+            self.assertNotIn("shh-secret", blob)
+            self.assertNotIn("shh-refresh", blob)
+            self.assertNotIn("access_token", blob)
+            self.assertNotIn("refresh_token", blob)
 
     def test_new_shell_has_five_destinations_and_no_publish(self):
         html = Path(app.__file__).with_name("index.html").read_text(encoding="utf-8")

@@ -179,8 +179,76 @@ function storyCard(event, reel) {
   return btn;
 }
 
+function renderOpsHome(container) {
+  fetchJson('/api/dashboard/home').then(({system, latest_updates, private_uploads}) => {
+    const blocks = [];
+    const s = system || {};
+    blocks.push(el('div', 'ops-summary',
+      el('div', 'ops-title', 'ReachOut'),
+      el('div', 'ops-row', `System: ${s.application || 'ONLINE'}`),
+      el('div', 'ops-row', `YouTube: ${s.youtube_status || '—'}${s.youtube_channel ? ` — ${s.youtube_channel}` : ''}`),
+      el('div', 'ops-row', `Publishing: ${s.publishing || 'PRIVATE ONLY'}`)));
+
+    const updates = el('div', 'section',
+      el('div', 'section-title', el('h2', '', 'Latest updates'),
+        el('span', 'pill plain', `${(latest_updates || []).length}`)));
+    const list = (latest_updates || []);
+    if (!list.length) {
+      updates.append(empty('No verified updates yet.', 'Verified news appears here as text while the reel is produced.'));
+    } else {
+      updates.append(el('div', 'update-grid', list.map(item => {
+        const tone = item.state === 'VERIFIED' ? 'good' : item.state === 'VERIFYING' ? 'warn' : '';
+        const card = el('div', 'card update-card',
+          el('div', 'chip-row', el('span', `pill ${tone}`, item.state_label || item.state),
+            el('span', 'muted', `${item.source_count || 0} sources`)),
+          el('div', 'update-headline', item.headline || ''),
+          el('div', 'muted pre-wrap', item.summary || ''),
+          el('div', 'update-meta', [item.location, fmt(item.updated_at), item.reel_status ? `Reel: ${label(item.reel_status)}` : null]
+            .filter(Boolean).join(' · ')));
+        const b = el('button', 'btn', 'View story'); b.type = 'button';
+        b.onclick = () => setPage('story', item.event_id, 'reel');
+        card.append(el('div', 'chip-row', b));
+        return card;
+      })));
+    }
+    blocks.push(updates);
+
+    const uploads = el('div', 'section',
+      el('div', 'section-title', el('h2', '', 'Private YouTube uploads'),
+        el('span', 'pill plain', `${(private_uploads || []).length}`)));
+    const ups = (private_uploads || []);
+    if (!ups.length) {
+      uploads.append(empty('No private uploads yet.', 'Approved reels upload to YouTube as PRIVATE.'));
+    } else {
+      uploads.append(el('div', 'update-grid', ups.map(u => {
+        const card = el('div', 'card update-card',
+          el('div', 'chip-row', el('span', 'pill bad', 'PRIVATE'),
+            el('span', 'muted', u.processing_state || '—')),
+          el('div', 'update-headline', u.title || ''),
+          el('div', 'muted', `Reel ${u.reel_id || '—'} · duration ${u.duration_seconds != null ? `${Math.round(u.duration_seconds)}s` : '—'}${u.views != null ? ` · views ${u.views}` : ''}`),
+          el('div', 'update-meta', [fmt(u.uploaded_at), u.video_id ? `video ${u.video_id}` : null].filter(Boolean).join(' · ')));
+        const actions = el('div', 'chip-row');
+        if (u.youtube_url) { const a = el('a', 'btn', 'Open YouTube'); a.href = u.youtube_url; a.target = '_blank'; a.rel = 'noopener'; actions.append(a); }
+        const vr = el('button', 'btn', 'View reel'); vr.type = 'button';
+        vr.onclick = () => setPage('story', u.event_id, 'reel'); actions.append(vr);
+        card.append(actions);
+        return card;
+      })));
+    }
+    blocks.push(uploads);
+    container.replaceChildren(...blocks);
+  }).catch(() => { container.replaceChildren(empty('Dashboard unavailable', 'Could not load the operations summary.')); });
+}
+
 function renderHome(root) {
   const overview = state.overview || {};
+  // Operational header: system summary + latest verified updates + private uploads (Arch 13).
+  const ops = el('div', 'ops-home');
+  root.append(ops);
+  renderOpsHome(ops);
+  if (state._opsTimer) clearInterval(state._opsTimer);
+  state._opsTimer = setInterval(() => { if (state.page === 'home') renderOpsHome(ops); }, 60000);
+
   const events = overview.events || [];
   const ready = events.filter(e => eventUiStatus(e) === 'READY_FOR_REVIEW');
   const generating = events.filter(e => ['PRODUCING','VERIFYING','RESEARCHING'].includes(eventUiStatus(e)));

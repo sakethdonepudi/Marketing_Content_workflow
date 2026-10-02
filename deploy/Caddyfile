@@ -1,0 +1,18 @@
+# ReachOut OS - public HTTPS reverse proxy (Caddy provisions TLS automatically).
+# Point the domain's A/AAAA record at the server, then: caddy run --config deploy/Caddyfile
+reachout.example.com {
+    encode zstd gzip
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "DENY"
+        -Server
+    }
+    reverse_proxy 127.0.0.1:8000
+    log {
+        output file /var/log/reachout/caddy.log {
+            roll_size 10mb
+            roll_keep 5
+        }
+    }
+}

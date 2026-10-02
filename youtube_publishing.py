@@ -1265,6 +1265,12 @@ def request_upload(reel_id, package_id, *, mode="NOW", scheduled_for=None, priva
     resolved = resolve_effective_privacy(privacy_status, public_upload_capability())
     privacy_status = resolved["effective_privacy"]
     privacy_downgrade_reason = resolved["privacy_downgrade_reason"]
+    # Architecture 13: automated uploads stay PRIVATE regardless of capability unless the
+    # operator explicitly overrides via YOUTUBE_AUTOMATED_PRIVACY.
+    automated_privacy = os.environ.get("YOUTUBE_AUTOMATED_PRIVACY", "PRIVATE").strip().upper() or "PRIVATE"
+    if automated_privacy != "PUBLIC" and privacy_status == "PUBLIC":
+        privacy_status = "PRIVATE"
+        privacy_downgrade_reason = "AUTOMATED_PRIVACY_PRIVATE_ONLY"
     capability = resolved["public_upload_capability"]
     scheduled_at = scheduled_for if mode == "SCHEDULED" else None
     if mode == "SCHEDULED":

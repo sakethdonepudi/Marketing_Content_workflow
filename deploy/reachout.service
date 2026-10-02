@@ -1,0 +1,26 @@
+# ReachOut OS - production service (systemd).
+# Copy to /etc/systemd/system/ and enable. Runs under an unprivileged user; secrets load
+# from the local .env file (never committed). App binds 127.0.0.1 behind a TLS proxy.
+[Unit]
+Description=ReachOut OS (ReachOut application)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=reachout
+Group=reachout
+WorkingDirectory=/srv/reachout
+Environment=HOST=127.0.0.1
+Environment=PORT=8000
+Environment=REACHOUT_DB=/var/lib/reachout/reachout.sqlite3
+Environment=RENDER_STORAGE_ROOT=/var/lib/reachout/generated_media
+EnvironmentFile=/srv/reachout/.env
+ExecStart=/usr/bin/python3 app.py
+Restart=always
+RestartSec=3
+StandardOutput=append:/var/log/reachout/app.log
+StandardError=append:/var/log/reachout/app.err.log
+
+[Install]
+WantedBy=multi-user.target
