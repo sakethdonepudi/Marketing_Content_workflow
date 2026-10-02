@@ -78,11 +78,12 @@ async function fetchJson(url, opts) {
 
 async function refresh() {
   try {
-    const [overview, pipelines, uploads, production] = await Promise.all([
+    const [overview, pipelines, uploads, production, discovered] = await Promise.all([
       fetchJson('/api/overview'),
       fetchJson('/api/pipelines').catch(() => ({pipelines: []})),
       fetchJson('/api/uploads').catch(() => ({assets: []})),
       fetchJson('/api/production').catch(() => ({})),
+      fetchJson('/api/discovered').catch(() => ({candidates: []})),
     ]);
     state.overview = overview;
     state.pipelines = pipelines.pipelines || [];
@@ -90,6 +91,7 @@ async function refresh() {
     state.health = production.health || null;
     state.queue = production.queue || [];
     state.notifications = production.notifications || [];
+    state.discovered = discovered.candidates || [];
     document.getElementById('clock').textContent = `Updated ${fmt(overview.updated_at)}`;
     document.getElementById('standard-tag').textContent = overview.reel_standard?.version || 'Standard';
     renderLeader(overview);
@@ -243,6 +245,20 @@ function renderStories(root) {
   const events = state.overview?.events || [];
   root.append(el('header', 'page-head', el('div', '', el('div', 'eyebrow', 'All coverage'), el('h1', '', 'Stories'),
     el('p', 'lede', 'Every event the desk is tracking, from first source to finished reel.'))));
+  const discovered = state.discovered || [];
+  if (discovered.length) {
+    root.append(el('div', 'section', el('div', 'section-title', el('h2', '', `Discovered (${discovered.length})`),
+      el('span', 'muted', 'Fast same-day leads — not yet verified')),
+      el('div', 'story-grid', discovered.slice(0, 12).map(c => el('div', 'card',
+        el('div', 'sc-title', c.headline),
+        el('div', 'chip-row', pill(c.verification_status, label(c.verification_status)),
+          el('span', 'pill plain', c.location || 'Location unknown'),
+          el('span', 'pill plain', `${c.source_count} signals · ${c.entity_count} entities`),
+          el('span', 'pill plain', c.confidence)),
+        el('p', 'secondary-text', `First seen ${fmt(c.first_seen_at)}`),
+      )))));
+  }
+  root.append(el('div', 'section-title', el('h2', '', `Events (${events.length})`)));
   root.append(events.length ? el('div', 'story-grid', events.map(e => storyCard(e))) : empty('No stories yet', 'Ingest a source to begin.'));
 }
 
@@ -524,6 +540,16 @@ function renderSystem(root) {
       ['Failure rate', `${Math.round((health.failure_rate || 0) * 100)}%`],
       ['Unknown-cost runs', health.unknown_cost_runs],
     ])));
+
+  const discovered = state.discovered || [];
+  if (discovered.length) {
+    const latencies = discovered.map(d => d.discovery_latency_seconds).filter(v => v != null);
+    grid.append(card('', cardHead('Discovery',
+      pill(`${discovered.length} candidates`, 'info'),
+      plainPill(latencies.length ? `avg latency ${Math.round(latencies.reduce((a,b)=>a+b,0)/latencies.length)}s` : 'no latency data', ''))),
+      el('ul', 'list', discovered.slice(0, 6).map(d =>
+        el('li', '', `${d.headline.slice(0, 60)} · ${d.source_count} signals · ${d.location || '—'} · ${label(d.verification_status)}`))));
+  }
 
   if (health.providers) grid.append(card('', cardHead('Provider health'),
     el('ul', 'provider-list', Object.entries(health.providers).map(([name, status]) =>

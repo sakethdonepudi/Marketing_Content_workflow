@@ -4267,6 +4267,63 @@ class WorkflowTests(unittest.TestCase):
         health = app.production_health()
         self.assertIn("unknown_cost_runs", health)
 
+    def test_fast_discovery_madanapalle_fixture_and_recall_qa(self):
+        import fast_discovery
+        # Same-day public signals across families (YouTube + Telugu media + a wire).
+        signals = [
+            {"source_family": "YouTube", "url": "https://youtube.example/1",
+             "title": "Anant Ambani speech at Global Horticulture Hub, Madanapalle",
+             "text": "Anant Ambani addressed the Indian School of Agriculture in Madanapalle, Andhra Pradesh.",
+             "published_at": "2026-10-02T09:30:00+00:00", "is_primary": False,
+             "location": "Madanapalle"},
+            {"source_family": "NTV Telugu", "url": "https://ntv.example/1",
+             "title": "పవన్ కల్యాణ్, చంద్రబాబు నాయుడు స్పందన",
+             "text": "Pawan Kalyan and Chandrababu Naidu reacted to the Madanapalle horticulture hub event.",
+             "published_at": "2026-10-02T10:15:00+00:00", "is_primary": False, "location": "Madanapalle"},
+            {"source_family": "PIB", "url": "https://pib.example/1",
+             "title": "Indian School of Agriculture at Madanapalle", "text": "Global Horticulture Hub, Madanapalle.",
+             "published_at": "2026-10-02T11:00:00+00:00", "is_primary": True, "location": "Madanapalle"},
+        ]
+        candidate = fast_discovery.discover(signals, connect=app.connect, now=lambda: "2026-10-02T11:05:00+00:00")
+        self.assertIsNotNone(candidate)
+        self.assertEqual(candidate["location"], "Madanapalle")
+        qa = fast_discovery.discovery_recall_qa(connect=app.connect)
+        self.assertEqual(qa["status"], "PASS", qa["errors"])
+        # Never split one physical event into duplicates.
+        again = fast_discovery.discover(signals, connect=app.connect, now=lambda: "2026-10-02T11:06:00+00:00")
+        self.assertEqual(again["id"], candidate["id"])
+        # Recency weighting + query expansion.
+        self.assertEqual(fast_discovery.recency_weight(1.0), "VERY_HIGH")
+        self.assertEqual(fast_discovery.recency_weight(12.0), "NORMAL")
+        self.assertEqual(fast_discovery.recency_weight(48.0), "LOW")
+        self.assertTrue(any("మదనపల్లె" in v for v in fast_discovery.expand_query("Madanapalle")))
+        # Candidate creation does not imply verification; a weak bundle makes no candidate.
+        self.assertIsNone(fast_discovery.discover(
+            [{"source_family": "YouTube", "title": "unrelated", "text": "nothing salient"}], connect=app.connect))
+
+    def test_fast_discovery_thresholds_and_handoff(self):
+        import fast_discovery
+        # ONE primary + ONE independent OR THREE independent required.
+        weak = [{"source_family": "YouTube", "title": "Madanapalle event", "text": "Madanapalle",
+                 "published_at": "2026-10-02T09:00:00+00:00"}]
+        self.assertIsNone(fast_discovery.discover(weak, connect=app.connect))
+        strong = weak + [
+            {"source_family": "X", "title": "Madanapalle update", "text": "Madanapalle", "published_at": "2026-10-02T09:10:00+00:00"},
+            {"source_family": "Sakshi", "title": "Madanapalle news", "text": "Madanapalle", "published_at": "2026-10-02T09:20:00+00:00"},
+        ]
+        candidate = fast_discovery.discover(strong, connect=app.connect)
+        self.assertIsNotNone(candidate)
+        # Auto-handoff creates a real event in VERIFYING (discovery never verifies).
+        result = app.handoff_candidate_to_verification(candidate["id"])
+        self.assertTrue(result["handed_off"])
+        with app.connect() as connection:
+            event = connection.execute("SELECT verification_status,status FROM events WHERE id=?",
+                                       (result["event_id"],)).fetchone()
+        self.assertEqual(event["verification_status"], "NOT_VERIFIED")
+        self.assertEqual(event["status"], "VERIFYING")
+        # Handoff is idempotent.
+        self.assertEqual(app.handoff_candidate_to_verification(candidate["id"])["event_id"], result["event_id"])
+
     def test_new_shell_has_five_destinations_and_no_publish(self):
         html = Path(app.__file__).with_name("index.html").read_text(encoding="utf-8")
         for page in ("home", "stories", "review", "media", "system"):

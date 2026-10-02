@@ -75,6 +75,7 @@ import final_reel_composer
 import reel_standard
 import reel_pipeline
 import reel_control
+import fast_discovery
 import media_discovery
 from meta_distribution import (
     COPY_POLICY_VERSION as DISTRIBUTION_COPY_POLICY_VERSION,
@@ -6860,6 +6861,48 @@ def run_auto_reel_pipeline(event_id, *, now=None):
     return reel_pipeline.advance(run["id"], handler=_auto_reel_stage_handler, connect=connect)
 
 
+def discovered_candidates_overview():
+    """Minimal Discovered queue for Stories/System: candidates, not verified events."""
+    items = fast_discovery.list_candidates(connect=connect)
+    return [{
+        "id": c["id"], "headline": c["headline"], "first_seen_at": c["first_seen_at"],
+        "source_count": c["source_count"], "location": c["location"],
+        "entity_count": len(c["entities"]), "confidence": c["confidence"],
+        "discovery_confidence": c["discovery_confidence"], "source_families": c["source_families"],
+        "verification_status": c["state"], "event_id": c["event_id"],
+        "discovery_latency_seconds": c["discovery_latency_seconds"],
+    } for c in items]
+
+
+def handoff_candidate_to_verification(candidate_id):
+    """Auto-handoff: a discovered candidate begins verification without manual confirmation.
+
+    Discovery stays permissive; the candidate is promoted to a real event in DETECTED state
+    and sent to VERIFYING. Verification remains the strict evidence gate; nothing here
+    verifies or produces a reel.
+    """
+    candidate = fast_discovery.candidate(candidate_id, connect=connect)
+    if candidate["state"] in ("PROMOTED", "HANDED_OFF") and candidate["event_id"]:
+        return {"candidate_id": candidate_id, "event_id": candidate["event_id"], "handed_off": True}
+    # Create a real event from the candidate and move it to VERIFYING.
+    with connect() as connection:
+        event_id = "EV-" + uuid.uuid4().hex[:10].upper()
+        timestamp = now()
+        connection.execute(
+            "INSERT INTO events(id,title,source,source_url,status,priority,created_at,updated_at,first_seen_at,"
+            "last_seen_at,workspace_key,event_time,verification_status) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (event_id, candidate["headline"], candidate["source_families"][0] if candidate["source_families"] else "Discovery",
+             candidate["signals"][0]["url"] if candidate["signals"] else "", "VERIFYING", "HIGH",
+             timestamp, timestamp, candidate["first_seen_at"], timestamp,
+             workspace_identity()["workspace_key"], candidate["first_seen_at"], "NOT_VERIFIED"),
+        )
+        connection.execute("INSERT INTO transitions(event_id,from_state,to_state,at) VALUES(?,?,?,?)",
+                           (event_id, None, "VERIFYING", timestamp))
+        connection.execute(
+            "UPDATE event_candidates SET state='HANDED_OFF',event_id=? WHERE id=?", (event_id, candidate_id))
+    return {"candidate_id": candidate_id, "event_id": event_id, "handed_off": True}
+
+
 def maybe_trigger_auto_reel(event_id):
     """Enqueue AUTO_REEL_PIPELINE_V1 automatically once an event becomes eligible.
 
@@ -8182,6 +8225,10 @@ class Handler(SimpleHTTPRequestHandler):
         if path == "/api/uploads":
             self.send_json({"assets": list_uploaded_media_assets(dict(parse_qsl(urlparse(self.path).query)).get("type"))})
             return
+        if path == "/api/discovered":
+            self.send_json({"candidates": discovered_candidates_overview(),
+                            "recall_qa": fast_discovery.discovery_recall_qa(connect=connect)})
+            return
         if path == "/api/production":
             self.send_json({"health": production_health(), "queue": production_queue(),
                             "notifications": reel_control.notifications(connect=connect)})
@@ -8320,6 +8367,17 @@ class Handler(SimpleHTTPRequestHandler):
                     match.group(1), body.get("action"), body.get("reviewer"), body.get("comment"),
                 )
                 self.send_json({"review": review}, 201)
+                return
+            if path == "/api/discover":
+                signals = body.get("signals") or []
+                candidate = fast_discovery.discover(signals, connect=connect, now=now)
+                if candidate and body.get("handoff", True):
+                    handoff_candidate_to_verification(candidate["id"])
+                self.send_json({"candidate": candidate}, 201 if candidate else 200)
+                return
+            match = re.fullmatch(r"/api/discovered/([^/]+)/handoff", path)
+            if match:
+                self.send_json(handoff_candidate_to_verification(match.group(1)), 201)
                 return
             match = re.fullmatch(r"/api/events/([^/]+)/auto-reel", path)
             if match:
