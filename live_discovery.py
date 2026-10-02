@@ -69,25 +69,55 @@ def normalize_signal(raw, *, source_family, publisher, source_id=None, fetch_run
     }
 
 
-def dedupe(signals):
-    """Drop identical/syndicated copies by canonical URL and normalized content hash.
-
-    Returns (unique, deduped_count). One story copied across mirrors counts once.
-    """
-    seen_url, seen_hash, unique, deduped = set(), set(), [], 0
+def _dedupe_details(signals):
+    """Return (unique, dropped): dropped carries each duplicate for attribution/reporting."""
+    seen_url, seen_hash, unique, dropped = set(), set(), [], []
     for signal in signals:
         key_url = signal.get("canonical_url") or signal.get("url")
         if key_url and key_url in seen_url:
-            deduped += 1
+            dropped.append(signal)
             continue
         if signal["content_hash"] in seen_hash:
-            deduped += 1
+            dropped.append(signal)
             continue
         if key_url:
             seen_url.add(key_url)
         seen_hash.add(signal["content_hash"])
         unique.append(signal)
-    return unique, deduped
+    return unique, dropped
+
+
+def dedupe(signals):
+    """Drop identical/syndicated copies by canonical URL and normalized content hash.
+
+    Returns (unique, deduped_count). One story copied across mirrors counts once.
+    """
+    unique, dropped = _dedupe_details(signals)
+    return unique, len(dropped)
+
+
+def dedupe_report(signals):
+    """Detailed dedupe accounting: raw, canonical unique, duplicates, syndicated collisions.
+
+    A syndicated collision is a dropped copy whose source family differs from the copy kept
+    for the same canonical URL/content hash — mirrored articles must not inflate independent
+    family counts.
+    """
+    unique, dropped = _dedupe_details(signals)
+    kept_families = {}
+    for signal in unique:
+        key = signal.get("canonical_url") or signal["content_hash"]
+        kept_families.setdefault(key, set()).add(signal["source_family"])
+    syndicated = 0
+    for signal in dropped:
+        key = signal.get("canonical_url") or signal["content_hash"]
+        families = kept_families.setdefault(key, set())
+        if families and signal["source_family"] not in families:
+            syndicated += 1
+        families.add(signal["source_family"])
+    return {"raw": len(signals), "unique": len(unique), "duplicates": len(dropped),
+            "syndicated_collisions": syndicated, "unique_signals": unique,
+            "dropped_signals": dropped}
 
 
 def backoff_delay(attempt, *, base=5.0, cap=300.0, jitter=0.3):
@@ -193,7 +223,8 @@ def source_health(*, connect):
         else:
             status = "HEALTHY"
         result[source["family"]] = {
-            "status": status, "adapter_type": source.get("adapter_type"),
+            "status": status, "publisher": source["publisher"], "adapter_type": source.get("adapter_type"),
+            "feed_url": source.get("feed_url"), "parser_name": source.get("parser_name"),
             "last_polled": source.get("last_polled_at"), "last_success": source["last_success_at"],
             "last_error": source["last_error"], "consecutive_failures": source["consecutive_failures"],
             "average_latency_ms": source["average_latency_ms"], "results_last_24h": source["results_last_24h"],
@@ -225,27 +256,39 @@ def _record_source_result(connection, source_id, *, status, signals, latency_ms,
     return fetch_run_id
 
 
-def run_discovery_cycle(*, connect, adapters, now=None, cold_start=False, handoff=True):
+def run_discovery_cycle(*, connect, adapters, now=None, cold_start=False, handoff=True, handoff_fn=None):
     """One polling cycle across all enabled, configured sources.
 
     Each adapter is called in isolation: a failure is recorded and never stops the cycle.
     429s are recorded as RATE_LIMITED (the scheduler backs off the source). Deduped signals
-    feed fast_discovery clustering; a candidate hands off immediately to verification.
+    feed fast_discovery clustering; a candidate hands off immediately to verification via
+    `handoff_fn(candidate_id) -> {candidate_id, event_id, handed_off}` when supplied.
     """
     import fast_discovery
     timestamp = now() if now else _now()
     started = datetime.now(timezone.utc)
     cycle = {"sources_polled": [], "sources_unconfigured": [], "sources_failed": [],
              "signals_fetched": 0, "signals_deduped": 0, "candidates_created": 0,
-             "handoffs": 0, "candidates": [], "fetch_run_ids": []}
+             "handoffs": 0, "candidates": [], "handoff_details": [], "fetch_run_ids": [],
+             "source_report": [], "latency": {}}
     all_signals = []
     for source in sources(connect=connect):
+        entry = {"source_id": source["id"], "publisher": source["publisher"], "family": source["family"],
+                 "url": source.get("feed_url"), "adapter_type": source.get("adapter_type"),
+                 "adapter": source["adapter"], "poll_interval_seconds": source["poll_interval_seconds"],
+                 "http_status": None, "latency_ms": None, "items_fetched": 0, "same_day_items": 0,
+                 "parse_failures": 0, "duplicates": 0, "last_publication": None, "health": None, "error": None}
         if not source["configured"] or not source["enabled"]:
             cycle["sources_unconfigured"].append(source["family"])
+            entry["health"] = "UNCONFIGURED"
+            cycle["source_report"].append(entry)
             continue
         adapter = adapters.get(source["adapter"])
         if adapter is None:
             cycle["sources_failed"].append({"family": source["family"], "error": "no adapter"})
+            entry["health"] = "FAILED"
+            entry["error"] = "no adapter"
+            cycle["source_report"].append(entry)
             continue
         fetch_started = datetime.now(timezone.utc)
         try:
@@ -257,10 +300,19 @@ def run_discovery_cycle(*, connect, adapters, now=None, cold_start=False, handof
                 _record_source_result(connection, source["id"], status=status, signals=0,
                                       latency_ms=latency, error=str(error), now=now)
             cycle["sources_failed"].append({"family": source["family"], "error": str(error)})
+            entry.update({"latency_ms": round(latency, 1), "error": str(error),
+                          "http_status": _http_status_from_error(error),
+                          "health": "BLOCKED" if _looks_blocked(str(error)) else "FAILED"})
+            cycle["source_report"].append(entry)
             continue
         latency = (datetime.now(timezone.utc) - fetch_started).total_seconds() * 1000
+        normalize_started = datetime.now(timezone.utc)
         normalized = [normalize_signal(item, source_family=source["family"], publisher=source["publisher"],
                                        source_id=source["id"], now=now) for item in raw_items]
+        normalize_ms = (datetime.now(timezone.utc) - normalize_started).total_seconds() * 1000
+        # A parsed item without a title or URL is a parse failure, not a usable signal.
+        parse_failures = sum(1 for item in raw_items
+                             if not str(item.get("title") or "").strip() or not item.get("url"))
         # Same-day filter: keep the last 24h; mark unknown dates rather than dropping silently.
         kept = []
         for signal in normalized:
@@ -282,10 +334,30 @@ def run_discovery_cycle(*, connect, adapters, now=None, cold_start=False, handof
         cycle["sources_polled"].append(source["family"])
         cycle["fetch_run_ids"].append(fetch_run_id)
         cycle["signals_fetched"] += len(normalized)
+        cycle.setdefault("_normalize_ms", []).append(normalize_ms)
+        published = [s["published_at"] for s in normalized if s.get("published_at") and s["published_at"] != "UNKNOWN"]
+        entry.update({"http_status": 200, "latency_ms": round(latency, 1),
+                      "items_fetched": len(raw_items), "same_day_items": len(normalized),
+                      "parse_failures": parse_failures,
+                      "last_publication": max(published) if published else None})
+        cycle["source_report"].append(entry)
         all_signals.extend(normalized)
 
-    unique, deduped = dedupe(all_signals)
-    cycle["signals_deduped"] = deduped
+    health = source_health(connect=connect)
+    for entry in cycle["source_report"]:
+        if entry["health"] is None:
+            entry["health"] = health.get(entry["family"], {}).get("status")
+
+    dedupe_detail = dedupe_report(all_signals)
+    unique = dedupe_detail["unique_signals"]
+    cycle["signals_deduped"] = dedupe_detail["duplicates"]
+    cycle["dedupe_report"] = {k: v for k, v in dedupe_detail.items()
+                              if k not in ("unique_signals", "dropped_signals")}
+    for dropped in dedupe_detail["dropped_signals"]:
+        for entry in cycle["source_report"]:
+            if entry["family"] == dropped["source_family"]:
+                entry["duplicates"] += 1
+                break
     # Persist signals (content_hash is unique), then cluster the unique set.
     stored = []
     with connect() as connection:
@@ -304,19 +376,51 @@ def run_discovery_cycle(*, connect, adapters, now=None, cold_start=False, handof
             except Exception:  # duplicate hash -> already stored
                 pass
     if stored:
+        cluster_started = datetime.now(timezone.utc)
         candidate = fast_discovery.discover(stored, connect=connect, now=now)
+        cycle["latency"]["cluster_ms"] = round((datetime.now(timezone.utc) - cluster_started).total_seconds() * 1000, 1)
         if candidate:
             cycle["candidates_created"] = 1
             cycle["candidates"].append(candidate["id"])
-            if handoff:
-                cycle["handoffs"] = 1
-    # SLO sample.
+            detail = {"candidate_id": candidate["id"], "location": candidate.get("location"),
+                      "entities": candidate.get("entities") or [], "source_families": candidate.get("source_families") or [],
+                      "first_seen_at": candidate.get("first_seen_at"), "candidate_created_at": candidate.get("candidate_created_at"),
+                      "discovery_latency_seconds": candidate.get("discovery_latency_seconds"),
+                      "priority": candidate.get("confidence"), "event_id": None, "verification_status": None}
+            already_handed_off = candidate.get("state") == "HANDED_OFF"
+            if handoff and handoff_fn:
+                outcome = handoff_fn(candidate["id"]) or {}
+                detail["event_id"] = outcome.get("event_id")
+                detail["verification_status"] = "NOT_VERIFIED" if outcome.get("handed_off") else None
+                if outcome.get("handed_off") and not already_handed_off:
+                    cycle["handoffs"] += 1
+            cycle["handoff_details"].append(detail)
+    # SLO sample (real timestamps).
     elapsed = (datetime.now(timezone.utc) - started).total_seconds()
+    fetch_latencies = [e["latency_ms"] for e in cycle["source_report"] if e["latency_ms"] is not None]
+    cycle["latency"].update({
+        "fetch_ms": round(sum(fetch_latencies), 1) if fetch_latencies else 0.0,
+        "fetch_ms_max": max(fetch_latencies) if fetch_latencies else None,
+        "normalize_ms": round(sum(cycle.get("_normalize_ms", [])), 1),
+        "candidate_ms": round(elapsed * 1000, 1),
+    })
+    cycle.pop("_normalize_ms", None)
     with connect() as connection:
         connection.execute(
             "INSERT INTO discovery_slo_samples(fetch_latency_ms,candidate_latency_seconds,slo_met,recorded_at) "
             "VALUES(?,?,?,?)", (elapsed * 1000, elapsed, int(elapsed <= SLO_SECONDS), timestamp))
     return cycle
+
+
+def _looks_blocked(text):
+    lowered = (text or "").lower()
+    return any(token in lowered for token in ("403", "captcha", "bot", "challenge", "blocked"))
+
+
+def _http_status_from_error(error):
+    """Best-effort HTTP status from a urllib error string; None when absent."""
+    match = re.search(r"\b([1-5]\d{2})\b", str(error))
+    return int(match.group(1)) if match else None
 
 
 def _json(value):
@@ -343,11 +447,14 @@ def _age_hours_for(published_at, now_at):
 
 
 def slo_metrics(*, connect):
-    """Median/p95 candidate latency and SLO misses, plus signals/candidates today."""
+    """Median/p95 fetch and candidate latency and SLO misses, plus signals/candidates today."""
     with connect() as connection:
         samples = [row[0] for row in connection.execute(
             "SELECT candidate_latency_seconds FROM discovery_slo_samples WHERE candidate_latency_seconds IS NOT NULL "
             "ORDER BY candidate_latency_seconds")]
+        fetch_samples = [row[0] for row in connection.execute(
+            "SELECT fetch_latency_ms FROM discovery_slo_samples WHERE fetch_latency_ms IS NOT NULL "
+            "ORDER BY fetch_latency_ms")]
         today = datetime.now(timezone.utc).date().isoformat()
         signals_today = connection.execute(
             "SELECT COUNT(*) FROM discovery_signals WHERE date(created_at)=?", (today,)).fetchone()[0]
@@ -361,6 +468,7 @@ def slo_metrics(*, connect):
         index = min(len(values) - 1, int(round((pct / 100) * (len(values) - 1))))
         return round(values[index], 2)
     return {"median_latency_seconds": percentile(samples, 50), "p95_latency_seconds": percentile(samples, 95),
+            "median_fetch_ms": percentile(fetch_samples, 50), "p95_fetch_ms": percentile(fetch_samples, 95),
             "slo_misses": slo_misses, "signals_today": signals_today, "candidates_today": candidates_today,
             "samples": len(samples)}
 

@@ -6879,7 +6879,9 @@ def run_live_discovery_cycle(*, handoff=True):
     """One LIVE_DISCOVERY_V1 polling cycle using the built-in no-key adapters."""
     live_discovery.sync_sources(connect=connect, now=now)
     adapters = live_discovery.default_adapters()
-    return live_discovery.run_discovery_cycle(connect=connect, adapters=adapters, now=now, handoff=handoff)
+    return live_discovery.run_discovery_cycle(
+        connect=connect, adapters=adapters, now=now, handoff=handoff,
+        handoff_fn=handoff_candidate_to_verification if handoff else None)
 
 
 def start_live_discovery_scheduler():

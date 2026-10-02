@@ -4416,6 +4416,71 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(health["X"]["status"], "UNCONFIGURED")
         self.assertEqual(health["YouTube"]["status"], "UNCONFIGURED")
         self.assertIn("last_polled", health["NTV Telugu"])
+        # Health carries the fields the System UI renders.
+        for field in ("publisher", "adapter_type", "last_polled", "last_success",
+                      "results_last_24h", "average_latency_ms", "poll_interval_seconds"):
+            self.assertIn(field, health["NTV Telugu"])
+
+    def test_discovery_cycle_per_source_report_and_syndicated_dedupe(self):
+        import live_discovery as ld
+        ld.sync_sources(connect=app.connect)
+        # The same wire story arrives via every enabled RSS family -> syndicated collision.
+        shared = {"title": "CM reviews cyclone preparedness in Vijayawada",
+                  "text": "Andhra Pradesh Chief Minister N Chandrababu Naidu reviewed cyclone preparedness.",
+                  "url": "https://example.com/ap-cyclone", "published_at": "2026-10-02T10:00:00+05:30"}
+        adapters = {"discover_news": lambda source: [dict(shared)], "discover_pib": lambda source: []}
+        cycle = ld.run_discovery_cycle(connect=app.connect, adapters=adapters, handoff=False)
+        report = {entry["family"]: entry for entry in cycle["source_report"]}
+        # Every enabled source appears with a real per-source report row.
+        for family in ("NTV Telugu", "TV9 Telugu", "Sakshi", "PIB"):
+            self.assertIn(family, report)
+            self.assertIn("health", report[family])
+            self.assertIn("adapter_type", report[family])
+        self.assertEqual(report["NTV Telugu"]["http_status"], 200)
+        self.assertEqual(report["NTV Telugu"]["adapter_type"], "RSS")
+        self.assertIsNotNone(report["NTV Telugu"]["latency_ms"])
+        self.assertEqual(report["NTV Telugu"]["items_fetched"], 1)
+        self.assertEqual(report["PIB"]["same_day_items"], 0)
+        # Dedupe report: raw > unique, and mirrored copies across families are flagged.
+        self.assertIn("dedupe_report", cycle)
+        self.assertGreater(cycle["dedupe_report"]["raw"], cycle["dedupe_report"]["unique"])
+        self.assertGreaterEqual(cycle["dedupe_report"]["syndicated_collisions"], 1)
+        # Latency breakdown is real, not stubbed.
+        self.assertIn("fetch_ms", cycle["latency"])
+        self.assertIn("normalize_ms", cycle["latency"])
+        self.assertIn("candidate_ms", cycle["latency"])
+
+    def test_discovery_candidate_handoff_creates_verification_event(self):
+        import live_discovery as ld
+        ld.sync_sources(connect=app.connect)
+        # Three independent same-day families, shared entity -> candidate meets threshold.
+        def feed(source):
+            return [{"title": "Anant Ambani visits Madanapalle Global Horticulture Hub",
+                     "text": f"Madanapalle {source['family']} reports the Global Horticulture Hub visit.",
+                     "url": f"https://{source['id']}.example/madanapalle-hub",
+                     "published_at": "2026-10-02T10:00:00+05:30"}]
+        adapters = {"discover_news": feed, "discover_pib": lambda source: []}
+        handed = []
+        def handoff(candidate_id):
+            outcome = app.handoff_candidate_to_verification(candidate_id)
+            handed.append(outcome)
+            return outcome
+        cycle = ld.run_discovery_cycle(connect=app.connect, adapters=adapters, handoff=True, handoff_fn=handoff)
+        self.assertEqual(cycle["candidates_created"], 1)
+        self.assertEqual(cycle["handoffs"], 1)
+        self.assertTrue(handed and handed[0]["handed_off"])
+        event_id = handed[0]["event_id"]
+        detail = cycle["handoff_details"][0]
+        self.assertEqual(detail["event_id"], event_id)
+        # The candidate is promoted and the event exists in VERIFYING / NOT_VERIFIED.
+        import fast_discovery as fd
+        candidate = fd.candidate(cycle["candidates"][0], connect=app.connect)
+        self.assertEqual(candidate["state"], "HANDED_OFF")
+        self.assertEqual(candidate["event_id"], event_id)
+        with app.connect() as connection:
+            row = connection.execute("SELECT status,verification_status FROM events WHERE id=?", (event_id,)).fetchone()
+        self.assertEqual(dict(row)["status"], "VERIFYING")
+        self.assertEqual(dict(row)["verification_status"], "NOT_VERIFIED")
 
     def test_new_shell_has_five_destinations_and_no_publish(self):
         html = Path(app.__file__).with_name("index.html").read_text(encoding="utf-8")

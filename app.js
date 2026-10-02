@@ -544,17 +544,41 @@ function renderSystem(root) {
 
   const dh = state.discoveryHealth || {};
   const slo = dh.slo || {};
+  const sourceRows = Object.entries(dh.sources || {});
+  const sourceTable = el('table', 'data-table discovery-sources',
+    el('thead', '', el('tr', '',
+      ...['Publisher', 'Adapter', 'Health', 'Last fetch', 'Last success', 'Items 24h', 'Avg latency'].map(h => el('th', '', h)))),
+    el('tbody', '', sourceRows.map(([family, s]) => el('tr', '',
+      el('td', '', s.publisher || family),
+      el('td', '', s.adapter_type || '—'),
+      el('td', '', el('span', `pill ${s.status === 'HEALTHY' ? 'good' : s.status === 'DEGRADED' ? 'warn' : s.status === 'UNCONFIGURED' ? '' : 'bad'}`, s.status)),
+      el('td', '', fmt(s.last_polled)),
+      el('td', '', fmt(s.last_success)),
+      el('td', '', s.results_last_24h ?? 0),
+      el('td', '', s.average_latency_ms != null ? `${Math.round(s.average_latency_ms)} ms` : '—')))));
+  const parserDetail = el('table', 'data-table discovery-parsers',
+    el('thead', '', el('tr', '', ...['Publisher', 'Feed URL', 'Parser', 'Poll interval', 'Failures', 'Last error'].map(h => el('th', '', h)))),
+    el('tbody', '', sourceRows.map(([family, s]) => el('tr', '',
+      el('td', '', s.publisher || family),
+      el('td', '', s.feed_url ? el('code', '', s.feed_url) : '—'),
+      el('td', '', s.parser_name || '—'),
+      el('td', '', s.poll_interval_seconds != null ? `${s.poll_interval_seconds}s` : '—'),
+      el('td', '', s.consecutive_failures ?? 0),
+      el('td', '', s.last_error || '—')))));
   grid.append(card('', cardHead('Discovery health',
     pill(dh.enabled ? 'Live discovery ON' : 'Live discovery OFF', dh.enabled ? 'good' : ''),
-    plainPill(`${dh.interval_seconds || 300}s interval`, '')),
+    plainPill(`${dh.interval_seconds || 300}s interval`, ''),
+    plainPill(`${sourceRows.filter(([, s]) => s.status === 'HEALTHY').length}/${sourceRows.length} healthy`, '')),
     facts([
       ['Signals today', slo.signals_today ?? 0], ['Candidates today', slo.candidates_today ?? 0],
       ['Median latency', slo.median_latency_seconds != null ? `${slo.median_latency_seconds}s` : '—'],
       ['p95 latency', slo.p95_latency_seconds != null ? `${slo.p95_latency_seconds}s` : '—'],
+      ['Median fetch', slo.median_fetch_ms != null ? `${slo.median_fetch_ms} ms` : '—'],
+      ['p95 fetch', slo.p95_fetch_ms != null ? `${slo.p95_fetch_ms} ms` : '—'],
       ['SLO misses', slo.slo_misses ?? 0],
     ]),
-    el('ul', 'provider-list', Object.entries(dh.sources || {}).map(([family, s]) =>
-      el('li', '', el('span', '', family), el('small', '', s.status))))));
+    sourceRows.length ? sourceTable : empty('No sources registered', 'Run a discovery cycle to populate the registry.'),
+    sourceRows.length ? disclosure('Advanced — parser & debug detail', parserDetail) : null));
 
   const discovered = state.discovered || [];
   if (discovered.length) {
