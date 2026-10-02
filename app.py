@@ -73,6 +73,8 @@ from media_tools import (
 from visual_qa import visual_qa_provider_for
 import final_reel_composer
 import reel_standard
+import reel_pipeline
+import media_discovery
 from meta_distribution import (
     COPY_POLICY_VERSION as DISTRIBUTION_COPY_POLICY_VERSION,
     PLATFORMS as META_PLATFORMS,
@@ -167,6 +169,7 @@ PRODUCTION_TRANSITIONS = {
     "VALIDATING": {"READY_FOR_APPROVAL", "HUMAN_REVIEW", "BLOCKED", "FAILED"},
     "READY_FOR_APPROVAL": set(), "HUMAN_REVIEW": {"VALIDATING"}, "BLOCKED": set(), "FAILED": set(),
 }
+AUTO_REEL_PIPELINE_ENABLED = os.environ.get("AUTO_REEL_PIPELINE", "0").strip().lower() in ("1", "true", "yes", "on")
 RENDER_POLICY_VERSION = os.environ.get("RENDER_POLICY_VERSION", "media-render-policy-v1")
 RENDERER_CONFIG_VERSION = os.environ.get("RENDERER_CONFIG_VERSION", "live-renderer-config-v1")
 RENDER_STORAGE_ROOT = Path(os.environ.get("RENDER_STORAGE_ROOT", ROOT / ".context" / "generated_media"))
@@ -290,6 +293,8 @@ def init():
     if OFFICIAL_SOURCES_CONFIG.exists():
         sync_official_source_registry(load_official_source_registry())
     recover_unfinished_media_jobs()
+    if AUTO_REEL_PIPELINE_ENABLED:
+        recover_auto_reel_pipelines()
     if os.environ.get("OCR_PROVIDER", "auto").strip().lower() not in ("", "none", "off"):
         warm_media_probe()
 
@@ -6648,6 +6653,100 @@ def final_reel_asset(final_reel_id):
     return decoded
 
 
+def _auto_reel_stage_handler(stage, run):
+    """Perform one AUTO_REEL_PIPELINE_V1 stage using the existing app functions.
+
+    Stages whose work is already done are cheap no-ops; paid stages are gated by the
+    pipeline's checkpoint so a restart never repeats provider work.
+    """
+    event_id = run["event_id"]
+    if stage == "ELIGIBILITY":
+        check = reel_pipeline.eligibility(connect, event_id)
+        if not check["eligible"]:
+            raise reel_pipeline.PipelineError(
+                "Not auto-eligible: " + " ".join(check["blockers"]), retryable=False,
+                recommended_action="Resolve verification/decision/claim-set blockers, then re-run.")
+        return {"eligible": True}
+    if stage == "SOURCE_ACQUISITION":
+        # Discovery/verification already complete for a VERIFIED event; nothing paid to do.
+        return {"sources_ready": True}
+    if stage == "VERIFICATION":
+        return {"verified": True}
+    if stage == "CONTENT_DECISION":
+        return {"decision_id": (run.get("checkpoint") or {}).get("decision_id")}
+    if stage == "NARRATION":
+        return {"narration_ready": True}
+    if stage == "MEDIA_DISCOVERY":
+        approved = media_discovery.approved_candidates(connect=connect)
+        if not approved:
+            raise reel_pipeline.PipelineError(
+                "No rights-cleared media available.", retryable=False,
+                recommended_action="Discover and approve rights-cleared media, or supply user media.")
+        return {"approved_media": len(approved)}
+    if stage == "RIGHTS_CHECK":
+        ingested = media_discovery.ingested_candidates(connect=connect)
+        if not ingested:
+            raise reel_pipeline.PipelineError(
+                "Approved media has not been ingested.", retryable=True,
+                recommended_action="Ingest the approved candidates, then resume.")
+        return {"ingested_media": len(ingested)}
+    if stage == "MEDIA_SELECTION":
+        return {"selected": True}
+    if stage == "REEL_GENERATION":
+        with connect() as connection:
+            source = connection.execute(
+                "SELECT ga.id FROM generated_assets ga WHERE ga.event_id=? AND ga.media_type IN "
+                "('VIDEO','SHORT_FORM_VIDEO','LONG_FORM_VIDEO') ORDER BY ga.created_at DESC LIMIT 1",
+                (event_id,),
+            ).fetchone()
+            cbn = connection.execute(
+                "SELECT id FROM uploaded_media_assets WHERE asset_type='PUBLIC_FIGURE_PHOTO' AND rights_status='VERIFIED' "
+                "ORDER BY uploaded_at DESC LIMIT 1").fetchone()
+            tdp = connection.execute(
+                "SELECT id FROM uploaded_media_assets WHERE asset_type='PARTY_LOGO' AND rights_status='VERIFIED' "
+                "ORDER BY uploaded_at DESC LIMIT 1").fetchone()
+        if not source:
+            raise reel_pipeline.PipelineError(
+                "No generated source video exists for this event.", retryable=False,
+                recommended_action="Render the base media for the approved package first.")
+        asset = create_final_reel(source["id"], cbn_asset_id=cbn["id"] if cbn else None,
+                                  tdp_asset_id=tdp["id"] if tdp else None, language="te")
+        return {"reel_id": asset.get("id")}
+    if stage == "QA":
+        reel_id = (run.get("checkpoint") or {}).get("reel_id") or reel_pipeline._latest_reel_id(connect, event_id)
+        if not reel_id:
+            raise reel_pipeline.PipelineError("No reel to QA.", recommended_action="Run REEL_GENERATION.")
+        with connect() as connection:
+            row = connection.execute("SELECT status FROM final_reel_assets WHERE id=?", (reel_id,)).fetchone()
+        if row["status"] != "READY_FOR_REVIEW":
+            raise reel_pipeline.PipelineError(
+                "Mandatory QA did not pass; reel is BLOCKED.", retryable=False,
+                recommended_action="Review the reel's QA flags; fix and regenerate.")
+        return {"reel_id": reel_id}
+    return {}
+
+
+def run_auto_reel_pipeline(event_id, *, now=None):
+    """Drive the automated reel factory one run for one event. Never publishes."""
+    run = reel_pipeline.open_or_resume(event_id, connect=connect, now=now or globals()["now"])
+    return reel_pipeline.advance(run["id"], handler=_auto_reel_stage_handler, connect=connect)
+
+
+def recover_auto_reel_pipelines():
+    """At startup, resume RUNNING pipelines; never duplicate paid/provider work (checkpointed)."""
+    with connect() as connection:
+        running = [row["event_id"] for row in connection.execute(
+            "SELECT event_id FROM reel_pipeline_runs WHERE status='RUNNING'"
+        )]
+    results = []
+    for event_id in running:
+        try:
+            results.append(run_auto_reel_pipeline(event_id))
+        except Exception as error:  # noqa: BLE001
+            log_error("auto_reel_recovery_failed", error, event_id=event_id)
+    return results
+
+
 def _real_assets_for_reel(connection):
     """Map ingested, rights-cleared media candidates to the real-AP scene plan keys.
 
@@ -7898,6 +7997,20 @@ class Handler(SimpleHTTPRequestHandler):
         if path == "/api/uploads":
             self.send_json({"assets": list_uploaded_media_assets(dict(parse_qsl(urlparse(self.path).query)).get("type"))})
             return
+        if path == "/api/pipelines":
+            with connect() as connection:
+                runs = [dict(row) for row in connection.execute(
+                    "SELECT * FROM reel_pipeline_runs ORDER BY updated_at DESC")]
+            for run in runs:
+                run["ui_status"] = reel_pipeline.ui_status(run["status"])
+            self.send_json({"pipelines": runs, "standard": reel_standard.PRODUCTION_STANDARD_VERSION})
+            return
+        match = re.fullmatch(r"/api/pipelines/([^/]+)", path)
+        if match:
+            run = reel_pipeline.pipeline_run(match.group(1), connect=connect)
+            run["ui_status"] = reel_pipeline.ui_status(run["status"])
+            self.send_json({"pipeline": run})
+            return
         match = re.fullmatch(r"/api/uploads/([^/]+)/content", path)
         if match:
             asset = uploaded_media_asset(match.group(1))
@@ -8015,6 +8128,12 @@ class Handler(SimpleHTTPRequestHandler):
                     match.group(1), body.get("action"), body.get("reviewer"), body.get("comment"),
                 )
                 self.send_json({"review": review}, 201)
+                return
+            match = re.fullmatch(r"/api/events/([^/]+)/auto-reel", path)
+            if match:
+                if not AUTO_REEL_PIPELINE_ENABLED:
+                    raise ValueError("The automated reel pipeline is off (AUTO_REEL_PIPELINE=0).")
+                self.send_json({"pipeline": run_auto_reel_pipeline(match.group(1))}, 201)
                 return
             if path == "/api/uploads":
                 self.send_json(ingest_reference_media(

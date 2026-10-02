@@ -3,110 +3,40 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>ReachOut — N. Chandrababu Naidu Live Desk</title>
+  <title>ReachOut OS</title>
   <link rel="stylesheet" href="/style.css">
 </head>
 <body>
   <div class="shell">
-    <aside class="sidebar">
+    <aside class="rail">
       <div class="brand"><span class="mark">R</span><span>ReachOut <span class="muted">OS</span></span></div>
-
-      <div class="leader-card">
-        <div class="leader-avatar">
-          <img id="leader-photo" alt="N. Chandrababu Naidu" hidden>
-          <span id="leader-initials" class="leader-initials">CBN</span>
-          <span class="leader-ring"></span>
-        </div>
-        <div class="leader-meta">
-          <div class="leader-name">N. Chandrababu Naidu</div>
-          <div class="leader-role">Chief Minister · Andhra Pradesh</div>
-          <div class="leader-tdp" id="leader-tdp" hidden><img id="leader-tdp-img" alt="Telugu Desam Party"></div>
-        </div>
-      </div>
-
-      <nav>
-        <button class="nav-item active" id="nav-desk" type="button">Live desk</button>
+      <nav id="rail-nav" aria-label="Primary">
+        <button class="nav-item active" data-page="home" type="button">Home</button>
+        <button class="nav-item" data-page="stories" type="button">Stories</button>
+        <button class="nav-item" data-page="review" type="button">Review</button>
+        <button class="nav-item" data-page="media" type="button">Media</button>
+        <button class="nav-item" data-page="system" type="button">System</button>
       </nav>
-      <div class="side-section">
-        <div class="side-label">Providers</div>
-        <ul class="provider-list" id="provider-list"></ul>
-      </div>
-      <div class="side-foot">
-        <div class="side-label">Workspace</div>
-        <div>N. Chandrababu Naidu</div>
-        <div class="muted">Andhra Pradesh, India</div>
+      <div class="rail-foot">
+        <div class="leader-mini">
+          <img id="leader-photo" alt="N. Chandrababu Naidu" hidden>
+          <span id="leader-initials" class="initial">CBN</span>
+          <span>
+            <span class="n">N. Chandrababu Naidu</span><br>
+            <span class="r">Andhra Pradesh</span>
+          </span>
+        </div>
+        <div id="standard-tag" class="muted">—</div>
+        <div id="clock" class="muted">—</div>
       </div>
     </aside>
 
     <main>
-      <!-- Desk view -->
-      <section id="desk-view" class="view">
-        <header class="page-head">
-          <div>
-            <div class="eyebrow">Public leadership · Andhra Pradesh</div>
-            <h1>N. Chandrababu Naidu — Live desk</h1>
-            <p class="lede">Attributed primary-source and independent reporting, verified before anything is produced.</p>
-          </div>
-          <div class="head-meta"><span class="live-dot"></span><span id="clock">—</span></div>
-        </header>
-
-        <form class="ingest" id="ingest-form" autocomplete="off">
-          <label class="sr-only" for="ingest-url">Public report URL</label>
-          <input id="ingest-url" type="url" placeholder="Paste a public report URL to ingest…" required>
-          <button id="ingest" type="submit" class="btn primary">Ingest URL</button>
-          <span id="ingest-status" class="form-status" aria-live="polite"></span>
-        </form>
-
-        <div class="stat-row">
-          <div class="stat"><span class="stat-value" id="discovered-event-count">0</span><span class="stat-label">Events</span></div>
-          <div class="stat"><span class="stat-value" id="review-count">0</span><span class="stat-label">Held for review</span></div>
-          <div class="stat"><span class="stat-value" id="reference-count">0</span><span class="stat-label">References</span></div>
-          <div class="stat"><span class="stat-value" id="rejected-count">0</span><span class="stat-label">Rejected</span></div>
-          <div class="stat stat-muted"><span class="stat-value">—</span><span class="stat-label">Instagram · not connected</span></div>
-        </div>
-
-        <div class="panel">
-          <div class="panel-head">
-            <h2>Events</h2>
-            <span class="muted" id="event-count">0 events</span>
-          </div>
-          <div class="event-table-head"><span>Event</span><span>Pipeline</span><span>Sources</span><span>Published</span></div>
-          <div id="event-list" class="event-list"></div>
-        </div>
-      </section>
-
-      <!-- Event view -->
-      <section id="event-view" class="view" hidden>
-        <button class="back-link" id="close-room" type="button">← Live desk</button>
-        <header class="event-head">
-          <div>
-            <div class="eyebrow" id="room-eyebrow">Event</div>
-            <h1 id="room-title">Event</h1>
-            <div class="chip-row" id="room-meta"></div>
-          </div>
-        </header>
-
-        <ol class="stepper" id="stepper" aria-label="Pipeline progress"></ol>
-
-        <div class="tabs" role="tablist" id="tabs">
-          <button data-tab="overview" type="button" role="tab">Overview</button>
-          <button data-tab="evidence" type="button" role="tab">Evidence</button>
-          <button data-tab="verification" type="button" role="tab">Verification</button>
-          <button data-tab="decision" type="button" role="tab">Decision</button>
-          <button data-tab="package" type="button" role="tab">Package</button>
-          <button data-tab="media" type="button" role="tab">Media</button>
-          <button data-tab="distribution" type="button" role="tab">Distribution</button>
-          <button data-tab="activity" type="button" role="tab">Activity</button>
-        </div>
-
-        <div id="action-bar" class="action-bar"></div>
-        <div id="room-content" class="room-content" aria-live="polite"></div>
-      </section>
-
-      <footer class="foot">ReachOut OS · Architecture 06F-S · Local preview · No publishing actions exist</footer>
+      <div id="page-root" aria-live="polite"></div>
+      <footer class="foot">ReachOut OS · Automated reel factory · No publishing actions exist</footer>
     </main>
   </div>
-  <div id="lightbox" class="lightbox" hidden><img alt="Generated media, full size"><button type="button" class="btn ghost" id="lightbox-close">Close</button></div>
+  <div id="lightbox" class="lightbox" hidden><img alt="Full size"><button type="button" class="btn ghost" id="lightbox-close">Close</button></div>
   <script src="/app.js"></script>
 </body>
 </html>

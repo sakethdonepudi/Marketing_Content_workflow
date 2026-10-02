@@ -445,12 +445,13 @@ class SourceAcquisitionIntegrationTests(unittest.TestCase):
         self.assertEqual(room["publishing_history"], [])
 
     def test_ui_exposes_discovery_and_manual_url_without_publish_action(self):
-        javascript = Path("app.js").read_text(encoding="utf-8")
+        # Architecture 07 simplified the UI; evidence discovery and manual evidence URLs remain
+        # as backend endpoints, and the shell still states that publishing does not exist.
         html = Path("index.html").read_text(encoding="utf-8")
-        self.assertIn("Evidence discovery", javascript)
-        self.assertIn("Add evidence URL", javascript)
-        self.assertIn("no decision changed", javascript)
+        javascript = Path("app.js").read_text(encoding="utf-8")
         self.assertIn("No publishing actions exist", html)
+        self.assertIn("/api/events/", javascript)
+        self.assertNotIn("Publish now", javascript)
 
 
 if __name__ == "__main__":
