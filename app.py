@@ -76,6 +76,7 @@ import reel_standard
 import reel_pipeline
 import reel_control
 import fast_discovery
+import live_discovery
 import media_discovery
 from meta_distribution import (
     COPY_POLICY_VERSION as DISTRIBUTION_COPY_POLICY_VERSION,
@@ -172,6 +173,8 @@ PRODUCTION_TRANSITIONS = {
     "READY_FOR_APPROVAL": set(), "HUMAN_REVIEW": {"VALIDATING"}, "BLOCKED": set(), "FAILED": set(),
 }
 AUTO_REEL_PIPELINE_ENABLED = os.environ.get("AUTO_REEL_PIPELINE", "0").strip().lower() in ("1", "true", "yes", "on")
+LIVE_DISCOVERY_ENABLED = os.environ.get("LIVE_DISCOVERY_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+LIVE_DISCOVERY_INTERVAL_SECONDS = max(60, int(os.environ.get("LIVE_DISCOVERY_INTERVAL_SECONDS", "300")))
 RENDER_POLICY_VERSION = os.environ.get("RENDER_POLICY_VERSION", "media-render-policy-v1")
 RENDERER_CONFIG_VERSION = os.environ.get("RENDERER_CONFIG_VERSION", "live-renderer-config-v1")
 RENDER_STORAGE_ROOT = Path(os.environ.get("RENDER_STORAGE_ROOT", ROOT / ".context" / "generated_media"))
@@ -295,6 +298,7 @@ def init():
     if OFFICIAL_SOURCES_CONFIG.exists():
         sync_official_source_registry(load_official_source_registry())
     recover_unfinished_media_jobs()
+    live_discovery.sync_sources(connect=connect, now=now)
     if AUTO_REEL_PIPELINE_ENABLED:
         recover_auto_reel_pipelines()
     if os.environ.get("OCR_PROVIDER", "auto").strip().lower() not in ("", "none", "off"):
@@ -6861,6 +6865,41 @@ def run_auto_reel_pipeline(event_id, *, now=None):
     return reel_pipeline.advance(run["id"], handler=_auto_reel_stage_handler, connect=connect)
 
 
+def discovery_health():
+    """Discovery Health for System: on/off, per-source status, SLO, todays counts."""
+    return {
+        "enabled": LIVE_DISCOVERY_ENABLED,
+        "interval_seconds": LIVE_DISCOVERY_INTERVAL_SECONDS,
+        "sources": live_discovery.source_health(connect=connect),
+        "slo": live_discovery.slo_metrics(connect=connect),
+    }
+
+
+def run_live_discovery_cycle(*, handoff=True):
+    """One LIVE_DISCOVERY_V1 polling cycle using the built-in no-key adapters."""
+    live_discovery.sync_sources(connect=connect, now=now)
+    adapters = live_discovery.default_adapters()
+    return live_discovery.run_discovery_cycle(connect=connect, adapters=adapters, now=now, handoff=handoff)
+
+
+def start_live_discovery_scheduler():
+    """Continuously poll on the configured cadence while enabled. Never crashes the app."""
+    if not LIVE_DISCOVERY_ENABLED:
+        return None
+    def loop():
+        while True:
+            try:
+                cycle = run_live_discovery_cycle()
+                log_error("live_discovery_cycle", RuntimeError("cycle complete"), **{
+                    "signals": cycle["signals_fetched"], "deduped": cycle["signals_deduped"],
+                    "candidates": cycle["candidates_created"], "handoffs": cycle["handoffs"]})
+            except Exception as error:  # noqa: BLE001
+                log_error("live_discovery_cycle_failed", error)
+            time.sleep(LIVE_DISCOVERY_INTERVAL_SECONDS)
+    threading.Thread(target=loop, name="live-discovery", daemon=True).start()
+    return True
+
+
 def discovered_candidates_overview():
     """Minimal Discovered queue for Stories/System: candidates, not verified events."""
     items = fast_discovery.list_candidates(connect=connect)
@@ -8227,7 +8266,8 @@ class Handler(SimpleHTTPRequestHandler):
             return
         if path == "/api/discovered":
             self.send_json({"candidates": discovered_candidates_overview(),
-                            "recall_qa": fast_discovery.discovery_recall_qa(connect=connect)})
+                            "recall_qa": fast_discovery.discovery_recall_qa(connect=connect),
+                            "discovery_health": discovery_health()})
             return
         if path == "/api/production":
             self.send_json({"health": production_health(), "queue": production_queue(),
@@ -8369,11 +8409,18 @@ class Handler(SimpleHTTPRequestHandler):
                 self.send_json({"review": review}, 201)
                 return
             if path == "/api/discover":
-                signals = body.get("signals") or []
-                candidate = fast_discovery.discover(signals, connect=connect, now=now)
+                # Manual discovery uses the SAME normalization + dedupe + clustering pipeline.
+                raw = body.get("signals") or []
+                normalized = [live_discovery.normalize_signal(item, source_family=item.get("source_family", "Manual"),
+                                                              publisher=item.get("publisher", "Manual")) for item in raw]
+                unique, deduped = live_discovery.dedupe(normalized)
+                candidate = fast_discovery.discover(unique, connect=connect, now=now)
                 if candidate and body.get("handoff", True):
                     handoff_candidate_to_verification(candidate["id"])
-                self.send_json({"candidate": candidate}, 201 if candidate else 200)
+                self.send_json({"candidate": candidate, "deduped": deduped}, 201 if candidate else 200)
+                return
+            if path == "/api/discovery/run":
+                self.send_json({"cycle": run_live_discovery_cycle(handoff=body.get("handoff", True))})
                 return
             match = re.fullmatch(r"/api/discovered/([^/]+)/handoff", path)
             if match:
@@ -8473,6 +8520,7 @@ if __name__ == "__main__":
     recover_interrupted_publish_jobs()
     start_publish_scheduler()
     start_scheduled_post_scheduler()
+    start_live_discovery_scheduler()
     port = int(os.environ.get("PORT", "8000"))
     host = os.environ.get("HOST", "127.0.0.1")
     print(f"ReachOut dashboard: http://{host}:{port}", flush=True)

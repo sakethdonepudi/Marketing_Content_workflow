@@ -92,6 +92,7 @@ async function refresh() {
     state.queue = production.queue || [];
     state.notifications = production.notifications || [];
     state.discovered = discovered.candidates || [];
+    state.discoveryHealth = discovered.discovery_health || null;
     document.getElementById('clock').textContent = `Updated ${fmt(overview.updated_at)}`;
     document.getElementById('standard-tag').textContent = overview.reel_standard?.version || 'Standard';
     renderLeader(overview);
@@ -541,14 +542,25 @@ function renderSystem(root) {
       ['Unknown-cost runs', health.unknown_cost_runs],
     ])));
 
+  const dh = state.discoveryHealth || {};
+  const slo = dh.slo || {};
+  grid.append(card('', cardHead('Discovery health',
+    pill(dh.enabled ? 'Live discovery ON' : 'Live discovery OFF', dh.enabled ? 'good' : ''),
+    plainPill(`${dh.interval_seconds || 300}s interval`, '')),
+    facts([
+      ['Signals today', slo.signals_today ?? 0], ['Candidates today', slo.candidates_today ?? 0],
+      ['Median latency', slo.median_latency_seconds != null ? `${slo.median_latency_seconds}s` : '—'],
+      ['p95 latency', slo.p95_latency_seconds != null ? `${slo.p95_latency_seconds}s` : '—'],
+      ['SLO misses', slo.slo_misses ?? 0],
+    ]),
+    el('ul', 'provider-list', Object.entries(dh.sources || {}).map(([family, s]) =>
+      el('li', '', el('span', '', family), el('small', '', s.status))))));
+
   const discovered = state.discovered || [];
   if (discovered.length) {
-    const latencies = discovered.map(d => d.discovery_latency_seconds).filter(v => v != null);
-    grid.append(card('', cardHead('Discovery',
-      pill(`${discovered.length} candidates`, 'info'),
-      plainPill(latencies.length ? `avg latency ${Math.round(latencies.reduce((a,b)=>a+b,0)/latencies.length)}s` : 'no latency data', ''))),
+    grid.append(card('', cardHead(`Discovered queue (${discovered.length})`),
       el('ul', 'list', discovered.slice(0, 6).map(d =>
-        el('li', '', `${d.headline.slice(0, 60)} · ${d.source_count} signals · ${d.location || '—'} · ${label(d.verification_status)}`))));
+        el('li', '', `${d.headline.slice(0, 60)} · ${d.source_count} signals · ${d.location || '—'} · ${label(d.verification_status)}`)))));
   }
 
   if (health.providers) grid.append(card('', cardHead('Provider health'),

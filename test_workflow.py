@@ -4324,6 +4324,63 @@ class WorkflowTests(unittest.TestCase):
         # Handoff is idempotent.
         self.assertEqual(app.handoff_candidate_to_verification(candidate["id"])["event_id"], result["event_id"])
 
+    def test_live_discovery_adapters_dedupe_and_isolation(self):
+        import live_discovery
+        # normalize + dedupe: syndicated copies count once.
+        raw = [
+            {"title": "AP news one", "text": "Madanapalle event", "url": "https://a.example/x?utm_source=t"},
+            {"title": "AP news one", "text": "Madanapalle event", "url": "https://a.example/x"},
+            {"title": "Other", "text": "Madanapalle", "url": "https://b.example/y"},
+        ]
+        signals = [live_discovery.normalize_signal(r, source_family="NTV Telugu", publisher="NTV") for r in raw]
+        unique, deduped = live_discovery.dedupe(signals)
+        self.assertEqual(deduped, 1)
+        self.assertEqual(len(unique), 2)
+        self.assertEqual(unique[0]["canonical_url"], "https://a.example/x")
+        # One failing adapter must not stop the cycle; X/Instagram are UNCONFIGURED.
+        app.live_discovery.sync_sources(connect=app.connect)
+        def boom(source): raise RuntimeError("HTTP Error 429: Too Many Requests")
+        adapters = {"discover_news": boom, "discover_pib": lambda s: [{"title": "PIB item", "text": "Madanapalle"}],
+                    "discover_ap_gov": lambda s: [], "discover_cmo_ap": lambda s: [], "discover_youtube": lambda s: []}
+        cycle = live_discovery.run_discovery_cycle(connect=app.connect, adapters=adapters, handoff=False)
+        self.assertIn("Instagram", cycle["sources_unconfigured"])
+        self.assertTrue(any(item["family"] == "NTV Telugu" for item in cycle["sources_failed"]))
+        self.assertIn("PIB", cycle["sources_polled"])
+        health = live_discovery.source_health(connect=app.connect)
+        self.assertEqual(health["X"]["status"], "UNCONFIGURED")
+        self.assertEqual(health["Instagram"]["status"], "UNCONFIGURED")
+
+    def test_live_discovery_scheduler_backoff_and_expansion(self):
+        import live_discovery, time as _t
+        # Bounded backoff with jitter, never a storm.
+        self.assertLessEqual(live_discovery.backoff_delay(1), 5.0)
+        self.assertGreater(live_discovery.backoff_delay(20), 0)
+        self.assertLessEqual(live_discovery.backoff_delay(20), 300.0)
+        # Multilingual expansion covers English + Telugu + Romanized + districts.
+        variants = live_discovery.query_variants(("Chandrababu Naidu",), recent_entities=("Pawan Kalyan",))
+        self.assertTrue(any("చంద్రబాబు" in v for v in variants))
+        self.assertTrue(any("Madanapalle" in v for v in variants))
+        # Location vocabulary only boosts when actually present.
+        from fast_discovery import extract_entities
+        self.assertIn("madanapalle", extract_entities("event at Madanapalle"))
+        self.assertEqual([e for e in extract_entities("no location here") if e in live_discovery.DISTRICT_VOCAB], [])
+
+    def test_live_discovery_burst_and_checkpoints_and_disabled(self):
+        import live_discovery
+        bursts = live_discovery.detect_bursts([
+            {"title": "Madanapalle Global Horticulture Hub", "text": "Anant Ambani", "source_family": "YouTube"},
+            {"title": "Madanapalle hub", "text": "Anant Ambani", "source_family": "NTV Telugu"},
+            {"title": "Madanapalle", "text": "Anant Ambani", "source_family": "PIB"},
+        ], window_minutes=30, min_families=3)
+        self.assertTrue(any(b["entity"] in ("anant ambani", "madanapalle") for b in bursts))
+        # Checkpoints resume without refetching history.
+        app.live_discovery.sync_sources(connect=app.connect)
+        live_discovery.update_checkpoint("ntv", connect=app.connect, last_seen_published_at="2026-10-02T10:00:00+00:00")
+        self.assertEqual(live_discovery.checkpoint_for("ntv", connect=app.connect)["last_seen_published_at"],
+                         "2026-10-02T10:00:00+00:00")
+        # LIVE_DISCOVERY_ENABLED=0 disables the scheduler.
+        self.assertFalse(app.LIVE_DISCOVERY_ENABLED)
+
     def test_new_shell_has_five_destinations_and_no_publish(self):
         html = Path(app.__file__).with_name("index.html").read_text(encoding="utf-8")
         for page in ("home", "stories", "review", "media", "system"):
