@@ -513,6 +513,7 @@ def run_youtube_cycle(*, connect, now=None, http=None, queries=None, bucket_size
     else:
         bucket = "explicit"
     result["bucket"] = bucket
+    started = datetime.now(timezone.utc)
     published_after = search_span_for_recency(hours, now=now)
     key = api_key()
 
@@ -563,10 +564,39 @@ def run_youtube_cycle(*, connect, now=None, http=None, queries=None, bucket_size
                       last_error="; ".join(result["errors"])[:400] or None,
                       recent_video_ids=result["video_ids"][:20],
                       last_queries=result["queries_executed"])
+    # Refresh the shared discovery_sources row so the System table shows real YouTube values.
+    latency_ms = round((datetime.now(timezone.utc) - started).total_seconds() * 1000, 1)
+    _update_youtube_source_row(connect=connect, status="FAILED" if failed else "COMPLETED",
+                               signals=len(signals), latency_ms=latency_ms, now=now)
     quota = quota_status(connect=connect)
     result["quota_used"] = quota["quota_used"]
     result["status"] = "FAILED" if failed else ("COMPLETED" if signals else "COMPLETED_EMPTY")
+    result["latency_ms"] = latency_ms
     return result
+
+
+def _update_youtube_source_row(*, connect, status, signals, latency_ms, now=None):
+    """Keep discovery_sources healthy for YouTube using the real API cycle outcome."""
+    import live_discovery
+    timestamp = now() if now else _now()
+    live_discovery.sync_sources(connect=connect, now=now)
+    with connect() as connection:
+        connection.execute(
+            "INSERT OR IGNORE INTO discovery_sources(id,family,adapter,publisher,enabled,configured,"
+            "poll_interval_seconds,adapter_type,parser_name,created_at) VALUES('youtube','YouTube',"
+            "'discover_youtube','YouTube',1,1,600,'API','youtube_api',?)", (timestamp,))
+        if status == "COMPLETED":
+            row = connection.execute("SELECT average_latency_ms FROM discovery_sources WHERE id='youtube'").fetchone()
+            avg = row["average_latency_ms"]
+            avg = latency_ms if avg is None else (avg * 0.7 + latency_ms * 0.3)
+            connection.execute(
+                "UPDATE discovery_sources SET last_polled_at=?,last_success_at=?,last_error=NULL,"
+                "consecutive_failures=0,average_latency_ms=?,results_last_24h=results_last_24h+? WHERE id='youtube'",
+                (timestamp, timestamp, avg, signals))
+        else:
+            connection.execute(
+                "UPDATE discovery_sources SET last_polled_at=?,last_error=?,consecutive_failures="
+                "consecutive_failures+1 WHERE id='youtube'", (timestamp, "youtube cycle failed"))
 
 
 def _attach_to_existing_candidate(signals, *, connect, now=None):
