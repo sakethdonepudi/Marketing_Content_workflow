@@ -18,6 +18,12 @@ import media_rendering
 import media_qa
 import visual_qa
 import socket
+import live_discovery
+
+
+def live_discovery_youtube_adapter(source=None):
+    """The generic-cycle YouTube adapter (returns [] without a key; never scrapes)."""
+    return live_discovery.youtube_adapter(source or {"feed_url": None})
 import threading
 import urllib.parse
 from http.client import HTTPConnection
@@ -4481,6 +4487,181 @@ class WorkflowTests(unittest.TestCase):
             row = connection.execute("SELECT status,verification_status FROM events WHERE id=?", (event_id,)).fetchone()
         self.assertEqual(dict(row)["status"], "VERIFYING")
         self.assertEqual(dict(row)["verification_status"], "NOT_VERIFIED")
+
+    def test_youtube_discovery_unconfigured_without_key(self):
+        import youtube_discovery
+        import os
+        saved = os.environ.pop("YOUTUBE_API_KEY", None)
+        os.environ["YOUTUBE_DISCOVERY_ENABLED"] = "1"
+        try:
+            self.assertIsNone(youtube_discovery.api_key())
+            cycle = youtube_discovery.run_youtube_cycle(connect=app.connect)
+            self.assertEqual(cycle["status"], "UNCONFIGURED")
+            self.assertEqual(cycle["signals_produced"], 0)
+            self.assertEqual(youtube_discovery.youtube_health(connect=app.connect)["status"], "UNCONFIGURED")
+            # No scraping around missing credentials: the adapter returns nothing.
+            self.assertEqual(live_discovery_youtube_adapter(), [])
+        finally:
+            os.environ.pop("YOUTUBE_DISCOVERY_ENABLED", None)
+            if saved is not None:
+                os.environ["YOUTUBE_API_KEY"] = saved
+
+    def test_youtube_query_expansion_and_rotation(self):
+        import youtube_discovery as yd
+        buckets = yd.build_query_buckets(connect=app.connect)
+        self.assertTrue(any("Chandrababu Naidu" in q for q in buckets["core_entities"]))
+        self.assertTrue(any("Madanapalle" in q for q in buckets["locations"]))
+        self.assertTrue(any(q in yd.TOPIC_QUERIES for q in buckets["topic_bursts"]))
+        # Dynamic queries expand an entity into English + Telugu + location variants.
+        dyn = yd.dynamic_queries_for_entities(["anant ambani"], limit=6)
+        self.assertTrue(any("అనంత్" in q for q in dyn))
+        self.assertTrue(any("Madanapalle" in q or "Guntur" in q for q in dyn))
+        # Rotation advances the persisted cursor and only samples ONE bucket per cycle.
+        yd.update_checkpoint(connect=app.connect, bucket_cursor=0, query_offset=0)
+        bucket, queries, cursor = yd.next_queries(connect=app.connect, bucket_size=3)
+        self.assertEqual(bucket, yd.QUERY_BUCKETS[0])
+        self.assertEqual(len(queries), 3)
+        self.assertEqual(cursor["bucket_cursor"], 1)
+        bucket2, _, _ = yd.next_queries(connect=app.connect, bucket_size=3)
+        self.assertEqual(bucket2, yd.QUERY_BUCKETS[1])
+
+    def test_youtube_channel_class_recency_and_normalization(self):
+        import youtube_discovery as yd
+        self.assertEqual(yd.channel_class("Telugu Desam Party"), "OFFICIAL")
+        self.assertEqual(yd.channel_class("NTV Telugu"), "NEWS")
+        self.assertEqual(yd.channel_class("The Hindu"), "KNOWN_MEDIA")
+        self.assertEqual(yd.channel_class("Random Vlogger"), "UNKNOWN_CHANNEL")
+        self.assertEqual(yd.recency_band("2026-10-02T10:00:00Z", now=lambda: "2026-10-02T11:00:00Z"), "VERY_HIGH")
+        self.assertEqual(yd.recency_band("2026-10-02T05:00:00Z", now=lambda: "2026-10-02T11:00:00Z"), "HIGH")
+        self.assertEqual(yd.recency_band("2026-10-01T20:00:00Z", now=lambda: "2026-10-02T11:00:00Z"), "NORMAL")
+        self.assertEqual(yd.recency_band("2019-03-01T09:00:00Z", now=lambda: "2026-10-02T11:00:00Z"), "LOW")
+        # Shorts normalize to YouTube Shorts; normal videos to YouTube; live is flagged.
+        short = yd.normalize_video({"video_id": "MADANAPALLE1", "title": "t", "url": "https://youtu.be/MADANAPALLE1",
+                                    "duration": "PT45S", "channel_title": "NTV Telugu"}, now=lambda: "2026-10-02T11:00:00Z")
+        self.assertEqual(short["source_family"], "YouTube Shorts")
+        long = yd.normalize_video({"video_id": "MADANAPALLE1", "title": "t", "url": "https://youtu.be/MADANAPALLE1",
+                                   "duration": "PT8M", "channel_title": "NTV Telugu"}, now=lambda: "2026-10-02T11:00:00Z")
+        self.assertEqual(long["source_family"], "YouTube")
+        # Rights are UNKNOWN: YouTube can never auto-become production B-roll.
+        self.assertEqual(short["raw_metadata"]["rights_status"], "UNKNOWN")
+
+    def test_youtube_official_api_path_and_dedupe_and_quota(self):
+        import youtube_discovery as yd
+        import json as _json
+        import os
+        os.environ["YOUTUBE_API_KEY"] = "test-key"
+        os.environ["YOUTUBE_DISCOVERY_ENABLED"] = "1"
+        try:
+            search = _json.loads((Path(app.__file__).parent / "test_fixtures" / "youtube_search_madanapalle.json").read_text())
+            videos = _json.loads((Path(app.__file__).parent / "test_fixtures" / "youtube_videos_madanapalle.json").read_text())
+            def fake_http(url):
+                return videos if "/videos" in url else search
+            # Reset quota so the assertion measures this cycle, not prior test state.
+            yd.update_checkpoint(connect=app.connect, quota_date="2026-10-02", quota_used=0)
+            result = yd.run_youtube_cycle(connect=app.connect, http=fake_http,
+                                          queries=["Anant Ambani Madanapalle"], now=lambda: "2026-10-02T11:00:00Z")
+            self.assertEqual(result["status"], "COMPLETED")
+            # The 2019 archive is filtered out; only the two same-day videos survive.
+            self.assertEqual(result["videos_fetched"], 2)
+            self.assertEqual(result["same_day_videos"], 2)
+            self.assertEqual(result["queries_executed"], ["Anant Ambani Madanapalle"])
+            # Repost from another channel is kept but flagged, never counted as a new source.
+            self.assertEqual(result["dedupe"]["reposts"], 1)
+            self.assertEqual(result["dedupe"]["duplicates"], 0)
+            # Quota: 1 search (100) + 2 videos (2) = 102.
+            self.assertEqual(result["quota_used"], 102)
+            yd.ingest_signals(result["signals"], connect=app.connect, now=lambda: "2026-10-02T11:00:00Z")
+            with app.connect() as connection:
+                run = connection.execute("SELECT COUNT(*) FROM discovery_signals WHERE source_id='youtube'").fetchone()[0]
+            self.assertGreaterEqual(run, 2)
+            # Health reflects configured usage; no 429/403 errors.
+            health = yd.youtube_health(connect=app.connect)
+            self.assertEqual(health["status"], "HEALTHY")
+            self.assertEqual(health["quota_used"], 102)
+        finally:
+            os.environ.pop("YOUTUBE_API_KEY", None)
+            os.environ.pop("YOUTUBE_DISCOVERY_ENABLED", None)
+
+    def test_youtube_quota_exhaustion_stops_cleanly(self):
+        import youtube_discovery as yd
+        import os
+        os.environ["YOUTUBE_API_KEY"] = "test-key"
+        os.environ["YOUTUBE_DISCOVERY_ENABLED"] = "1"
+        try:
+            yd.update_checkpoint(connect=app.connect, quota_date="2026-10-02", quota_used=yd.daily_quota_limit())
+            result = yd.run_youtube_cycle(connect=app.connect, queries=["anything"], now=lambda: "2026-10-02T12:00:00Z")
+            self.assertEqual(result["status"], "QUOTA_EXHAUSTED")
+            self.assertEqual(result["searches"], 0)
+            self.assertEqual(yd.youtube_health(connect=app.connect)["status"], "QUOTA_EXHAUSTED")
+        finally:
+            yd.update_checkpoint(connect=app.connect, quota_used=0)
+            os.environ.pop("YOUTUBE_API_KEY", None)
+            os.environ.pop("YOUTUBE_DISCOVERY_ENABLED", None)
+
+    def test_youtube_clusters_with_news_and_never_verifies_alone(self):
+        import youtube_discovery as yd
+        import os
+        os.environ["YOUTUBE_API_KEY"] = "test-key"
+        os.environ["YOUTUBE_DISCOVERY_ENABLED"] = "1"
+        try:
+            fixture = Path(app.__file__).parent / "test_fixtures" / "youtube_search_madanapalle.json"
+            import json as _json
+            search = _json.loads(fixture.read_text())
+            videos = _json.loads((Path(app.__file__).parent / "test_fixtures" / "youtube_videos_madanapalle.json").read_text())
+            def fake_http(url):
+                return videos if "/videos" in url else search
+            now = lambda: "2026-10-02T11:30:00Z"
+            result = yd.run_youtube_cycle(connect=app.connect, http=fake_http,
+                                          queries=["Anant Ambani Madanapalle"], now=now)
+            # Corroborate with a Telugu news family and a primary wire.
+            app.live_discovery.sync_sources(connect=app.connect)
+            def fake_news(source):
+                return [{"title": "చంద్రబాబు నాయుడు పవన్ కల్యాణ్ మదనపల్లె హార్టికల్చర్ హబ్",
+                         "text": "Madanapalle Global Horticulture Hub Anant Ambani",
+                         "url": f"https://{source['id']}.example/mp", "published_at": "2026-10-02T10:15:00Z"}]
+            def fake_pib(source):
+                return [{"title": "Indian School of Agriculture at Madanapalle",
+                         "text": "Global Horticulture Hub, Madanapalle", "url": "https://pib.example/mp",
+                         "published_at": "2026-10-02T11:00:00Z"}]
+            app.live_discovery.run_discovery_cycle(
+                connect=app.connect, now=now,
+                adapters={"discover_news": fake_news, "discover_pib": fake_pib,
+                          "discover_youtube": live_discovery_youtube_adapter}, handoff=False)
+            ingest = yd.ingest_signals(result["signals"], connect=app.connect, now=now,
+                                       handoff_fn=app.handoff_candidate_to_verification)
+            # YouTube clusters into the SAME Madanapalle candidate as NTV + PIB (one event).
+            import fast_discovery
+            shared = [c for c in fast_discovery.list_candidates(connect=app.connect)
+                      if set(c["source_families"]) & {"YouTube"}
+                      and set(c["source_families"]) & {"PIB"}
+                      and (c.get("location") or "").lower().startswith("madanapalle")]
+            self.assertTrue(shared, "YouTube must cluster with PIB on the Madanapalle event")
+            families = set(shared[0]["source_families"])
+            self.assertIn("YouTube", families)
+            self.assertIn("PIB", families)
+            self.assertTrue(any("NTV" in f or "TV9" in f or "Sakshi" in f for f in families))
+            # A YouTube signal alone produces no candidate (unknown channel needs corroboration).
+            os.environ["YOUTUBE_DAILY_QUOTA"] = "100000"
+            solo = yd.run_youtube_cycle(connect=app.connect, http=lambda url: {"items": [
+                {"id": {"videoId": "SOLO0000001"}, "snippet": {"title": "Madanapalle hub", "channelTitle": "Random Vlogger",
+                 "publishedAt": "2026-10-02T09:00:00Z", "channelId": "c"}}]}, queries=["Madanapalle"], now=now)
+            self.assertIsNone(fast_discovery.discover(solo["signals"], connect=app.connect))
+            os.environ.pop("YOUTUBE_DAILY_QUOTA", None)
+        finally:
+            os.environ.pop("YOUTUBE_API_KEY", None)
+            os.environ.pop("YOUTUBE_DISCOVERY_ENABLED", None)
+
+    def test_youtube_missing_key_in_full_cycle_reports_unconfigured(self):
+        import os
+        saved = os.environ.pop("YOUTUBE_API_KEY", None)
+        try:
+            health = app.discovery_health()
+            self.assertIn("youtube", health)
+            self.assertEqual(health["youtube"]["status"], "UNCONFIGURED")
+            self.assertEqual(health["sources"]["YouTube"]["status"], "UNCONFIGURED")
+        finally:
+            if saved is not None:
+                os.environ["YOUTUBE_API_KEY"] = saved
 
     def test_new_shell_has_five_destinations_and_no_publish(self):
         html = Path(app.__file__).with_name("index.html").read_text(encoding="utf-8")

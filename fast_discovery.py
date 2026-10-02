@@ -170,7 +170,7 @@ def discover(signals, *, connect, now=None, jurisdiction="Andhra Pradesh"):
                 "INSERT INTO candidate_signals(id,candidate_id,source_family,url,title,text,published_at,"
                 "is_primary,entities_json,location,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                 ("CS-" + uuid.uuid4().hex[:12].upper(), candidate_id, signal["source_family"], signal["url"],
-                 signal["title"], signal["text"], signal["published_at"], int(signal["is_primary"]),
+                 signal["title"], signal["text"], signal["published_at"], int(signal.get("is_primary") or 0),
                  json.dumps(signal["entities"]), signal["location"], timestamp),
             )
     return candidate(candidate_id, connect=connect)

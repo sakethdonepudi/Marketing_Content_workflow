@@ -544,6 +544,7 @@ function renderSystem(root) {
 
   const dh = state.discoveryHealth || {};
   const slo = dh.slo || {};
+  const yt = dh.youtube || null;
   const sourceRows = Object.entries(dh.sources || {});
   const sourceTable = el('table', 'data-table discovery-sources',
     el('thead', '', el('tr', '',
@@ -578,6 +579,20 @@ function renderSystem(root) {
       ['SLO misses', slo.slo_misses ?? 0],
     ]),
     sourceRows.length ? sourceTable : empty('No sources registered', 'Run a discovery cycle to populate the registry.'),
+    yt ? card('', cardHead('YouTube discovery',
+        pill(yt.status, yt.status === 'HEALTHY' ? 'good' : yt.status === 'DEGRADED' ? 'warn' : yt.status === 'UNCONFIGURED' ? '' : 'bad')),
+      facts([
+        ['Status', yt.status],
+        ['Last fetch', fmt(yt.last_success)],
+        ['Videos today', yt.videos_today ?? 0],
+        ['Queries today', yt.queries_today ?? 0],
+        ['Quota used', `${yt.quota_used ?? 0} / ${yt.quota_limit ?? 0}`],
+        ['Quota remaining', yt.quota_remaining ?? 0],
+      ]),
+      (yt.last_queries?.length || yt.recent_video_ids?.length) ? disclosure('Advanced — YouTube debug detail',
+        facts([['Last bucket', yt.last_bucket || '—'], ['Last error', yt.last_error || '—'], ['Errors today', yt.errors_today ?? 0]]),
+        el('div', 'chip-row', (yt.last_queries || []).map(q => el('span', 'ref', q))),
+        el('div', 'chip-row', (yt.recent_video_ids || []).map(v => el('span', 'ref', v)))) : null) : null,
     sourceRows.length ? disclosure('Advanced — parser & debug detail', parserDetail) : null));
 
   const discovered = state.discovered || [];

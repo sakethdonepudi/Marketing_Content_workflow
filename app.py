@@ -6867,12 +6867,27 @@ def run_auto_reel_pipeline(event_id, *, now=None):
 
 def discovery_health():
     """Discovery Health for System: on/off, per-source status, SLO, todays counts."""
+    import youtube_discovery
     return {
         "enabled": LIVE_DISCOVERY_ENABLED,
         "interval_seconds": LIVE_DISCOVERY_INTERVAL_SECONDS,
         "sources": live_discovery.source_health(connect=connect),
         "slo": live_discovery.slo_metrics(connect=connect),
+        "youtube": youtube_discovery.youtube_health(connect=connect),
     }
+
+
+def run_youtube_discovery_cycle(*, now=None, queries=None):
+    """One bounded YouTube discovery cycle: fetch, normalize, dedupe, cluster, hand off."""
+    import youtube_discovery
+    result = youtube_discovery.run_youtube_cycle(
+        connect=connect, now=now, queries=queries, handoff_fn=handoff_candidate_to_verification)
+    ingest = youtube_discovery.ingest_signals(
+        result.get("signals") or [], connect=connect, now=now,
+        handoff_fn=handoff_candidate_to_verification)
+    result.update({k: v for k, v in ingest.items() if k in
+                   ("candidates_created", "candidates", "handoffs", "cross_source_clusters", "handoff_details")})
+    return result
 
 
 def run_live_discovery_cycle(*, handoff=True):
@@ -8423,6 +8438,9 @@ class Handler(SimpleHTTPRequestHandler):
                 return
             if path == "/api/discovery/run":
                 self.send_json({"cycle": run_live_discovery_cycle(handoff=body.get("handoff", True))})
+                return
+            if path == "/api/discovery/youtube/run":
+                self.send_json({"cycle": run_youtube_discovery_cycle(queries=body.get("queries"))})
                 return
             match = re.fullmatch(r"/api/discovered/([^/]+)/handoff", path)
             if match:

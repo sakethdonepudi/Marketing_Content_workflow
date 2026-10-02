@@ -65,6 +65,7 @@ def normalize_signal(raw, *, source_family, publisher, source_id=None, fetch_run
         "language": raw.get("language") or ("te" if _TELUGU.search(title + text) else "en"),
         "engagement_metrics": raw.get("engagement_metrics") or {},
         "raw_metadata": raw.get("raw_metadata") or {},
+        "is_primary": bool(raw.get("is_primary")),
         "content_hash": _content_hash(title, text, publisher), "candidate_id": None, "created_at": timestamp,
     }
 
@@ -148,8 +149,10 @@ def load_registry(path=None):
 
 def adapter_key(source):
     """Map a registry entry to its adapter function key."""
+    if source.get("parser_name") == "youtube_api" or source.get("family") == "YouTube":
+        return "discover_youtube"
     if source.get("adapter_type") == "UNCONFIGURED":
-        return {"YouTube": "discover_youtube", "X": "discover_x", "Instagram": "discover_instagram"}.get(
+        return {"X": "discover_x", "Instagram": "discover_instagram"}.get(
             source.get("family"), "discover_news")
     return {"rss": "discover_news", "pib_listing": "discover_pib"}.get(source.get("parser_name"), "discover_news")
 
@@ -207,6 +210,24 @@ def source_health(*, connect):
     result = {}
     for source in rows:
         error_text = (source["last_error"] or "").lower()
+        if source.get("parser_name") == "youtube_api":
+            import youtube_discovery
+            yt = youtube_discovery.youtube_health(connect=connect)
+            result[source["family"]] = {
+                "status": yt["status"], "publisher": source["publisher"], "adapter_type": "API",
+                "feed_url": source.get("feed_url"), "parser_name": source.get("parser_name"),
+                "last_polled": source.get("last_polled_at"), "last_success": yt["last_success"] or source["last_success_at"],
+                "last_error": yt["last_error"] or source["last_error"],
+                "consecutive_failures": source["consecutive_failures"],
+                "average_latency_ms": source["average_latency_ms"], "results_last_24h": source["results_last_24h"],
+                "poll_interval_seconds": source["poll_interval_seconds"],
+                "quota_used": yt["quota_used"], "quota_limit": yt["quota_limit"],
+                "quota_remaining": yt["quota_remaining"], "queries_today": yt["queries_today"],
+                "videos_today": yt["videos_today"], "searches_today": yt["searches_today"],
+                "errors_today": yt["errors_today"], "last_bucket": yt["last_bucket"],
+                "last_queries": yt["last_queries"], "recent_video_ids": yt["recent_video_ids"],
+            }
+            continue
         if not source["configured"]:
             status = "UNCONFIGURED"
         elif source.get("adapter_type") == "UNAVAILABLE":
@@ -585,10 +606,23 @@ def default_adapters(*, user_agent="ReachOut-OS/0.5 (live discovery)", http=None
         "discover_pib": pib,
         "discover_ap_gov": rss,
         "discover_cmo_ap": rss,
-        "discover_youtube": lambda source: [],
+        # YouTube is a discovery signal only; runs via youtube_discovery (UNCONFIGURED w/o key).
+        "discover_youtube": youtube_adapter,
         "discover_x": lambda source: [],
         "discover_instagram": lambda source: [],
     }
+
+
+def youtube_adapter(source):
+    """Live YouTube adapter: returns [] (source stays UNCONFIGURED) without YOUTUBE_API_KEY.
+
+    `run_youtube_cycle` is driven separately (it owns quota + rotation + ingestion), so the
+    generic cycle treats YouTube as an empty/no-op adapter rather than double-fetching.
+    """
+    import youtube_discovery
+    if not youtube_discovery.youtube_enabled() or not youtube_discovery.api_key():
+        return []
+    return []
 
 
 def checkpoint_for(source_id, *, connect):
