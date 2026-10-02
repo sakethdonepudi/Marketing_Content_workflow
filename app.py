@@ -7178,6 +7178,11 @@ def _auto_reel_stage_handler(stage, run):
             build_post_packages_for_reel(reel_id, event_id)
         except Exception as error:  # noqa: BLE001 - copy generation never blocks the reel
             log_error("post_package_generation_failed", error, reel_id=reel_id)
+        # And a YouTube title/description/hashtag package (Arch 11).
+        try:
+            build_youtube_package_for_reel(reel_id, event_id)
+        except Exception as error:  # noqa: BLE001 - metadata generation never blocks the reel
+            log_error("youtube_package_generation_failed", error, reel_id=reel_id)
         return {"reel_id": reel_id}
     return {}
 
@@ -7241,6 +7246,48 @@ def _intervals(candidate, event, verified, pipeline):
     return {"t_discovery": t_discovery, "t_verification": t_verification,
             "t_production": t_production, "t_total": t_total,
             "verified": bool(verified_at), "reel_completed": bool(completed_at)}
+
+
+def build_youtube_package_for_reel(reel_id, event_id, *, regenerate=False):
+    """YOUTUBE_TITLE_PACKAGE_V1 + content intelligence (Arch 11): build the YouTube package.
+
+    Research runs before copy; titles/description derive only from the approved claim set.
+    """
+    import youtube_publishing as yp
+    with connect() as connection:
+        claims = [dict(r) for r in connection.execute(
+            "SELECT cv.text, cv.id AS claim_version_id FROM approved_claim_set_items aci "
+            "JOIN claim_versions cv ON cv.id=aci.claim_version_id "
+            "JOIN approved_claim_sets acs ON acs.id=aci.claim_set_id "
+            "WHERE acs.event_id=? AND acs.status='APPROVED' ORDER BY aci.claim_version_id", (event_id,))]
+        candidate = connection.execute("SELECT * FROM event_candidates WHERE event_id=?", (event_id,)).fetchone()
+        event = connection.execute("SELECT title,source FROM events WHERE id=?", (event_id,)).fetchone()
+        signals = [dict(r) for r in connection.execute(
+            "SELECT source_family FROM discovery_signals WHERE url IN (SELECT url FROM signals WHERE event_id=?)",
+            (event_id,))]
+    entities = json.loads(candidate["entities_json"] or "[]") if candidate else []
+    location = (candidate["location"] if candidate else None) or "Andhra Pradesh"
+    event_name = (candidate["headline"] if candidate else None) or (event["title"] if event else None)
+    attribution = ", ".join(sorted({s["source_family"] for s in signals if s["source_family"]})[:3]) or None
+    research = yp.run_content_intelligence(connect=connect, event_id=event_id, event_name=event_name,
+                                           location=location, entities=entities,
+                                           topic_terms=["Horticulture", "Agriculture"])
+    if regenerate:
+        with connect() as connection:
+            connection.execute("UPDATE youtube_packages SET status='SUPERSEDED' WHERE reel_id=? AND status!='SUPERSEDED'",
+                               (reel_id,))
+    existing = None if regenerate else yp.latest_package(reel_id, connect=connect)
+    if existing:
+        return {"reel_id": reel_id, "research": research, "package": existing}
+    package = yp.build_youtube_package(claims=claims, event_name=event_name, location=location,
+                                       entities=entities, topic_terms=["Horticulture", "Agriculture"],
+                                       attribution=attribution, research=research,
+                                       language_mix=research.get("language_mix", "BILINGUAL"),
+                                       format_kind="SHORT")
+    record = yp.create_package(connect=connect, reel_id=reel_id, event_id=event_id, package=package,
+                               research_snapshot_id=research.get("id"),
+                               claim_map=[c["claim_version_id"] for c in claims])
+    return {"reel_id": reel_id, "research": research, "package": record}
 
 
 def build_post_packages_for_reel(reel_id, event_id, *, regenerate=False):
@@ -7318,12 +7365,14 @@ def run_auto_reel_pipeline(event_id, *, now=None):
 def discovery_health():
     """Discovery Health for System: on/off, per-source status, SLO, todays counts."""
     import youtube_discovery
+    import youtube_publishing
     return {
         "enabled": LIVE_DISCOVERY_ENABLED,
         "interval_seconds": LIVE_DISCOVERY_INTERVAL_SECONDS,
         "sources": live_discovery.source_health(connect=connect),
         "slo": live_discovery.slo_metrics(connect=connect),
         "youtube": youtube_discovery.youtube_health(connect=connect),
+        "youtube_connection": youtube_publishing.connection_status(connect=connect),
     }
 
 
@@ -8832,6 +8881,26 @@ class Handler(SimpleHTTPRequestHandler):
             state = post_package.copy_approval_state(connect=connect, reel_id=match.group(1))
             self.send_json({"packages": packages, "approval_state": state})
             return
+        match = re.fullmatch(r"/api/reels/([^/]+)/youtube-packages", path)
+        if match:
+            import youtube_publishing as yp
+            packages = yp.packages_for_reel(match.group(1), connect=connect)
+            state = yp.approval_state(connect=connect, reel_id=match.group(1))
+            self.send_json({"packages": packages, "approval_state": state,
+                            "connection": yp.connection_status(connect=connect),
+                            "project_audit_status": yp.project_audit_status()})
+            return
+        match = re.fullmatch(r"/api/youtube-packages/([^/]+)", path)
+        if match:
+            import youtube_publishing as yp
+            self.send_json({"package": yp.package_row(match.group(1), connect=connect)})
+            return
+        if path == "/api/youtube/connection":
+            import youtube_publishing as yp
+            self.send_json({"connection": yp.connection_status(connect=connect),
+                            "oauth": yp.oauth_configuration(),
+                            "project_audit_status": yp.project_audit_status()})
+            return
         match = re.fullmatch(r"/api/post-packages/([^/]+)", path)
         if match:
             import post_package
@@ -9025,6 +9094,73 @@ class Handler(SimpleHTTPRequestHandler):
             match = re.fullmatch(r"/api/verification/([^/]+)/resume-acquisition", path)
             if match:
                 self.send_json(resume_evidence_acquisition(match.group(1)), 201)
+                return
+            match = re.fullmatch(r"/api/reels/([^/]+)/youtube-packages/regenerate", path)
+            if match:
+                with connect() as connection:
+                    reel = connection.execute("SELECT event_id FROM final_reel_assets WHERE id=?",
+                                              (match.group(1),)).fetchone()
+                if reel is None:
+                    self.send_json({"error": "reel not found"}, 404)
+                    return
+                self.send_json(build_youtube_package_for_reel(match.group(1), reel["event_id"], regenerate=True), 201)
+                return
+            match = re.fullmatch(r"/api/youtube-packages/([^/]+)", path)
+            if match:
+                import youtube_publishing as yp
+                package = yp.edit_package(
+                    match.group(1), title=body.get("title"), description=body.get("description"),
+                    hashtags=body.get("hashtags"), tags=body.get("tags"),
+                    edited_by=body.get("edited_by", "reviewer"), connect=connect)
+                self.send_json({"package": package}, 201)
+                return
+            match = re.fullmatch(r"/api/youtube-packages/([^/]+)/copy-review", path)
+            if match:
+                import youtube_publishing as yp
+                package = yp.approve_package(match.group(1), reviewer=body.get("reviewer", "reviewer"),
+                                             connect=connect)
+                state = yp.approval_state(connect=connect, reel_id=package["reel_id"])
+                self.send_json({"package": package, "approval_state": state}, 201)
+                return
+            match = re.fullmatch(r"/api/reels/([^/]+)/youtube-upload", path)
+            if match:
+                import youtube_publishing as yp
+                reel_id = match.group(1)
+                with connect() as connection:
+                    package = connection.execute(
+                        "SELECT id FROM youtube_packages WHERE reel_id=? AND status='YOUTUBE_COPY_APPROVED' "
+                        "ORDER BY version_number DESC LIMIT 1", (reel_id,)).fetchone()
+                if package is None:
+                    self.send_json({"error": "no approved YouTube package for this reel"}, 400)
+                    return
+                video_bytes = None
+                if body.get("video_base64"):
+                    import base64 as _b64
+                    video_bytes = _b64.b64decode(body["video_base64"])
+                result = yp.request_upload(
+                    reel_id, package["id"], mode=body.get("mode", "NOW"),
+                    scheduled_for=body.get("scheduled_for"),
+                    privacy_status=body.get("privacy_status", "PRIVATE"),
+                    timezone_name=body.get("timezone", "Asia/Kolkata"), connect=connect,
+                    video_bytes=video_bytes, requested_by=body.get("requested_by"))
+                self.send_json(result, 200 if result["duplicate"] else 201)
+                return
+            if path == "/api/youtube/oauth/authorize-url":
+                import youtube_publishing as yp
+                self.send_json({"authorization_url": yp.authorization_url(state=body.get("state"))})
+                return
+            if path == "/api/youtube/oauth/connect":
+                import youtube_publishing as yp
+                exchanged = yp.exchange_code(body.get("code"))
+                if exchanged.get("ok"):
+                    state = yp.record_oauth_state(connect=connect, token_status="CONNECTED",
+                                                  channel_id=body.get("channel_id"),
+                                                  channel_title=body.get("channel_title"),
+                                                  connected_account=body.get("connected_account"))
+                else:
+                    state = yp.record_oauth_state(connect=connect, token_status="ERROR",
+                                                  error="OAuth code exchange failed")
+                self.send_json({"connection": yp.connection_status(connect=connect)}, 201)
                 return
             match = re.fullmatch(r"/api/discovered/([^/]+)/handoff", path)
             if match:

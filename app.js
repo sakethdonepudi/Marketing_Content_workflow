@@ -390,6 +390,57 @@ function changeRequestForm(reel, onDone) {
   return form;
 }
 
+function loadYoutubePackage(reelId, container) {
+  fetchJson(`/api/reels/${encodeURIComponent(reelId)}/youtube-packages`).then(({packages, approval_state, connection, project_audit_status}) => {
+    const body = el('div', 'copy-block');
+    const pkg = packages && packages[0];
+    if (!pkg) {
+      body.append(empty('No YouTube package yet', 'A package is generated when the reel reaches review.'));
+      container.replaceChildren(cardHead('YouTube package'), body);
+      return;
+    }
+    body.append(facts([
+      ['Title', pkg.title_primary],
+      ['Format', pkg.youtube_format],
+      ['Language', pkg.language_mix],
+      ['QA', pkg.qa?.status || '—'],
+      ['Copy approval', pkg.status === 'YOUTUBE_COPY_APPROVED' ? 'Approved' : label(pkg.status)],
+      ['Project audit', project_audit_status || 'UNKNOWN'],
+    ]));
+    body.append(el('p', 'body-text pre-wrap', pkg.description || ''));
+    body.append(el('div', 'chip-row', (pkg.hashtags || []).map(t => el('span', 'ref', t))));
+    body.append(disclosure('Search tags', el('div', 'chip-row', (pkg.tags || []).map(t => el('span', 'ref', t)))));
+    if (pkg.alternates) body.append(el('div', 'muted', `Alt titles: ${pkg.alternates.filter(Boolean).join(' · ')}`));
+    const row = el('div', 'chip-row');
+    const approve = el('button', 'btn primary', 'Approve YouTube package'); approve.type = 'button';
+    approve.onclick = () => {
+      const reviewer = window.prompt('Reviewer name'); if (!reviewer?.trim()) return;
+      approve.disabled = true;
+      fetchJson(`/api/youtube-packages/${encodeURIComponent(pkg.id)}/copy-review`, {
+        method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({reviewer}),
+      }).then(() => loadYoutubePackage(reelId, container)).catch(e => { approve.disabled = false; window.alert(e.message); });
+    };
+    const edit = el('button', 'btn', 'Edit'); edit.type = 'button';
+    edit.onclick = () => {
+      const title = window.prompt('Title', pkg.title_primary) || pkg.title_primary;
+      const description = window.prompt('Description', pkg.description) || pkg.description;
+      fetchJson(`/api/youtube-packages/${encodeURIComponent(pkg.id)}`, {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({title, description, edited_by: 'reviewer'}),
+      }).then(() => loadYoutubePackage(reelId, container)).catch(e => window.alert(e.message));
+    };
+    const regen = el('button', 'btn', 'Regenerate copy'); regen.type = 'button';
+    regen.onclick = () => { regen.disabled = true;
+      fetchJson(`/api/reels/${encodeURIComponent(reelId)}/youtube-packages/regenerate`, {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'})
+        .then(() => loadYoutubePackage(reelId, container)).catch(e => { regen.disabled = false; window.alert(e.message); });
+    };
+    row.append(approve, edit, regen);
+    body.append(row);
+    if (!connection || !connection.upload_capability) body.append(el('div', 'muted', 'YouTube upload: UNCONFIGURED (OAuth required).'));
+    container.replaceChildren(cardHead('YouTube package', plainPill(pkg.youtube_format, '')), body);
+  }).catch(e => container.replaceChildren(cardHead('YouTube package'), empty('YouTube package unavailable', e.message)));
+}
+
 function renderReelReview(root, data, reel) {
   if (!reel) { root.append(empty('No reel yet', 'The automated pipeline has not produced a reel for this story.')); return; }
   const layout = el('div', 'review-layout');
@@ -424,6 +475,12 @@ function renderReelReview(root, data, reel) {
       ['Local context', (reel.local_context_qa || {}).status], ['Public figure', (reel.public_figure_qa || {}).status],
       ['Reference standard', (reel.reference_standard_qa || {}).status], ['Cost', reel.cost_status === 'known' ? money(reel.cost_usd) : label(reel.cost_status)],
     ]))));
+
+  // YouTube package (Architecture 11) — titles/description/hashtags/tags, copy approval separate.
+  const ytCard = card('', cardHead('YouTube package', plainPill('Copy approved separately', '')));
+  ytCard.append(empty('Loading YouTube package…', ''));
+  panel.append(ytCard);
+  loadYoutubePackage(reel.id, ytCard);
 
   const actions = el('div', 'sticky-actions');
   const done = () => { state.room = null; renderPage(); };
@@ -530,6 +587,20 @@ function renderSystem(root) {
     ['Instagram', switches.INSTAGRAM_PUBLISHING_ENABLED ? 'ON' : 'OFF'],
     ['Facebook', switches.FACEBOOK_PUBLISHING_ENABLED ? 'ON' : 'OFF'],
   ])));
+
+  const yc = state.discoveryHealth?.youtube_connection || null;
+  if (yc) grid.append(card('', cardHead('YouTube upload',
+      pill(yc.status, yc.status === 'CONNECTED' ? 'good' : yc.status === 'UNCONFIGURED' ? '' : 'warn')),
+    facts([
+      ['Channel', yc.channel_name || '—'],
+      ['Channel ID', yc.channel_id_masked || '—'],
+      ['Connected account', yc.connected_account || '—'],
+      ['Token status', yc.token_status],
+      ['Last authorized call', fmt(yc.last_authorized_call)],
+      ['API-key discovery', yc.api_key_discovery ? 'Configured' : 'Off'],
+      ['Upload capability', yc.upload_capability ? 'OAuth ready' : 'OAuth required'],
+    ]),
+    yc.missing?.length ? disclosure('Advanced', facts([['Missing', yc.missing.join(', ')]])) : null));
 
   const health = state.health || {};
   if (health.today) grid.append(card('', cardHead('Production health'),

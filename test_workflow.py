@@ -5168,6 +5168,170 @@ class WorkflowTests(unittest.TestCase):
         # Still exactly two acquisition passes were consumed.
         self.assertEqual(ea.passes_used(connect=app.connect, verification_run_id=verification["id"]), 2)
 
+    def test_arch11_youtube_api_key_cannot_upload_and_oauth_required(self):
+        import youtube_publishing as yp
+        import os
+        saved = os.environ.pop("YOUTUBE_CLIENT_ID", None)
+        saved_secret = os.environ.pop("YOUTUBE_CLIENT_SECRET", None)
+        saved_redirect = os.environ.pop("YOUTUBE_REDIRECT_URI", None)
+        saved_refresh = os.environ.pop("YOUTUBE_REFRESH_TOKEN", None)
+        os.environ["YOUTUBE_API_KEY"] = "test-api-key"
+        try:
+            config = yp.oauth_configuration()
+            self.assertFalse(config["upload_configured"])
+            self.assertTrue(config["api_key_configured"])
+            # An API key can never authorize an upload.
+            with self.assertRaises(PermissionError):
+                yp.YouTubePublisher().upload({}, title="t", description="d", tags=[], privacy_status="PRIVATE",
+                                             video_bytes=b"x")
+            # Connection reports UNCONFIGURED and never exposes secrets.
+            status = yp.connection_status(connect=app.connect)
+            self.assertEqual(status["status"], "UNCONFIGURED")
+            self.assertFalse(status["upload_capability"])
+            # No secret VALUES leak (the word may appear only in the missing-var names).
+            self.assertNotIn("test-api-key", json.dumps(status))
+            self.assertNotIn("client_secret_value", json.dumps(status))
+        finally:
+            os.environ.pop("YOUTUBE_API_KEY", None)
+            if saved is not None:
+                os.environ["YOUTUBE_CLIENT_ID"] = saved
+            if saved_secret is not None:
+                os.environ["YOUTUBE_CLIENT_SECRET"] = saved_secret
+            if saved_redirect is not None:
+                os.environ["YOUTUBE_REDIRECT_URI"] = saved_redirect
+            if saved_refresh is not None:
+                os.environ["YOUTUBE_REFRESH_TOKEN"] = saved_refresh
+
+    def test_arch11_token_status_masking_and_no_exposure(self):
+        import youtube_publishing as yp
+        # Channel IDs are masked; tokens are never stored or returned.
+        self.assertEqual(yp.mask("UCabcdefghijklmnop", keep=4), "*" * 14 + "mnop")
+        with app.connect() as connection:
+            columns = {row[1] for row in connection.execute("PRAGMA table_info(youtube_oauth_state)")}
+        for forbidden in ("access_token", "refresh_token", "client_secret"):
+            self.assertNotIn(forbidden, columns)
+        source = Path(app.__file__).with_name("youtube_publishing.py").read_text(encoding="utf-8")
+        # The module never logs or returns token values.
+        self.assertNotIn("print(refresh", source)
+
+    def test_arch11_content_intelligence_aggregate_only(self):
+        import youtube_publishing as yp
+        event = app.create_event("YT research event", "PIB", "https://pib.example/yt-r",
+                                 event_time="2026-10-02T11:00:00+00:00")
+        videos = [
+            {"title": "Madanapalle Global Horticulture Hub | Anant Ambani", "hashtags": ["#Madanapalle", "#Horticulture"],
+             "published_at": "2026-10-02T10:00:00Z"},
+            {"title": "Anant Ambani at Madanapalle - Key Highlights", "hashtags": ["#AndhraPradesh", "#Madanapalle"],
+             "published_at": "2026-10-02T12:00:00Z"},
+            {"title": "మదనపల్లె హార్టికల్చర్ హబ్", "hashtags": ["#TeluguNews"], "published_at": "2026-10-02T14:00:00Z"},
+        ]
+        research = yp.run_content_intelligence(connect=app.connect, event_id=event, event_name="Global Horticulture Hub",
+                                               location="Madanapalle", entities=["Anant Ambani"], videos=videos)
+        self.assertEqual(research["sample_count"], 3)
+        self.assertEqual(research["language_mix"], "BILINGUAL")
+        self.assertIn("#Madanapalle", research["recurring_hashtags"])
+        self.assertTrue(research["title_structures"])
+        # Aggregate content only — no demographic/political profiling keys.
+        for forbidden in ("target_audience", "ideology", "party", "voter"):
+            self.assertNotIn(forbidden, json.dumps(research).lower())
+        # Cached within 30-60 minutes (quota reuse).
+        cached = yp.run_content_intelligence(connect=app.connect, event_id=event, event_name="x", location="y", videos=[])
+        self.assertTrue(cached.get("cached"))
+
+    def test_arch11_title_description_hashtag_qa(self):
+        import youtube_publishing as yp
+        claims = [{"text": "Anant Ambani spoke at the Global Horticulture Hub, Madanapalle."}]
+        package = yp.build_youtube_package(claims=claims, event_name="Global Horticulture Hub",
+                                           location="Madanapalle", entities=["Anant Ambani"],
+                                           attribution="NTV Telugu")
+        self.assertEqual(package["qa"]["status"], "PASS", package["qa"])
+        # Grounded in approved claims.
+        self.assertEqual(yp.title_factual_qa(package["title"], claims=claims)["status"], "PASS")
+        self.assertEqual(yp.description_factual_qa(package["description"], claims=claims)["status"], "PASS")
+        # Clickbait / inferred / partisan framing hard-fails.
+        self.assertEqual(yp.title_factual_qa("SHOCKING: Anant Ambani DESTROYED at event", claims=claims)["status"], "FAIL")
+        self.assertEqual(yp.title_factual_qa("Chandrababu Naidu loved the speech", claims=claims)["status"], "FAIL")
+        self.assertEqual(yp.title_factual_qa("Vote for our candidate", claims=claims)["status"], "FAIL")
+        # No unrelated trending tags / fyp spam.
+        self.assertEqual(yp.hashtag_relevance_qa([{"tag": "#fyp"}], entities=["Anant Ambani"],
+                                                 location="Madanapalle", claims=claims)["status"], "FAIL")
+        self.assertEqual(yp.hashtag_relevance_qa([{"tag": "#SelenaGomez"}], entities=["Anant Ambani"],
+                                                 location="Madanapalle", claims=claims)["status"], "FAIL")
+        # 5-10 hashtags only.
+        self.assertLessEqual(len(package["hashtags"]), 10)
+        self.assertGreaterEqual(len(package["hashtags"]), 5)
+
+    def test_arch11_youtube_package_approval_and_upload_gating(self):
+        import youtube_publishing as yp
+        import reel_control
+        reel = self.reel_with_approved_claims()
+        result = app.build_youtube_package_for_reel(reel["id"], reel["event_id"])
+        package = result["package"]
+        self.assertEqual(package["qa"]["status"], "PASS", package["qa"])
+        # No upload without reel approval + YouTube copy approval.
+        with self.assertRaises(ValueError):
+            yp.request_upload(reel["id"], package["id"], connect=app.connect)
+        yp.approve_package(package["id"], reviewer="Editor", connect=app.connect)
+        # Reel not approved yet -> still blocked.
+        with self.assertRaises(ValueError):
+            yp.request_upload(reel["id"], package["id"], connect=app.connect)
+        reel_control.approve_reel(reel["id"], reviewer="Editor", connect=app.connect)
+        self.assertTrue(yp.upload_allowed(reel["id"], connect=app.connect))
+        # Editing title invalidates only the YouTube copy approval, never the reel approval.
+        edited = yp.edit_package(package["id"], title="Global Horticulture Hub | Madanapalle",
+                                 edited_by="Editor", connect=app.connect)
+        self.assertEqual(edited["status"], "DRAFT")
+        self.assertIsNotNone(reel_control.valid_approval(reel["id"], connect=app.connect))
+        self.assertFalse(yp.upload_allowed(reel["id"], connect=app.connect))
+
+    def test_arch11_private_default_idempotency_and_unconfigured_upload(self):
+        import youtube_publishing as yp
+        import reel_control
+        reel = self.reel_with_approved_claims()
+        package = app.build_youtube_package_for_reel(reel["id"], reel["event_id"])["package"]
+        yp.approve_package(package["id"], reviewer="Editor", connect=app.connect)
+        reel_control.approve_reel(reel["id"], reviewer="Editor", connect=app.connect)
+        # PUBLIC is downgraded to PRIVATE until the project is verified.
+        first = yp.request_upload(reel["id"], package["id"], privacy_status="PUBLIC", connect=app.connect)
+        self.assertEqual(first["job"]["privacy_status"], "PRIVATE")
+        # Same approved combination never uploads twice (duplicate protection).
+        again = yp.request_upload(reel["id"], package["id"], connect=app.connect)
+        self.assertTrue(again["duplicate"])
+        self.assertEqual(again["job"]["id"], first["job"]["id"])
+        # Upload is UNCONFIGURED without OAuth -> recorded FAILED, never faked.
+        job = yp.execute_upload(first["job"]["id"], connect=app.connect, video_bytes=b"fake-video")
+        self.assertEqual(job["status"], "FAILED")
+        self.assertEqual(job["last_error_code"], "OAUTH_REQUIRED")
+        self.assertIsNone(job["video_id"])
+
+    def test_arch11_project_audit_and_analytics_append_only(self):
+        import youtube_publishing as yp
+        import os
+        # Unverified project -> PRIVATE_ONLY / UNKNOWN reported honestly.
+        self.assertIn(yp.project_audit_status(), ("UNKNOWN", "PRIVATE_ONLY", "PUBLIC_VERIFIED"))
+        self.assertEqual(yp.record_snapshot(connect=app.connect, video_id="VID-A", checkpoint="1h",
+                                            metrics={"views": 100, "source": "PUBLIC_DATA"})["checkpoint"], "1h")
+        yp.record_snapshot(connect=app.connect, video_id="VID-A", checkpoint="6h",
+                           metrics={"views": 150, "source": "PUBLIC_DATA"})
+        snaps = yp.snapshots_for("VID-A", connect=app.connect)
+        self.assertEqual([s["checkpoint"] for s in snaps], ["1h", "6h"])  # append-only, ordered
+        # Metrics availability is honest: UNKNOWN stays UNKNOWN without authorization.
+        unconfigured = yp.collect_analytics("VID-B", checkpoint="24h", connect=app.connect)
+        self.assertEqual(unconfigured["source"], "UNKNOWN")
+        self.assertIsNone(unconfigured["views"])
+        # Content-level learning only.
+        intel = yp.performance_intelligence(connect=app.connect)
+        self.assertIn("by_content_feature", intel)
+        self.assertNotIn("voter", json.dumps(intel).lower())
+
+    def test_arch11_youtube_only_no_meta_publishing(self):
+        # This architecture is YouTube-only: no new Instagram/Facebook publishing is added.
+        source = Path(app.__file__).with_name("youtube_publishing.py").read_text(encoding="utf-8")
+        self.assertNotIn("graph.facebook.com", source)
+        self.assertNotIn("graph.instagram.com", source)
+        self.assertNotIn("INSTAGRAM_ACCESS_TOKEN", source)
+        self.assertNotIn("FACEBOOK_PAGE_ACCESS_TOKEN", source)
+
     def test_new_shell_has_five_destinations_and_no_publish(self):
         html = Path(app.__file__).with_name("index.html").read_text(encoding="utf-8")
         for page in ("home", "stories", "review", "media", "system"):
