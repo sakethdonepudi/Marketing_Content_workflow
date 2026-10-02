@@ -140,6 +140,22 @@ function renderProviders(data) {
   )));
 }
 
+async function renderLeaderBranding(data) {
+  const ref = data.reference_media || {};
+  const photo = (ref.cbn_options || [])[0];
+  const logo = (ref.tdp_options || [])[0];
+  if (photo) {
+    const img = document.getElementById('leader-photo');
+    img.src = `/api/uploads/${encodeURIComponent(photo.id)}/content`;
+    img.hidden = false;
+    document.getElementById('leader-initials').hidden = true;
+  }
+  if (logo) {
+    document.getElementById('leader-tdp-img').src = `/api/uploads/${encodeURIComponent(logo.id)}/content`;
+    document.getElementById('leader-tdp').hidden = false;
+  }
+}
+
 async function refresh() {
   try {
     const response = await fetch('/api/overview');
@@ -152,6 +168,7 @@ async function refresh() {
     document.getElementById('rejected-count').textContent = data.rejected_count;
     document.getElementById('discovered-event-count').textContent = data.events.length;
     renderProviders(data);
+    renderLeaderBranding(data);
     const list = document.getElementById('event-list');
     if (!data.events.length) {
       list.replaceChildren(el('div', 'empty-state', 'No events yet. Paste a public report URL above to test the source monitor.'));
@@ -898,15 +915,21 @@ function renderFinalReels(data, root) {
     root.append(section);
     return;
   }
-  // Show only the newest version; older runs stay immutable but are collapsed.
+  // Show only the newest version; older runs stay immutable but are tucked away.
   const [current, ...older] = reels;
   section.append(finalReelCard(current, {current: true}));
   if (older.length) {
-    const rows = older.map(reel => el('div', 'reel-history-row',
-      pill(reel.status), el('span', 'ref', reel.id), el('span', 'secondary-text',
-        `${reel.width}×${reel.height} · ${Math.round(reel.duration_seconds)}s · ${label(reel.latest_review?.action || 'REQUIRED')}`),
-      el('span', 'muted', fmt(reel.created_at))));
-    section.append(disclosure(`Previous versions (${older.length}) — kept for audit`, rows));
+    const rows = older.map((reel, index) => el('div', 'reel-history-row',
+      el('span', 'reel-history-index', `v${older.length - index}`),
+      el('div', 'reel-history-main',
+        el('div', 'reel-history-id', reel.id),
+        el('div', 'reel-history-sub', `${Math.round(reel.duration_seconds)}s · ${reel.width}×${reel.height} · ${fmt(reel.created_at)}`)),
+      pill(reel.status),
+      el('span', 'reel-history-review', label(reel.latest_review?.action || 'REQUIRED')),
+    ));
+    const body = el('div', 'reel-history', el('p', 'secondary-text',
+      'Immutable earlier runs, kept for audit. They are never distributed once a newer version exists.'), rows);
+    section.append(disclosure(`Earlier versions (${older.length})`, body));
   }
   root.append(section);
 }

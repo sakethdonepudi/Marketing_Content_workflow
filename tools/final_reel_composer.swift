@@ -95,7 +95,7 @@ func captionBitmap(text: String, size: CGSize) -> CGImage {
     let paragraph = NSMutableParagraphStyle()
     paragraph.alignment = .center
     paragraph.lineBreakMode = .byWordWrapping
-    let fontSize = size.width * 0.088
+    let fontSize = size.width * 0.076
     let baseAttributes: [NSAttributedString.Key: Any] = [
         .font: NSFont.systemFont(ofSize: fontSize, weight: .bold),
         .paragraphStyle: paragraph,
@@ -136,7 +136,7 @@ func captionLayer(text: String, start: Double, end: Double, total: Double, size:
     paragraph.alignment = .center
     paragraph.lineBreakMode = .byWordWrapping
     let measureAttributes: [NSAttributedString.Key: Any] = [
-        .font: NSFont.systemFont(ofSize: censureWidth * 0.088, weight: .bold), .paragraphStyle: paragraph,
+        .font: NSFont.systemFont(ofSize: censureWidth * 0.076, weight: .bold), .paragraphStyle: paragraph,
     ]
     let measured = (text.uppercased() as NSString).boundingRect(
         with: NSSize(width: censureWidth - 40, height: censureWidth), options: [.usesLineFragmentOrigin, .usesFontLeading],
@@ -328,7 +328,7 @@ func lowerThirdLayer(line1: String, line2: String, start: Double, end: Double, s
     layer.addSublayer(tab)
     let textLayer = CALayer()
     textLayer.frame = CGRect(x: 18, y: 0, width: layer.bounds.width - 26, height: barHeight)
-    textLayer.contents = cardBitmap(lines: [(line1, size.width * 0.05, true), (line2, size.width * 0.038, false)],
+    textLayer.contents = cardBitmap(lines: [(line1, size.width * 0.044, true), (line2, size.width * 0.033, false)],
                                     size: textLayer.bounds.size, accent: false)
     textLayer.contentsGravity = .resize
     textLayer.contentsScale = 2
@@ -543,13 +543,13 @@ func compose(_ config: ComposerConfig) throws -> ComposerReceipt {
     }
     // Hook card and closing card.
     if let headline = config.hookHeadline, !headline.isEmpty {
-        parentLayer.addSublayer(cardLayer(lines: [(headline, renderSize.width * 0.072, true),
-                                                  (config.hookSubline ?? "", renderSize.width * 0.046, false)],
+        parentLayer.addSublayer(cardLayer(lines: [(headline, renderSize.width * 0.062, true),
+                                                  (config.hookSubline ?? "", renderSize.width * 0.04, false)],
                                           accent: true, start: 0.1, end: 2.5, size: renderSize))
     }
     if let closing = config.closingHeadline, !closing.isEmpty {
         let closingStart = max(2.6, targetDuration - 2.2)
-        parentLayer.addSublayer(cardLayer(lines: [(closing, renderSize.width * 0.055, true)],
+        parentLayer.addSublayer(cardLayer(lines: [(closing, renderSize.width * 0.048, true)],
                                           accent: true, start: closingStart, end: targetDuration, size: renderSize))
     }
     for cue in cues {

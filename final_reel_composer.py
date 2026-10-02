@@ -23,7 +23,7 @@ from meta_distribution import check_compliance
 ROOT = Path(__file__).resolve().parent
 COMPOSER_SOURCE = ROOT / "tools" / "final_reel_composer.swift"
 COMPOSER_CACHE = ROOT / ".cache" / "final-reel-composer"
-COMPOSER_POLICY_VERSION = "final-reel-composer-v9"
+COMPOSER_POLICY_VERSION = "final-reel-composer-v10"
 VOICE_PROVIDER = "apple-speech"
 VOICE_MODEL = "Aman (en-IN)"
 NARRATION_GAIN = 1.3
@@ -45,13 +45,24 @@ def _normalized(value):
 
 
 def approved_narration(package):
-    """Use only existing approved package strings: its hook, then first script claim."""
+    """A friendly explainer read using only approved package strings, verbatim.
+
+    Order is hook first, then the approved script sentences in sequence. No fact is
+    added, dropped, or reworded; only ordering and joining punctuation change, so the
+    narration stays fully grounded in the approved package and claims.
+    """
     hook = str((package.get("hook") or {}).get("text") or "").strip().rstrip(".")
     script = sorted(package.get("script") or [], key=lambda item: item.get("sequence", 0))
-    first = str((script[0] if script else {}).get("text") or "").strip()
-    if not hook or not first:
-        raise FinalReelError("The approved package has no usable hook and script claim.")
-    return hook + ". " + first
+    sentences = [str(item.get("text") or "").strip().rstrip(".") for item in script]
+    sentences = [sentence for sentence in sentences if sentence]
+    if not hook or not sentences:
+        raise FinalReelError("The approved package has no usable hook or script text.")
+    # Hook, then each distinct approved script sentence (deduplicated, order preserved).
+    ordered = [hook]
+    for sentence in sentences:
+        if _normalized(sentence) not in {_normalized(existing) for existing in ordered}:
+            ordered.append(sentence)
+    return ". ".join(ordered) + "."
 
 
 def validate_factual_narration(narration, package, approved_claims):

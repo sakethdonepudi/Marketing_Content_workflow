@@ -7708,6 +7708,10 @@ def overview():
         "source_counts": source_counts,
         "metrics": metrics,
         "connected": False,
+        "reference_media": {
+            "cbn_options": _reference_media_choices("PUBLIC_FIGURE_PHOTO"),
+            "tdp_options": _reference_media_choices("PARTY_LOGO"),
+        },
         "research": {
             "grok_configured": bool(os.environ.get("XAI_API_KEY")),
             "search_limit": RESEARCH_SEARCH_LIMIT,
